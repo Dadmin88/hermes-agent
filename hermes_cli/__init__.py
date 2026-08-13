@@ -16,6 +16,9 @@ import sys
 
 __version__ = "0.20.1"
 __release_date__ = "2026.8.13"
+# This is the commit count at the release tag, used only by immutable Nix builds that do
+# not carry git history. `scripts/release.py` updates it for each new release.
+__release_rev_count__ = 16544
 
 
 def _ensure_utf8():

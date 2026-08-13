@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Hermes Agent Release Script
 
-Generates changelogs and creates GitHub releases with CalVer tags.
+Generates changelogs and creates GitHub releases with SemVer tags.
 
 Usage:
     # Preview changelog (dry run)
@@ -16,7 +16,7 @@ Usage:
     # First release (no previous tag)
     python scripts/release.py --bump minor --publish --first-release
 
-    # Override CalVer date (e.g. for a belated release)
+    # Override release-date metadata (e.g. for a belated release)
     python scripts/release.py --bump minor --publish --date 2026.3.15
 """
 
@@ -33,6 +33,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VERSION_FILE = REPO_ROOT / "hermes_cli" / "__init__.py"
 PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"
+UV_LOCK_FILE = REPO_ROOT / "uv.lock"
+DESKTOP_PKG_FILE = REPO_ROOT / "apps" / "desktop" / "package.json"
+PKG_LOCK_FILE = REPO_ROOT / "package-lock.json"
 
 # ──────────────────────────────────────────────────────────────────────
 # Git email → GitHub username mapping
@@ -2131,24 +2134,75 @@ def git_result(*args, cwd=None):
     )
 
 
+def list_remotes() -> list[str]:
+    """The configured git remote names, in git's order."""
+    result = git_result("remote")
+    if result.returncode != 0:
+        return []
+    return [name for name in result.stdout.split() if name]
+
+
+def resolve_push_remote(requested: str | None) -> str:
+    """Pick the remote that receives the release push (and the GitHub
+    release). One configured remote: use it. More than one: the tag push
+    is what fires the release workflow on whichever repo it lands on, so
+    an implicit default is a foot-gun — require an explicit --remote.
+    """
+    remotes = list_remotes()
+    if not remotes:
+        raise SystemExit("release: no git remotes configured — nothing to push to")
+    if requested:
+        if requested not in remotes:
+            raise SystemExit(
+                f"release: remote {requested!r} is not configured "
+                f"(available: {', '.join(remotes)})"
+            )
+        return requested
+    if len(remotes) == 1:
+        return remotes[0]
+    raise SystemExit(
+        "release: multiple remotes are configured "
+        f"({', '.join(remotes)}) — pass --remote <name> to say which one "
+        "receives the release push"
+    )
+
+
+def remote_github_repo(remote: str) -> str | None:
+    """The 'owner/repo' behind a remote's push URL, for gh --repo.
+    None when the URL is not a recognizable GitHub URL."""
+    result = git_result("remote", "get-url", "--push", remote)
+    if result.returncode != 0:
+        return None
+    url = result.stdout.strip()
+    match = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?/?$", url)
+    return match.group(1) if match else None
+
+
+# Cap the major at three digits — the same rule as _parse_release_tag in
+# hermes_cli/update_cmd.py and _SEMVER_TAG_RE in scripts/write_install_stamp.py.
+# The legacy CalVer tags (v2026.7.20) must never match as SemVer.
+_SEMVER_TAG_RE = re.compile(r"v(?:0|[1-9]\d{0,2})\.\d+\.\d+$")
+_LEGACY_CALVER_TAG_RE = re.compile(r"v20\d{2}\.\d+\.\d+(?:\.\d+)?$")
+
+
+def release_tag_for_version(semver: str) -> str:
+    """Return the canonical Git tag for a Hermes package version."""
+    return f"v{semver}"
+
+
 def get_last_tag():
-    """Get the most recent CalVer tag."""
-    tags = git("tag", "--list", "v20*", "--sort=-v:refname")
+    """Get the latest SemVer tag, falling back to legacy CalVer history."""
+    tags = git("tag", "--list", "v[0-9]*", "--sort=-v:refname")
     if tags:
-        return tags.split("\n")[0]
+        tag_list = tags.split("\n")
+        for tag in tag_list:
+            if _SEMVER_TAG_RE.fullmatch(tag) and not _LEGACY_CALVER_TAG_RE.fullmatch(tag):
+                return tag
+
+    legacy_tags = git("tag", "--list", "v20*", "--sort=-v:refname")
+    if legacy_tags:
+        return legacy_tags.split("\n")[0]
     return None
-
-
-def next_available_tag(base_tag: str) -> tuple[str, str]:
-    """Return a tag/calver pair, suffixing same-day releases when needed."""
-    if not git("tag", "--list", base_tag):
-        return base_tag, base_tag.removeprefix("v")
-
-    suffix = 2
-    while git("tag", "--list", f"{base_tag}.{suffix}"):
-        suffix += 1
-    tag_name = f"{base_tag}.{suffix}"
-    return tag_name, tag_name.removeprefix("v")
 
 
 def get_current_version():
@@ -2180,8 +2234,8 @@ def bump_version(current: str, part: str) -> str:
     return f"{major}.{minor}.{patch}"
 
 
-def update_version_files(semver: str, calver_date: str):
-    """Update version strings in source files."""
+def update_version_files(semver: str, calver_date: str) -> list[str]:
+    """Update version strings in source files. returns a list of updates files."""
     # Update __init__.py
     content = VERSION_FILE.read_text(encoding="utf-8")
     content = re.sub(
@@ -2192,6 +2246,15 @@ def update_version_files(semver: str, calver_date: str):
     content = re.sub(
         r'__release_date__\s*=\s*"[^"]+"',
         f'__release_date__ = "{calver_date}"',
+        content,
+    )
+    # This function runs before the release-bump commit is created. Record the
+    # count that commit will have so Nix store builds can derive ``+N`` without
+    # a .git directory. The corresponding SemVer tag is made at that commit.
+    parent_count = int(git("rev-list", "--count", "HEAD") or "0")
+    content = re.sub(
+        r'__release_rev_count__\s*=\s*\d+',
+        f'__release_rev_count__ = {parent_count + 1}',
         content,
     )
     VERSION_FILE.write_text(content, encoding="utf-8")
@@ -2210,16 +2273,45 @@ def update_version_files(semver: str, calver_date: str):
     # Python package version. The desktop About panel reads the live Hermes
     # version at runtime, but app.getVersion()/packaging metadata still come
     # from this field, so it must track pyproject to avoid drift.
-    desktop_pkg = REPO_ROOT / "apps" / "desktop" / "package.json"
-    if desktop_pkg.exists():
-        pkg_text = desktop_pkg.read_text(encoding="utf-8")
-        pkg_text = re.sub(
-            r'("version"\s*:\s*)"[^"]+"',
-            rf'\g<1>"{semver}"',
-            pkg_text,
-            count=1,
-        )
-        desktop_pkg.write_text(pkg_text, encoding="utf-8")
+    pkg_text = DESKTOP_PKG_FILE.read_text(encoding="utf-8")
+    pkg_text = re.sub(
+        r'("version"\s*:\s*)"[^"]+"',
+        rf'\g<1>"{semver}"',
+        pkg_text,
+        count=1,
+    )
+    DESKTOP_PKG_FILE.write_text(pkg_text, encoding="utf-8")
+
+    # npm mirrors each workspace package's version into the root lockfile.
+    # Update the apps/desktop entry so `npm ci`/`npm install` do not see the
+    # lockfile as out of date and rewrite it (or fail in CI) after a bump.
+    lock_text = PKG_LOCK_FILE.read_text(encoding="utf-8")
+    lock_text = re.sub(
+        r'("apps/desktop"\s*:\s*\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"version"\s*:\s*)"[^"]+"',
+        rf'\g<1>"{semver}"',
+        lock_text,
+        count=1,
+    )
+    PKG_LOCK_FILE.write_text(lock_text, encoding="utf-8")
+
+    # uv.lock records the editable root package's version from pyproject.
+    # Update it in place so a post-release `uv sync`/`uv lock` is a no-op.
+    uv_text = UV_LOCK_FILE.read_text(encoding="utf-8")
+    uv_text = re.sub(
+        r'(name = "hermes-agent"\nversion = )"[^"]+"',
+        rf'\g<1>"{semver}"',
+        uv_text,
+        count=1,
+    )
+    UV_LOCK_FILE.write_text(uv_text, encoding="utf-8")
+
+    return [
+        str(VERSION_FILE),
+        str(PYPROJECT_FILE),
+        str(DESKTOP_PKG_FILE),
+        str(PKG_LOCK_FILE),
+        str(UV_LOCK_FILE),
+    ]
 
 
 def resolve_author(name: str, email: str) -> str:
@@ -2481,25 +2573,24 @@ def main():
                         help="Which semver component to bump")
     parser.add_argument("--publish", action="store_true",
                         help="Actually create the tag and GitHub release (otherwise dry run)")
+    parser.add_argument("--remote", type=str,
+                        help="Git remote that receives the release push and the GitHub "
+                             "release. Required with --publish when more than one remote "
+                             "is configured; the single remote is used when only one exists.")
     parser.add_argument("--date", type=str,
-                        help="Override CalVer date (format: YYYY.M.D)")
+                        help="Override release date metadata (format: YYYY.M.D)")
     parser.add_argument("--first-release", action="store_true",
                         help="Mark as first release (no previous tag expected)")
     parser.add_argument("--output", type=str,
                         help="Write changelog to file instead of stdout")
     args = parser.parse_args()
 
-    # Determine CalVer date
+    # Determine release-date metadata.
     if args.date:
         calver_date = args.date
     else:
         now = datetime.now()
         calver_date = f"{now.year}.{now.month}.{now.day}"
-
-    base_tag = f"v{calver_date}"
-    tag_name, calver_date = next_available_tag(base_tag)
-    if tag_name != base_tag:
-        print(f"Note: Tag {base_tag} already exists, using {tag_name}")
 
     # Determine semver
     current_version = get_current_version()
@@ -2507,6 +2598,7 @@ def main():
         new_version = bump_version(current_version, args.bump)
     else:
         new_version = current_version
+    tag_name = release_tag_for_version(new_version)
 
     # Get previous tag
     prev_tag = get_last_tag()
@@ -2526,7 +2618,7 @@ def main():
     print(f"{'='*60}")
     print("  Hermes Agent Release Preview")
     print(f"{'='*60}")
-    print(f"  CalVer tag:      {tag_name}")
+    print(f"  Release tag:     {tag_name}")
     print(f"  SemVer:          v{current_version} → v{new_version}")
     print(f"  Previous tag:    {prev_tag or '(none — first release)'}")
     print(f"  Commits:         {len(commits)}")
@@ -2549,17 +2641,22 @@ def main():
         print(changelog)
 
     if args.publish:
+        # Resolve the destination FIRST: a wrong or ambiguous remote must
+        # fail before any commit or tag exists, not after.
+        push_remote = resolve_push_remote(args.remote)
+        gh_repo = remote_github_repo(push_remote)
+
         print(f"\n{'='*60}")
         print("  Publishing release...")
+        print(f"  Remote: {push_remote}" + (f" ({gh_repo})" if gh_repo else ""))
         print(f"{'='*60}")
 
         # Update version files
         if args.bump:
-            update_version_files(new_version, calver_date)
+            add_files = update_version_files(new_version, calver_date)
             print(f"  ✓ Updated version files to v{new_version} ({calver_date})")
 
             # Commit version bump
-            add_files = [str(VERSION_FILE), str(PYPROJECT_FILE)]
             add_result = git_result("add", *add_files)
             if add_result.returncode != 0:
                 print(f"  ✗ Failed to stage version files: {add_result.stderr.strip()}")
@@ -2584,23 +2681,31 @@ def main():
         print(f"  ✓ Created tag {tag_name}")
 
         # Push
-        push_result = git_result("push", "origin", "HEAD", "--tags")
+        push_result = git_result("push", push_remote, "HEAD", "--tags")
         if push_result.returncode == 0:
-            print("  ✓ Pushed to origin")
+            print(f"  ✓ Pushed to {push_remote}")
         else:
-            print(f"  ✗ Failed to push to origin: {push_result.stderr.strip()}")
+            print(f"  ✗ Failed to push to {push_remote}: {push_result.stderr.strip()}")
             print("    Continue manually after fixing access:")
-            print("    git push origin HEAD --tags")
+            print(f"    git push {push_remote} HEAD --tags")
 
-        # Create GitHub release
+        # Create the GitHub release as a DRAFT. The tag push above triggers
+        # the desktop-bundled-release workflow, which attaches the installers
+        # and electron-updater feed files to this draft. Publishing now would
+        # expose an artifact-less release; publish after that matrix is green.
         changelog_file = REPO_ROOT / ".release_notes.md"
         changelog_file.write_text(changelog, encoding="utf-8")
 
         gh_cmd = [
             "gh", "release", "create", tag_name,
+            "--draft",
             "--title", f"Hermes Agent v{new_version} ({calver_date})",
             "--notes-file", str(changelog_file),
         ]
+        # Pin gh to the pushed remote's repo: gh's own default resolution
+        # can pick a different remote than the one the tag just landed on.
+        if gh_repo:
+            gh_cmd += ["--repo", gh_repo]
 
         gh_bin = shutil.which("gh")
         if gh_bin:
@@ -2614,17 +2719,22 @@ def main():
 
         if result and result.returncode == 0:
             changelog_file.unlink(missing_ok=True)
-            print(f"  ✓ GitHub release created: {result.stdout.strip()}")
-            print(f"\n  🎉 Release v{new_version} ({tag_name}) published!")
+            print(f"  ✓ GitHub draft release created: {result.stdout.strip()}")
+            print(f"\n  🎉 Release v{new_version} ({tag_name}) drafted!")
+            print("     The Desktop Bundled Release workflow attaches installers to the draft.")
+            print("     Publish once it is green:")
+            repo_flag = f" --repo {gh_repo}" if gh_repo else ""
+            print(f"     gh release edit {tag_name}{repo_flag} --draft=false")
         else:
             if result is None:
                 print("  ✗ GitHub release skipped: `gh` CLI not found.")
             else:
                 print(f"  ✗ GitHub release failed: {result.stderr.strip()}")
             print(f"    Release notes kept at: {changelog_file}")
-            print("    Tag was created locally. Create the release manually:")
+            print("    Tag was created locally. Create the draft release manually:")
+            repo_flag = f" --repo {gh_repo}" if gh_repo else ""
             print(
-                f"    gh release create {tag_name} --title 'Hermes Agent v{new_version} ({calver_date})' "
+                f"    gh release create {tag_name}{repo_flag} --draft --title 'Hermes Agent v{new_version} ({calver_date})' "
                 f"--notes-file .release_notes.md"
             )
             print(f"\n  ✓ Release v{new_version} ({tag_name}) prepared for manual publish.")
