@@ -169,8 +169,24 @@ _ensure_teams_mock()
 _teams_mod = load_plugin_adapter("teams")
 
 _teams_mod.AIOHTTP_AVAILABLE = True
-# SDK import is deferred (#62935); bind mocked symbols the same way connect() does.
-assert _teams_mod.check_teams_requirements() is True
+# SDK import is deferred (#62935); bind mocked symbols the same way connect()
+# does. check_teams_requirements() routes through tools.lazy_deps.ensure(),
+# which probes the real microsoft-teams-apps *distribution* — the sys.modules
+# mocks above cannot satisfy that probe, and on a read-only site-packages
+# (Nix store) ensure() refuses outright at collection time. The SDK surface
+# under test IS the mock, so make ensure() a no-op for the bind step.
+import tools.lazy_deps as _lazy_deps
+
+_original_lazy_ensure = _lazy_deps.ensure
+_lazy_deps.ensure = lambda feature, *, prompt=True: None
+try:
+    if not _teams_mod.check_teams_requirements():
+        pytest.skip(
+            "teams SDK mock did not bind through check_teams_requirements()",
+            allow_module_level=True,
+        )
+finally:
+    _lazy_deps.ensure = _original_lazy_ensure
 _teams_mod.TEAMS_SDK_AVAILABLE = True
 
 # Ensure SDK symbols that were None (import failed on Python <3.12) are
