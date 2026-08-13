@@ -2308,8 +2308,13 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         print(format_docker_update_message())
         sys.exit(1)
 
-    if method in {"nix", "nixos"}:
+    if method == "nix":
         print(recommended_update_command_for_method(method))
+        sys.exit(1)
+
+    if method == "source":
+        print("✗ This is a source checkout, not the managed install.")
+        print("  Check it like any working tree: git fetch && git status")
         sys.exit(1)
 
     git_dir = _m().PROJECT_ROOT / ".git"

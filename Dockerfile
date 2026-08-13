@@ -40,6 +40,24 @@ RUN apt-get -o Acquire::Retries=3 update && \
     make -j"$(nproc)" && \
     make install
 
+# ---------- Install stamp stages ----------
+# CI pre-builds install-stamp.json (scripts/write_install_stamp.py,
+# --distribution docker) with full git provenance before `docker build`.
+# The stamp is COPY'd into the image so version_info.py and
+# detect_install_method() can read it at runtime — .dockerignore excludes
+# .git, so no commit is resolvable inside the image, and the stamp's
+# `distribution` field is the only install-method marker the image carries.
+#
+# The stamp arrives via the bulk `COPY . .` below as
+# /opt/hermes/install-stamp.json — already at its canonical, code-scoped
+# path. It lives next to the code (NOT in $HERMES_HOME) so a host install
+# sharing the bind-mounted data volume can never read the container's
+# provenance as its own.
+#
+# If the file is absent (local `docker build` without CI), runtime falls
+# through to "unknown" provenance with no crash.
+
+# ---------- Base image ----------
 FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df22866bd7857e5d304b67a564f4feab6ac22044dde719b AS uv_source
 # Node 26 source stage. Debian trixie's bundled nodejs is pinned to 20.x
 # which reached EOL in April 2026 — we copy node + npm from the upstream
@@ -291,47 +309,29 @@ COPY --link --chmod=a+rX,go-w . .
 # resolution or downloads.
 RUN uv pip install --no-cache-dir --no-deps -e "."
 
-# Wire the exec shim and install-method stamp.  Files under /opt/hermes are
+# Wire the exec shim.  Files under /opt/hermes are
 # already root-owned (COPY, uv sync, npm install all run as root) and
 # read-only for the hermes user (go-w from the --chmod above).
 
 USER root
 RUN mkdir -p /opt/hermes/bin && \
     cp /opt/hermes/docker/hermes-exec-shim.sh /opt/hermes/bin/hermes && \
-    chmod 0755 /opt/hermes/bin/hermes && \
-    printf 'docker\n' > /opt/hermes/.install_method
-# The ``.install_method`` stamp is baked next to the running code (the install
-# tree), NOT into $HERMES_HOME. $HERMES_HOME (/opt/data) is a shared data
-# volume that is commonly bind-mounted from the host and even shared with a
-# host-side Desktop/CLI install; stamping it at boot used to clobber that
-# host install's marker and wrongly block its ``hermes update``. A code-scoped
-# stamp is read first by detect_install_method() and is immune to the share.
+    chmod 0755 /opt/hermes/bin/hermes
+
+# Guarantee the code-scoped install stamp exists. CI COPY'd a full-provenance
+# install-stamp.json in the bulk COPY above; a local build without CI gets a
+# minimal fallback so detect_install_method() still reads `docker` from the
+# `distribution` field. The stamp lives next to the code (NOT in $HERMES_HOME,
+# a shared data volume that may be bind-mounted from a host that has its own
+# install) — see hermes_cli/runtime_tree.py.
+RUN if [ ! -f /opt/hermes/install-stamp.json ]; then \
+        printf '{"schemaVersion":2,"commit":"0000000000000000000000000000000000000000","distribution":"docker","source":"fallback"}\n' \
+            > /opt/hermes/install-stamp.json; \
+    fi
 # Start as root so the s6-overlay stage2 hook can usermod/groupmod and chown
 # the data volume. Each supervised service then drops to the hermes user via
 # `s6-setuidgid hermes` in its run script. If HERMES_UID is unset, services
 # run as the default hermes user (UID 10000).
-
-# ---------- Bake build-time git revision ----------
-# .dockerignore excludes .git, so `git rev-parse HEAD` from inside the
-# container always returns nothing — meaning `hermes dump` reports
-# "(unknown)" and the startup banner drops its `· upstream <sha>` suffix.
-# That makes support triage from container bug reports impossible:
-# we can't tell which commit the user is actually running.
-#
-# Fix: write the commit SHA passed via the HERMES_GIT_SHA build-arg to
-# /opt/hermes/.hermes_build_sha at build time, and have
-# hermes_cli/build_info.py read it at runtime.  Both `hermes dump` and
-# banner.get_git_banner_state() try the baked SHA first, then fall back
-# to live `git rev-parse` for source installs (unchanged behaviour).
-#
-# The arg is optional — local `docker build` without --build-arg simply
-# omits the file, and the runtime falls back to live-git lookup.  CI
-# (.github/workflows/docker.yml) passes ${{ github.sha }} so
-# every published image has it.
-ARG HERMES_GIT_SHA=
-RUN if [ -n "${HERMES_GIT_SHA}" ]; then \
-        printf '%s\n' "${HERMES_GIT_SHA}" > /opt/hermes/.hermes_build_sha; \
-    fi
 
 # ---------- s6-overlay service wiring ----------
 # Static services declared at build time: main-hermes + dashboard.
