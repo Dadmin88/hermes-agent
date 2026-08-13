@@ -29,6 +29,9 @@
           '')
           self'.packages.sandbox
           uv
+          # hermes egress setup (iron-proxy) shells out to openssl for CA
+          # generation; tests/test_iron_proxy_cli.py exercises that wizard.
+          openssl
           # Headless Wayland compositor for E2E tests (test:e2e:visual).
           # cage renders a single client with no window management, so
           # the Electron window opens at a fixed size without tiling.
