@@ -366,15 +366,15 @@ class TestVisionDispatchLoopSafety:
                 new_callable=AsyncMock,
                 return_value=fake_response,
             ),
+            # vision_analyze resolves its input through
+            # tools.image_source.resolve_image_source (SSRF gate + fetch in
+            # one seam). Patch that seam: the old _download_image /
+            # _validate_image_url_async hooks are no longer on this path,
+            # and the DNS-backed gate would block example.com offline.
             patch(
-                "tools.vision_tools._download_image",
+                "tools.image_source.resolve_image_source",
                 new_callable=AsyncMock,
-                side_effect=lambda url, dest, **kw: _write_fake_image(dest),
-            ),
-            patch(
-                "tools.vision_tools._validate_image_url_async",
-                new_callable=AsyncMock,
-                return_value=True,
+                return_value=_fake_resolved_image(),
             ),
             patch(
                 "tools.vision_tools._image_to_base64_data_url",
@@ -411,15 +411,11 @@ class TestVisionDispatchLoopSafety:
                 new_callable=AsyncMock,
                 return_value=fake_response,
             ),
+            # Same seam note as test_vision_dispatch_keeps_loop_alive.
             patch(
-                "tools.vision_tools._download_image",
+                "tools.image_source.resolve_image_source",
                 new_callable=AsyncMock,
-                side_effect=lambda url, dest, **kw: _write_fake_image(dest),
-            ),
-            patch(
-                "tools.vision_tools._validate_image_url_async",
-                new_callable=AsyncMock,
-                return_value=True,
+                return_value=_fake_resolved_image(),
             ),
             patch(
                 "tools.vision_tools._image_to_base64_data_url",
@@ -440,8 +436,12 @@ class TestVisionDispatchLoopSafety:
         assert not loop_after_second.is_closed()
 
 
-def _write_fake_image(dest):
-    """Write minimal bytes so vision_analyze_tool thinks download succeeded."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(b"\xff\xd8\xff" + b"\x00" * 16)
-    return dest
+def _fake_resolved_image():
+    """A ResolvedImage as tools.image_source would return for a fetched JPEG."""
+    from tools.image_source import ResolvedImage
+
+    return ResolvedImage(
+        data=b"\xff\xd8\xff" + b"\x00" * 16,
+        mime="image/jpeg",
+        origin="http",
+    )

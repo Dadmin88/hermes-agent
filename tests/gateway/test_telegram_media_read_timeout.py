@@ -53,7 +53,14 @@ from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 
 
 @pytest.fixture
-def adapter():
+def adapter(monkeypatch):
+    # send_image runs the SSRF gate (tools.url_safety.is_safe_url) before any
+    # send. The gate DNS-resolves the host, so an offline/no-DNS sandbox
+    # classifies example.com as unsafe and the send path under test is never
+    # reached. The gate has its own tests; stub it here.
+    import tools.url_safety as url_safety
+    monkeypatch.setattr(url_safety, "is_safe_url", lambda url, **kw: True)
+
     a = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token"))
     a._bot = MagicMock()
     a._metadata_thread_id = lambda metadata: None
