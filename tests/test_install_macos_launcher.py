@@ -36,6 +36,8 @@ def test_venv_launcher_bypasses_uv_console_script_that_requires_realpath(tmp_pat
     command_dir = tmp_path / "command"
     minimal_path = tmp_path / "minimal-path"
     result = tmp_path / "launch-result"
+    sandbox_home = tmp_path / "home"
+    sandbox_home.mkdir()
     venv_bin.mkdir(parents=True)
     minimal_path.mkdir()
 
@@ -72,8 +74,12 @@ def test_venv_launcher_bypasses_uv_console_script_that_requires_realpath(tmp_pat
         "INSTALL_DIR": str(install_dir),
         "DISTRO": "macos",
         "COMMAND_LINK_DIR": str(command_dir),
+        # setup_path appends PATH lines to $HOME shell configs when the
+        # command dir is not on PATH. Point HOME at a sandbox so the test
+        # cannot write to the developer's real dotfiles.
+        "HOME": str(sandbox_home),
     }
-    subprocess.run(["/bin/bash", "-c", harness], env=env, check=True)
+    subprocess.run([shutil.which("bash") or "bash", "-c", harness], env=env, check=True)
 
     completed = subprocess.run(
         [command_dir / "hermes", "--version"],
