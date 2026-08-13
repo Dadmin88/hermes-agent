@@ -112,6 +112,12 @@ def _install_fake_tools_package():
     sys.modules["agent.credential_persistence"] = types.SimpleNamespace(
         sanitize_borrowed_credential_payload=lambda entry, provider_id=None: entry,
     )
+    # The browser plugins read credentials through the profile-scope
+    # resolver (agent.secret_scope.get_secret). Mirror its single-process
+    # fallback: read os.environ so the tests' patch.dict environments work.
+    sys.modules["agent.secret_scope"] = types.SimpleNamespace(
+        get_secret=lambda name, default=None: os.environ.get(name, default),
+    )
 
     # Stubs for the browser-provider plugin layer introduced in PR #25214.
     # The fake `agent` package has an empty __path__ so real submodules
