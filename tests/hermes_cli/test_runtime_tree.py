@@ -50,7 +50,10 @@ class TestRuntimeTree:
 
 class TestStewardMessages:
     def test_every_known_steward_names_its_mechanism(self):
-        assert "--eject" in steward_update_message("desktop-app")
+        # Behavior contract, not a copy snapshot: each refusal must name the
+        # steward that owns updates for that tree, so the user knows where
+        # to go. The exact wording is free to change.
+        assert "desktop app" in steward_update_message("desktop-app")
         assert "docker pull" in steward_update_message("docker")
         assert "flake" in steward_update_message("nix")
 

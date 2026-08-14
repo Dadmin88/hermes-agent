@@ -5037,13 +5037,23 @@ def cmd_version(args):
 
 
 def cmd_uninstall(args):
-    """Uninstall Hermes Agent (or just the Chat GUI with --gui)."""
+    """Uninstall Hermes Agent (or just the Chat GUI / user data)."""
     # Machine-readable install snapshot for the desktop app's uninstall UI.
     # Must run before any TTY gate — it's called from a non-interactive child.
     if getattr(args, "gui_summary", False):
         from hermes_cli.gui_uninstall import gui_install_summary
 
         print(json.dumps(gui_install_summary()))
+        return
+
+    # Data-only removal. Valid on every install kind (source, bundled
+    # desktop app, Nix, Docker) — it never touches code.
+    if getattr(args, "data", False):
+        if not getattr(args, "yes", False):
+            _require_tty("uninstall --data")
+        from hermes_cli.uninstall import run_data_uninstall
+
+        run_data_uninstall(args)
         return
 
     # GUI-only uninstall. The desktop app shells out to this non-interactively
@@ -5150,6 +5160,8 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _resume_windows_gateways_after_update,
     _run_logged_subprocess,
     _run_pre_update_backup,
+    _run_update_phase_inline,
+    _spawn_post_update_phase,
     _should_skip_upstream_prompt,
     _stash_apply_failed_only_on_existing_untracked,
     _stash_local_changes_if_needed,
@@ -5223,6 +5235,15 @@ def _sweep_stale_bytecode_if_checkout_changed() -> None:
     ``hermes`` entry point compares the checkout fingerprint (cheap file
     reads, no git subprocess) against the last-validated stamp and sweeps
     the bytecode cache once when they diverge.
+
+    Scope (two-axis model): the sweep runs wherever ``.git`` exists —
+    managed installs AND dev trees. Dev trees accept the tradeoff on
+    purpose: the sweep writes ``.bytecode-fingerprint`` (gitignored) into
+    the tree and deletes ``__pycache__`` dirs, and skipping dev trees
+    would reopen the stale-pyc hole for everyone who lives in a checkout.
+    Sealed trees (embedded desktop, docker, nix) are exempt by
+    construction: no ``.git`` means no fingerprint, and the embedded app
+    also points PYTHONPYCACHEPREFIX outside its sealed resources.
 
     Never raises — a failure here must not block launch.
     """
@@ -9282,6 +9303,27 @@ def cmd_update(args):
         print(f"✗ This is a git checkout at {PROJECT_ROOT},")
         print("  not the managed install. Update it like any working tree:")
         print("    git pull")
+        sys.exit(1)
+
+    # --eject runs BEFORE the bundled-install refusal below. The eject
+    # operation is the one update operation that must work on a bundled
+    # install. It is the exit from desktop management. On source installs
+    # it only sets the channel or does nothing.
+    if getattr(args, "eject", False):
+        from hermes_cli.update_cmd import cmd_update_eject
+
+        sys.exit(cmd_update_eject(args))
+
+    # Bundled desktop installs are materialized from payloads shipped inside
+    # the desktop app. The updater of the app re-materializes the checkout
+    # after the app updates itself. If `hermes update` changes that checkout,
+    # the checkout no longer agrees with the stamped tag of the shell. Thus
+    # refuse, and point at the in-app updater or at eject. Eject changes the
+    # install to source mode.
+    from hermes_cli.install_manifest import format_bundled_update_message, is_bundled_install
+
+    if is_bundled_install(PROJECT_ROOT):
+        print(format_bundled_update_message())
         sys.exit(1)
 
     if getattr(args, "check", False):

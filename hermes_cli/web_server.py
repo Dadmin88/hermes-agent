@@ -1050,6 +1050,11 @@ _CATEGORY_MERGE: Dict[str, str] = {
     "prompt_caching": "agent",
     "goals": "agent",
     "updates": "general",
+    # `update.channel` is the only schema-surfaced field under `update` (the
+    # bundled-install release-channel selector) — fold it into general next
+    # to the sibling `updates` section rather than spawning a one-field
+    # orphan category.
+    "update": "general",
     # `onboarding.profile_build` is the only schema-surfaced onboarding field
     # (`onboarding.seen` is an internal latch dict, not a user setting), so fold
     # it into the agent tab rather than spawning a one-field orphan category.
@@ -17960,6 +17965,19 @@ def start_server(
     from hermes_cli.resource_limits import apply_nofile_soft_limit
 
     apply_nofile_soft_limit()
+
+    # Post-update boot bootstrap. This is the rung that covers desktop
+    # bundled installs: after an app-updater swap, the first `hermes serve`
+    # boot sees the new stamp commit and runs config migration / skills
+    # sync / state.db guard for this home. Two file reads when the code
+    # didn't change; never raises.
+    try:
+        from hermes_cli.boot_bootstrap import maybe_run_boot_bootstrap
+        from hermes_cli.main import PROJECT_ROOT as _boot_root
+
+        maybe_run_boot_bootstrap(Path(_boot_root))
+    except Exception as exc:
+        _log.debug("boot bootstrap skipped: %s", exc)
 
     import uvicorn
 

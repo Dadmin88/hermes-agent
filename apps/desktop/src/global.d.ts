@@ -400,7 +400,9 @@ export interface DesktopVersionInfo {
   hermesRoot: string
 }
 
-export type DesktopUninstallMode = 'full' | 'gui' | 'lite'
+export type DesktopUninstallMode = 'data' | 'full' | 'gui' | 'lite'
+
+export type DesktopInstallKind = 'bundled' | 'nix' | 'standard'
 
 export interface DesktopUninstallSummary {
   hermes_home: string
@@ -413,6 +415,14 @@ export interface DesktopUninstallSummary {
   platform: string
   running_app_path?: null | string
   probe?: string
+  /** Which uninstall actions this install kind supports. */
+  allowed_modes?: DesktopUninstallMode[]
+  install_kind?: DesktopInstallKind
+  /**
+   * How to remove the app itself when the install is managed (nix/bundled):
+   * the steward's instructions. Null when the app can remove itself.
+   */
+  native_removal?: null | string
 }
 
 export interface DesktopUninstallResult {

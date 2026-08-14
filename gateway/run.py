@@ -28961,7 +28961,21 @@ def main():
         with open(args.config, encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
             config = GatewayConfig.from_dict(data)
-    
+
+    # Post-update boot bootstrap: when this install's code changed since the
+    # last boot (app-updater swap, docker/nix image change, git pull without
+    # `hermes update`), run the idempotent user-state steps (config
+    # migration, skills sync, state.db guard) before platforms connect.
+    # Two file reads when nothing changed; never raises.
+    try:
+        from pathlib import Path as _Path
+
+        from hermes_cli.boot_bootstrap import maybe_run_boot_bootstrap
+
+        maybe_run_boot_bootstrap(_Path(__file__).resolve().parents[1])
+    except Exception:
+        pass
+
     # start_gateway() performs the full graceful teardown (adapters
     # disconnected, sessions saved + flushed, SQLite closed, cron/MCP stopped,
     # PID file + runtime lock released) before it returns OR raises SystemExit
