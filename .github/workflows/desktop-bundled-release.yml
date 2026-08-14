@@ -1,11 +1,17 @@
 name: Desktop Bundled Release
 
-# This workflow builds the fully self-contained desktop installers for each
-# (os, arch) target. The agent payloads are baked in: the repo snapshot at
-# the release tag (with the prebuilt TUI/dashboard JS), uv plus CPython, a
-# ready site-packages tree, and node.
-# The app runs the backend directly out of its own resources.
-# nothing installs on the user machine.
+# This workflow builds the desktop installers for each (os, arch) target,
+# in both release variants:
+#
+#   * bundled — the fully self-contained installer. The agent payloads are
+#     baked in: the repo snapshot at the release tag (with the prebuilt
+#     TUI/dashboard JS), uv plus CPython, a ready site-packages tree, and
+#     node. The app runs the backend directly out of its own resources;
+#     nothing installs on the user machine.
+#   * light — "Hermes Light", the remote-only client. No agent payload, no
+#     local backend; it only connects to remote gateways. A separate app
+#     identity (own appId and names) and its own electron-updater channel
+#     (light*.yml), so both variants share one GitHub release.
 #
 # Payload staging stays dormant unless a build sets
 # HERMES_DESKTOP_VARIANT=bundled. This workflow is the only place that
@@ -51,8 +57,8 @@ concurrency:
 
 jobs:
   build:
-    name: ${{ matrix.label }}
-    runs-on: ${{ matrix.runner }}
+    name: ${{ matrix.variant }} ${{ matrix.target.label }}
+    runs-on: ${{ matrix.target.runner }}
     # The signing secrets and variables live in this environment, not at
     # repo level. Its deployment policy (main + v* tags) decides which
     # refs may receive them. Refs outside the policy fail at job start,
@@ -65,7 +71,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
+        # variant × target: every target builds both the bundled installer
+        # and the light client. The light lanes skip every payload step and
+        # finish much faster; signing and packaging are identical.
+        variant: [bundled, light]
+        target:
           # electron-builder targets are chosen by the shared script from
           # the runner platform: linux AppImage, mac dmg+zip, win nsis.
           - label: linux-x64
@@ -85,8 +95,10 @@ jobs:
           - label: win32-arm64
             runner: windows-11-arm
     env:
-      # This is the one switch that turns on the whole bundled stack.
-      HERMES_DESKTOP_VARIANT: 'bundled'
+      # The one switch that selects the variant stack. 'bundled' turns on
+      # payload staging; 'light' builds the remote-only client under its
+      # own app identity (electron-builder.config.cjs overlay).
+      HERMES_DESKTOP_VARIANT: ${{ matrix.variant }}
       HERMES_PAYLOAD_TAG: ${{ github.event.inputs.tag || github.ref_name }}
       HERMES_PAYLOAD_PYTHON: '3.11'
     steps:
@@ -151,14 +163,14 @@ jobs:
       # self-contained (the offline payload cannot ship loose DLLs). The
       # cache saves the ~20 minute from-source OpenSSL build on later runs.
       - name: Cache vcpkg OpenSSL (arm64)
-        if: matrix.label == 'win32-arm64'
+        if: matrix.variant == 'bundled' && matrix.target.label == 'win32-arm64'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: C:\vcpkg\installed\arm64-windows-static-md
           key: vcpkg-openssl-arm64-windows-static-md-${{ runner.os }}
 
       - name: Install OpenSSL (arm64)
-        if: matrix.label == 'win32-arm64'
+        if: matrix.variant == 'bundled' && matrix.target.label == 'win32-arm64'
         shell: bash
         run: |
           if [ ! -f "/c/vcpkg/installed/arm64-windows-static-md/lib/libcrypto.lib" ]; then
@@ -181,13 +193,14 @@ jobs:
       # anyway. win32-arm64 saves the most (15+ min of MSVC/Rust sdist
       # builds); every platform saves the python install + wheel downloads.
       - name: Cache payload python + site-packages
+        if: matrix.variant == 'bundled'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             apps/desktop/build/agent-payload/python
             apps/desktop/build/agent-payload/site-packages
             apps/desktop/build/agent-payload/.stage-cache-key
-          key: agent-payload-${{ matrix.label }}-py${{ env.HERMES_PAYLOAD_PYTHON }}-${{ hashFiles('uv.lock') }}
+          key: agent-payload-${{ matrix.target.label }}-py${{ env.HERMES_PAYLOAD_PYTHON }}-${{ hashFiles('uv.lock') }}
 
       # ── Azure OIDC login for Windows signing ───────────────────────────
       # No client secret exists anywhere. GitHub mints an OIDC token for
@@ -198,7 +211,7 @@ jobs:
       # Skipped when the environment variables are absent (forks, dry
       # runs) — the build stays unsigned.
       - name: Azure login (OIDC)
-        if: startsWith(matrix.label, 'win32-') && vars.AZURE_CLIENT_ID != ''
+        if: startsWith(matrix.target.label, 'win32-') && vars.AZURE_CLIENT_ID != ''
         uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca # v3.0.1
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
@@ -220,7 +233,7 @@ jobs:
       # a fresh dlib process that re-reads the file. The runner reaps the
       # loop at job end.
       - name: Mint federated token for the signing dlib
-        if: startsWith(matrix.label, 'win32-') && vars.AZURE_CLIENT_ID != ''
+        if: startsWith(matrix.target.label, 'win32-') && vars.AZURE_CLIENT_ID != ''
         shell: bash
         run: |
           file="$RUNNER_TEMP/azure-federated-token"
@@ -242,7 +255,7 @@ jobs:
       # secret holds the raw .p8 CONTENT and this step writes the file
       # whose path the build step exports as APPLE_API_KEY.
       - name: Write App Store Connect key for notarytool
-        if: startsWith(matrix.label, 'darwin-')
+        if: startsWith(matrix.target.label, 'darwin-')
         shell: bash
         env:
           APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
@@ -319,11 +332,11 @@ jobs:
           # AZURE_SIGN_* variables above are present. It cannot ride through
           # -c arguments: the publisherName contains spaces, which do not
           # survive the cmd.exe hops on the Windows runners.
-          MATRIX_LABEL="${{ matrix.label }}"
+          MATRIX_LABEL="${{ matrix.target.label }}"
           if [[ "$MATRIX_LABEL" == win32-* ]] && [ -n "$AZURE_SIGN_ENDPOINT" ] && [ -n "$AZURE_CLIENT_ID" ]; then
             echo "Windows signing: Azure Trusted Signing at $AZURE_SIGN_ENDPOINT"
           fi
-          node scripts/build-bundled-desktop.mjs --tag="$HERMES_BUNDLE_TAG"
+          node scripts/build-bundled-desktop.mjs --tag="$HERMES_BUNDLE_TAG" --variant="${{ matrix.variant }}"
 
       # makeappx reports manifest problems as a bare 0x80080204 with no
       # detail, and the manifest lives in a per-run stage dir — unreadable
@@ -349,7 +362,7 @@ jobs:
       - name: Audit bundle architecture
         shell: bash
         run: |
-          MATRIX_LABEL="${{ matrix.label }}"
+          MATRIX_LABEL="${{ matrix.target.label }}"
           node apps/desktop/scripts/audit-bundle-arch.mjs \
             --arch="${MATRIX_LABEL##*-}" --root=apps/desktop/release
 
@@ -368,12 +381,12 @@ jobs:
           if [ ${#dirs[@]} -eq 0 ]; then
             echo "::error::no unpacked app directory found"; exit 1
           fi
-          tar -czf "unpacked-${{ matrix.label }}.tar.gz" "${dirs[@]}"
+          tar -czf "unpacked-${{ matrix.variant }}-${{ matrix.target.label }}.tar.gz" "${dirs[@]}"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: hermes-bundled-${{ matrix.label }}-${{ env.HERMES_PAYLOAD_TAG }}
+          name: hermes-${{ matrix.variant }}-${{ matrix.target.label }}-${{ env.HERMES_PAYLOAD_TAG }}
           path: |
             apps/desktop/release/*.dmg
             apps/desktop/release/*.zip
@@ -382,6 +395,7 @@ jobs:
             apps/desktop/release/*.AppImage
             apps/desktop/release/*.blockmap
             apps/desktop/release/latest*.yml
+            apps/desktop/release/light*.yml
             apps/desktop/release/unpacked-*.tar.gz
           retention-days: 30
           if-no-files-found: error
@@ -396,7 +410,8 @@ jobs:
           shopt -s nullglob
           files=(apps/desktop/release/*.dmg apps/desktop/release/*.zip \
                  apps/desktop/release/*.exe apps/desktop/release/*.AppImage \
-                 apps/desktop/release/*.blockmap apps/desktop/release/latest*.yml)
+                 apps/desktop/release/*.blockmap apps/desktop/release/latest*.yml \
+                 apps/desktop/release/light*.yml)
           if [ ${#files[@]} -eq 0 ]; then
             echo "::error::no release artifacts found"; exit 1
           fi

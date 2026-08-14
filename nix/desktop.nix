@@ -1,11 +1,17 @@
 # nix/desktop.nix — Hermes Desktop (Electron) app build + wrapper
 #
-# `hermesAgent` is the fully-built `.#default` package — it ships the
-# `hermes` binary with the venv, runtime PATH, bundled skills/plugins, etc.
-# already wired up.  We point the desktop at it via the existing
-# `HERMES_DESKTOP_HERMES` override env var, so the desktop's resolver
-# uses our fully wrapped binary at step 4 ("existing Hermes CLI").
-# No reimplementation of the agent resolution in this wrapper.
+# Returns TWO derivations: `desktop` (the regular app, pointed at the
+# nix-built agent) and `light` ("Hermes Light", the remote-only client —
+# no agent in its closure at all).
+#
+# For the regular variant, `hermesAgent` is the fully-built `.#default`
+# package — it ships the `hermes` binary with the venv, runtime PATH,
+# bundled skills/plugins, etc. already wired up.  We point the desktop at
+# it via the existing `HERMES_DESKTOP_HERMES` override env var, so the
+# desktop's resolver uses our fully wrapped binary at step 4 ("existing
+# Hermes CLI").  No reimplementation of the agent resolution in this
+# wrapper.  The light variant sets no agent env var: its artifact kind
+# ('light' in the baked install stamp) makes the app remote-only.
 {
   pkgs,
   lib,
@@ -19,7 +25,6 @@
   branch ? null,
   dirty ? false,
   distance ? null,
-  displayVersion ? null,
   ...
 }:
 let
@@ -29,7 +34,6 @@ let
   # hermes-agent.nix computes distance and displayVersion once and passes
   # them in — do not re-derive them here.
   version = (fromTOML (builtins.readFile ../pyproject.toml)).project.version;
-  stampDisplayVersion = if displayVersion != null then displayVersion else version;
 
   electronHeaders = pkgs.fetchurl {
     url = "https://artifacts.electronjs.org/headers/dist/v${electron.version}/node-v${electron.version}-headers.tar.gz";
@@ -55,170 +59,232 @@ let
     else
       throw "hermes-desktop: unsupported host arch for node-pty staging";
 
-  # Build the renderer (dist/ + electron/ + package.json).
-  renderer = hermesNpmLib.buildNpmPackage {
-    dirs = [
-      "apps/desktop"
-      "apps/shared"
-    ];
-    pname = "hermes-desktop-renderer";
+  mkDesktop =
+    {
+      variant ? "",
+    }:
+    let
+      variantSuffix = if variant != "" then "-${variant}" else "";
+      binName = "hermes-desktop${variantSuffix}";
 
-    doCheck = true;
+      # Build the renderer (dist/ + electron/ + package.json).
+      renderer = hermesNpmLib.buildNpmPackage {
+        dirs = [
+          "apps/desktop"
+          "apps/shared"
+        ];
+        pname = "${binName}-renderer";
 
-    buildPhase = ''
-      runHook preBuild
+        doCheck = true;
 
-      mkdir -p apps/desktop/build
+        # for write_install_stamp.py
+        nativeBuildInputs = [
+          python3
+          hermesNpmLib.nodejs
+        ];
 
-      # Electron reads app.getVersion() from this manifest. The source
-      # manifest deliberately does not own the Hermes release version, so
-      # stamp the canonical package version into the Nix-built copy.
-      node -e '
-        const fs = require("fs")
-        const file = "apps/desktop/package.json"
-        const pkg = JSON.parse(fs.readFileSync(file, "utf8"))
-        pkg.version = process.argv[1]
-        fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + "\n")
-      ' '${version}'
+        HERMES_DESKTOP_VARIANT = variant;
 
-      patchShebangs .
+        buildPhase = ''
+          runHook preBuild
 
-      pushd apps/desktop
-        # typecheck :3
-        npm exec -- tsc -b
+          mkdir -p apps/desktop/build
 
-        # build the renderer bundle
-        # vite's emptyOutDir wipes dist/ on every run
-        # so it has to be first
-        npm exec -- vite build
 
-        # build the electron bundle
-        node scripts/bundle-electron-main.mjs
+          # grab desktopname and version, same as electron-builder
+          APP_ID=${getAppId}
+          node -e '
+            const fs = require("fs")
+            const file = "apps/desktop/package.json"
+            const pkg = JSON.parse(fs.readFileSync(file, "utf8"))
+            pkg.version = process.argv[1]
+            pkg.desktopName = process.argv[2]
+            fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + "\n")
+          ' '${version}' '$APP_ID'
 
-        # Compile node-pty against Electron's actual ABI (the nixpkgs
-        # `electron` we ship). Headers come from a pinned fetchurl input
-        # since the sandbox has no network here, so node-gyp's
-        # normal --disturl download path can't run.
-        mkdir -p "$TMPDIR/electron-headers"
-        tar -xzf ${electronHeaders} -C "$TMPDIR/electron-headers" --strip-components=1
+          patchShebangs .
 
-        ${lib.getExe hermesNpmLib.node-gyp} rebuild \
-          --directory=../../node_modules/node-pty \
-          --build-from-source \
-          --runtime=electron \
-          --target=${electron.version} \
-          --nodedir="$TMPDIR/electron-headers" \
-          --disturl="" \
-          --offline
+          pushd apps/desktop
+            # typecheck :3
+            npm exec -- tsc -b
 
-        # Target platform/arch come from stdenv.hostPlatform, not the
-        # build host's own process.platform/arch.
-        node scripts/stage-native-deps.mjs ${targetPlatform} ${targetArch}
-      popd
+            # The sandbox has no .git, so we pass things explicitly
+            python3 ${../scripts/write_install_stamp.py} \
+              --output build/install-stamp.json \
+              ${lib.optionalString (rev != null) "--commit ${rev}"} \
+              ${lib.optionalString (branch != null) "--branch ${lib.escapeShellArg branch}"} \
+              ${lib.optionalString dirty "--dirty"} \
+              --base-version '${version}' \
+              ${lib.optionalString (distance != null) "--distance ${toString distance}"} \
+              --source nix --distribution nix
 
-      runHook postBuild
-    '';
+            # build the renderer bundle
+            # vite's emptyOutDir wipes dist/ on every run
+            # so it has to be first
+            npm exec -- vite build
 
-    checkPhase = ''
-      runHook preCheck
+            # build the electron bundle (bakes the stamp + identity + the
+            # Linux .desktop entry, all variant-derived)
+            node scripts/bundle-electron-main.mjs
 
-      pushd apps/desktop
+            node scripts/gen-linux-desktop-entry.mjs --out-dir=build/desktop-entry
 
-        npm run postbuild
+            # Compile node-pty against Electron's actual ABI (the nixpkgs
+            # `electron` we ship). Headers come from a pinned fetchurl input
+            # since the sandbox has no network here, so node-gyp's
+            # normal --disturl download path can't run.
+            mkdir -p "$TMPDIR/electron-headers"
+            tar -xzf ${electronHeaders} -C "$TMPDIR/electron-headers" --strip-components=1
 
-        # validate staged node-pty native binary is present.
-        STAGED_PTY_NODE="./dist/node_modules/node-pty/build/Release/pty.node"
+            ${lib.getExe hermesNpmLib.node-gyp} rebuild \
+              --directory=../../node_modules/node-pty \
+              --build-from-source \
+              --runtime=electron \
+              --target=${electron.version} \
+              --nodedir="$TMPDIR/electron-headers" \
+              --disturl="" \
+              --offline
 
-        if [ ! -f "$STAGED_PTY_NODE" ]; then
-          echo "FATAL: Missing staged node-pty native binary at $STAGED_PTY_NODE"
-          echo "node-pty must be compiled natively"
-          exit 1
-        fi
-        
-      popd
+            # Target platform/arch come from stdenv.hostPlatform, not the
+            # build host's own process.platform/arch.
+            node scripts/stage-native-deps.mjs ${targetPlatform} ${targetArch}
+          popd
 
-      runHook postCheck
-    '';
+          runHook postBuild
+        '';
 
-    installPhase = ''
-      runHook preInstall
-      mkdir -p $out
-      # vite writes to apps/desktop/dist/ (we cd'd there in buildPhase).
-      # stage-native-deps.mjs stages node-pty into dist/node_modules/node-pty,
-      # so copying dist/ wholesale carries the native dep along with the
-      # esbuild bundle that require()s it. apps/desktop/build was created
-      # before the cd.
-      cp -rn apps/desktop/dist $out/
+        checkPhase = ''
+          runHook preCheck
 
-      cat > $out/install-stamp.json <<'EOF'
-      {"schemaVersion":2,"commit":${builtins.toJSON rev},"branch":${builtins.toJSON branch},"baseVersion":"${version}","displayVersion":"${stampDisplayVersion}","distance":${builtins.toJSON distance},"dirty":${
-        if dirty then "true" else "false"
-      },"source":"nix","distribution":"nix"}
-      EOF
+          pushd apps/desktop
 
-      cp -n apps/desktop/package.json $out/
-      runHook postInstall
-    '';
-  };
+            npm run postbuild
+
+            # validate staged node-pty native binary is present.
+            STAGED_PTY_NODE="./dist/node_modules/node-pty/build/Release/pty.node"
+
+            if [ ! -f "$STAGED_PTY_NODE" ]; then
+              echo "FATAL: Missing staged node-pty native binary at $STAGED_PTY_NODE"
+              echo "node-pty must be compiled natively"
+              exit 1
+            fi
+
+            # The .desktop entry must exist under the variant's appId and
+            # carry the placeholders the wrapper substitutes.
+            APP_ID=${getAppId}
+            ENTRY="build/desktop-entry/$APP_ID.desktop"
+            if [ ! -f "$ENTRY" ]; then
+              echo "FATAL: expected launcher entry at $ENTRY"
+              ls build/desktop-entry || true
+              exit 1
+            fi
+            grep -q '@@EXEC@@' "$ENTRY" || (echo "FATAL: $ENTRY lost its @@EXEC@@ placeholder"; exit 1)
+            grep -q '@@ICON@@' "$ENTRY" || (echo "FATAL: $ENTRY lost its @@ICON@@ placeholder"; exit 1)
+
+          popd
+
+          runHook postCheck
+        '';
+
+        installPhase = ''
+          runHook preInstall
+          mkdir -p $out
+          # vite writes to apps/desktop/dist/ (we cd'd there in buildPhase).
+          # stage-native-deps.mjs stages node-pty into dist/node_modules/node-pty,
+          # so copying dist/ wholesale carries the native dep along with the
+          # esbuild bundle that require()s it. apps/desktop/build was created
+          # before the cd.
+          cp -rn apps/desktop/dist $out/
+          cp -rn apps/desktop/build/desktop-entry $out/desktop-entry
+
+          cp -n apps/desktop/package.json $out/
+          runHook postInstall
+        '';
+      };
+      getAppId = ''$(${lib.getExe hermesNpmLib.nodejs} -e "console.log(require('${../apps/desktop/product-identity.cjs}').appId)")'';
+    in
+
+    # Electron wrapper: nixpkgs' electron binary pointed at the renderer dir.
+    stdenv.mkDerivation {
+      pname = "hermes-desktop${variantSuffix}";
+      inherit (renderer) version;
+
+      HERMES_DESKTOP_VARIANT = variant;
+
+      dontUnpack = true;
+      dontBuild = true;
+
+      nativeBuildInputs = [
+        makeWrapper
+      ];
+
+      installPhase = ''
+        runHook preInstall
+
+        mkdir -p $out/share/hermes-desktop $out/bin
+        cp -r ${renderer}/* $out/share/hermes-desktop/
+
+        # Standard nixpkgs pattern for electron-builder apps: patch process.resourcesPath
+        # to point to the app's directory. In Nix, unpackaged electron defaults this
+        # to the electron distribution's resources path, breaking extraResources lookups.
+        substituteInPlace $out/share/hermes-desktop/dist/electron-main.mjs \
+          --replace-fail "process.resourcesPath" "'$out/share/hermes-desktop'"
+
+        # Wrap the nixpkgs electron binary to launch our app.
+        ${
+          if variant == "light" then
+            # no agent in the closure
+            ''
+              makeWrapper ${lib.getExe electron} $out/bin/${binName} \
+                --add-flags "$out/share/hermes-desktop" \
+                --set ELECTRON_IS_DEV 0
+            ''
+          else
+            # Set HERMES_DESKTOP_HERMES to the absolute path of the
+            # nix-built `hermes` binary
+            ''
+              makeWrapper ${lib.getExe electron} $out/bin/${binName} \
+                --add-flags "$out/share/hermes-desktop" \
+                --set HERMES_DESKTOP_HERMES "${lib.getExe hermesAgent}" \
+                --set ELECTRON_IS_DEV 0
+            ''
+        }
+
+        # XDG launcher entry — the electron-builder-generated, variant-named
+        # entry from the renderer, with the placeholder Exec/Icon swapped
+        # for this wrapper's store paths. Icon name matches the appId so
+        # the entry's themed Icon= key resolves through hicolor.
+        APP_ID=${getAppId}
+        mkdir -p $out/share/applications $out/share/icons/hicolor/1024x1024/apps
+        install -m 0644 ${../apps/desktop/assets/icon.png} \
+          $out/share/icons/hicolor/1024x1024/apps/$APP_ID.png
+        install -m 0644 ${renderer}/desktop-entry/$APP_ID.desktop \
+          $out/share/applications/$APP_ID.desktop
+        substituteInPlace $out/share/applications/$APP_ID.desktop \
+          --replace-fail '@@EXEC@@' "$out/bin/${binName}" \
+          --replace-fail '@@ICON@@' '$APP_ID'
+
+        runHook postInstall
+      '';
+
+      passthru = {
+        inherit (renderer.passthru) packageJsonPath;
+      };
+
+      meta = with lib; {
+        description =
+          if variant == "light" then
+            "Remote-only Electron desktop client for Hermes Agent"
+          else
+            "Native Electron desktop shell for Hermes Agent";
+        homepage = "https://github.com/NousResearch/hermes-agent";
+        license = licenses.mit;
+        platforms = platforms.unix;
+        mainProgram = binName;
+      };
+    };
 in
-
-# Electron wrapper: nixpkgs' electron binary pointed at the renderer dir.
-stdenv.mkDerivation {
-  pname = "hermes-desktop";
-  inherit (renderer) version;
-
-  dontUnpack = true;
-  dontBuild = true;
-
-  nativeBuildInputs = [
-    makeWrapper
-    python3
-  ];
-
-  installPhase = ''
-    runHook preInstall
-
-    mkdir -p $out/share/hermes-desktop $out/bin
-    cp -r ${renderer}/* $out/share/hermes-desktop/
-
-    # Standard nixpkgs pattern for electron-builder apps: patch process.resourcesPath
-    # to point to the app's directory. In Nix, unpackaged electron defaults this
-    # to the electron distribution's resources path, breaking extraResources lookups.
-    substituteInPlace $out/share/hermes-desktop/dist/electron-main.mjs \
-      --replace-fail "process.resourcesPath" "'$out/share/hermes-desktop'"
-
-    # Wrap the nixpkgs electron binary to launch our app.  Set
-    # HERMES_DESKTOP_HERMES to the absolute path of the nix-built `hermes`
-    # binary so the desktop's resolver step 4 ("existing Hermes CLI on
-    # PATH") uses our fully wrapped binary — venv with all deps,
-    # bundled skills/plugins, runtime PATH (ripgrep/git/ffmpeg/etc).
-    # No reimplementation of the agent resolver in the wrapper.
-    makeWrapper ${lib.getExe electron} $out/bin/hermes-desktop \
-      --add-flags "$out/share/hermes-desktop" \
-      --set HERMES_DESKTOP_HERMES "${lib.getExe hermesAgent}" \
-      --set ELECTRON_IS_DEV 0
-
-    # XDG launcher entry
-    mkdir -p $out/share/applications $out/share/icons/hicolor/1024x1024/apps
-    install -m 0644 ${../apps/desktop/assets/icon.png} \
-      $out/share/icons/hicolor/1024x1024/apps/hermes.png
-    export PYTHONPATH=$(mktemp -d)
-    cp ${../hermes_cli/linux_desktop_entry.py} "$PYTHONPATH/linux_desktop_entry.py"
-    export DESKTOP_EXEC="$out/bin/hermes-desktop"
-    export DESKTOP_ICON="$out/share/icons/hicolor/1024x1024/apps/hermes.png"
-    python3 -c 'import os; from linux_desktop_entry import render_desktop_entry; print(render_desktop_entry(os.environ["DESKTOP_EXEC"], os.environ["DESKTOP_ICON"]))' > $out/share/applications/hermes.desktop
-    runHook postInstall
-  '';
-
-  passthru = {
-    inherit (renderer.passthru) packageJsonPath;
-  };
-
-  meta = with lib; {
-    description = "Native Electron desktop shell for Hermes Agent";
-    homepage = "https://github.com/NousResearch/hermes-agent";
-    license = licenses.mit;
-    platforms = platforms.unix;
-    mainProgram = "hermes-desktop";
-  };
+{
+  desktop = mkDesktop { };
+  light = mkDesktop { variant = "light"; };
 }

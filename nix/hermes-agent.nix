@@ -250,20 +250,22 @@ stdenv.mkDerivation (finalAttrs: {
         hermesVenv
         ;
 
-      # `hermesDesktop` references `finalAttrs.finalPackage` (this whole
-      # derivation, after all overrides are applied) so the desktop wrapper
-      # can prepend its `/bin` to PATH.  The desktop's resolver step 4
-      # ("existing hermes on PATH") then picks up the fully wrapped
-      # `hermes` binary — venv with all deps, bundled skills/plugins,
-      # runtime PATH (ripgrep/git/ffmpeg/etc).  No re-implementation
-      # of the agent resolution in the desktop wrapper.
-      hermesDesktop = callPackage ./desktop.nix {
+      # `hermesDesktopVariants` references `finalAttrs.finalPackage` (this
+      # whole derivation, after all overrides are applied) so the regular
+      # desktop wrapper can point HERMES_DESKTOP_HERMES at the fully
+      # wrapped `hermes` binary — venv with all deps, bundled
+      # skills/plugins, runtime PATH (ripgrep/git/ffmpeg/etc).  No
+      # re-implementation of the agent resolution in the desktop wrapper.
+      # The light variant carries no agent reference at all.
+      hermesDesktopVariants = callPackage ./desktop.nix {
         inherit hermesNpmLib electron;
         hermesAgent = finalAttrs.finalPackage;
         inherit rev branch dirty;
         distance = stampDistance;
         displayVersion = stampDisplayVersion;
       };
+      hermesDesktop = finalAttrs.finalPackage.hermesDesktopVariants.desktop;
+      hermesDesktopLight = finalAttrs.finalPackage.hermesDesktopVariants.light;
 
       devShellHook = ''
         export HERMES_PYTHON=${devPython}/bin/python3

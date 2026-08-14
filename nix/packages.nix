@@ -18,16 +18,23 @@
       # exposed as self.ref after Nix resolves it to an immutable source, so
       # branch is normally null for remote flakes. Preserve null rather than
       # inventing a sentinel that could be a real branch name.
-      rev = inputs.self.rev or (if dirtyRevision != null then builtins.substring 0 40 dirtyRevision else null);
+      rev =
+        inputs.self.rev or (if dirtyRevision != null then builtins.substring 0 40 dirtyRevision else null);
       revCount = inputs.self.revCount or null;
       rawRef = inputs.self.ref or null;
-      branch = if rawRef != null then builtins.replaceStrings ["refs/heads/"] [""] rawRef else null;
+      branch = if rawRef != null then builtins.replaceStrings [ "refs/heads/" ] [ "" ] rawRef else null;
       dirty = dirtyRevision != null;
       lastModified = inputs.self.lastModified or null;
       minimal = pkgs.callPackage ./hermes-agent.nix {
         inherit (inputs) uv2nix pyproject-nix pyproject-build-systems;
         npm-lockfile-fix = inputs'.npm-lockfile-fix.packages.default;
-        inherit rev revCount branch dirty lastModified;
+        inherit
+          rev
+          revCount
+          branch
+          dirty
+          lastModified
+          ;
       };
 
       # All platform-portable optional integrations pre-built.
@@ -78,6 +85,7 @@
         tui = full.hermesTui;
         web = full.hermesWeb;
         desktop = full.hermesDesktop;
+        desktop-light = full.hermesDesktopLight;
 
         # A self-contained builder for the bundled (embedded-runtime)
         # desktop artifact. The derivation is pure — it only wraps the
@@ -89,7 +97,11 @@
         #   nix run .#build-desktop-app-bundle -- --tag=vX.Y.Z
         build-desktop-app-bundle = pkgs.writeShellApplication {
           name = "build-desktop-app-bundle";
-          runtimeInputs = [ pkgs.nodejs_26 pkgs.uv pkgs.git ];
+          runtimeInputs = [
+            pkgs.nodejs_26
+            pkgs.uv
+            pkgs.git
+          ];
           text = ''
             if [ ! -f scripts/build-bundled-desktop.mjs ]; then
               echo "error: run from a hermes-agent checkout root" >&2

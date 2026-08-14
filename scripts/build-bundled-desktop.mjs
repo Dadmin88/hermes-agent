@@ -1,12 +1,21 @@
 #!/usr/bin/env node
-// build-bundled-desktop.mjs — build the fully bundled desktop installer
-// locally, on any of the three platforms.
+// build-bundled-desktop.mjs — build a release desktop installer locally,
+// on any of the three platforms, for either release variant:
+//
+//   --variant=bundled (default): the fully self-contained installer. The
+//     agent payloads are baked in (repo snapshot, uv + CPython,
+//     site-packages, node); the app runs the backend out of its own
+//     resources.
+//   --variant=light: "Hermes Light" — the remote-only client. No agent
+//     payload, no payload node, no local backend; the identity overlay in
+//     electron-builder.config.cjs renames the app and moves its updater
+//     feed to the 'light' channel.
 //
 //   1. preflight: uv, git, npm exist; a release tag is resolvable
 //   2. npm ci at the repo root
 //   3. build ui-tui (with hermes-ink) and the dashboard SPA
-//   4. download the payload node dist (the exact host node version)
-//   5. npm run build in apps/desktop with HERMES_DESKTOP_VARIANT=bundled
+//   4. download the payload node dist (bundled only)
+//   5. npm run build in apps/desktop with the variant exported
 //   6. npm run builder -- <platform targets>
 //
 // Every step always runs. There is no opt-out: a skipped step is a
@@ -14,6 +23,7 @@
 //
 // Usage:
 //   node scripts/build-bundled-desktop.mjs --tag=v0.20.0
+//   node scripts/build-bundled-desktop.mjs --tag=v0.20.0 --variant=light
 //
 // Signing is CI's job (Azure/Apple secrets). Local builds are unsigned.
 
@@ -29,10 +39,15 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..
 
 const args = process.argv.slice(2)
 const tagArg = args.find((a) => a.startsWith("--tag="))?.slice("--tag=".length)
+const variant = args.find((a) => a.startsWith("--variant="))?.slice("--variant=".length) || "bundled"
 // Everything after `--` goes to electron-builder verbatim (CI appends its
 // signing configuration this way).
 const dashDash = process.argv.indexOf("--")
 const extraBuilderArgs = dashDash === -1 ? [] : process.argv.slice(dashDash + 1)
+
+if (!["bundled", "light"].includes(variant)) {
+  fail(`--variant must be 'bundled' or 'light', got '${variant}'`)
+}
 
 function fail(message) {
   console.error(`[build-bundled] ${message}`)
@@ -189,7 +204,7 @@ if (!targets) {
   fail(`unsupported platform: ${process.platform}`)
 }
 
-console.log(`[build-bundled] tag=${tag} platform=${process.platform}-${process.arch}`)
+console.log(`[build-bundled] tag=${tag} variant=${variant} platform=${process.platform}-${process.arch}`)
 
 // ── 2-3. deps + JS surfaces ─────────────────────────────────────────────────
 
@@ -208,49 +223,55 @@ run("npm", ["run", "build", "--workspace", "ui-tui"])
 run("npm", ["run", "build", "--workspace", "web"])
 
 // ── 4. payload node dist ────────────────────────────────────────────────────
-// Pinned to the EXACT host node version: the JS surfaces were built and
-// npm-installed by the host node, and the payload node runs them at
-// runtime. A different version is a different artifact. This also means
-// the host node must be an official nodejs.org release — a patched build
-// whose version does not exist upstream fails here, loudly.
+// Bundled only: light ships no runtime, so there is no payload node to
+// embed. Pinned to the EXACT host node version: the JS surfaces were
+// built and npm-installed by the host node, and the payload node runs
+// them at runtime. A different version is a different artifact. This
+// also means the host node must be an official nodejs.org release — a
+// patched build whose version does not exist upstream fails here, loudly.
 
-const distName = { linux: "linux", darwin: "darwin", win32: "win" }[process.platform]
-const distArch = { x64: "x64", arm64: "arm64" }[process.arch]
-const distExt = process.platform === "win32" ? "zip" : process.platform === "darwin" ? "tar.gz" : "tar.xz"
+let nodeDir = null
+let work = null
 
-const version = `v${HOST_TOOLCHAIN.node.join(".")}`
-const index = JSON.parse(
-  execSync(`curl -fsSL https://nodejs.org/dist/index.json`, { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 })
-)
-if (!index.some((e) => e.version === version)) {
-  fail(`host node ${version} is not an official nodejs.org release — cannot embed the exact build toolchain`)
+if (variant === "bundled") {
+  const distName = { linux: "linux", darwin: "darwin", win32: "win" }[process.platform]
+  const distArch = { x64: "x64", arm64: "arm64" }[process.arch]
+  const distExt = process.platform === "win32" ? "zip" : process.platform === "darwin" ? "tar.gz" : "tar.xz"
+
+  const version = `v${HOST_TOOLCHAIN.node.join(".")}`
+  const index = JSON.parse(
+    execSync(`curl -fsSL https://nodejs.org/dist/index.json`, { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 })
+  )
+  if (!index.some((e) => e.version === version)) {
+    fail(`host node ${version} is not an official nodejs.org release — cannot embed the exact build toolchain`)
+  }
+
+  work = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-node-payload-"))
+  const archive = `node-${version}-${distName}-${distArch}.${distExt}`
+  const extractDir = path.join(work, "extract")
+  nodeDir = path.join(work, "node-payload")
+  fs.mkdirSync(extractDir, { recursive: true })
+
+  console.log(`[build-bundled] payload node: ${version}`)
+  run("curl", ["-fsSL", "-o", path.join(work, archive), `https://nodejs.org/dist/${version}/${archive}`])
+  run(hostTarBin(), ["-xf", path.join(work, archive), "-C", extractDir])
+  const [topDir] = fs.readdirSync(extractDir)
+  fs.renameSync(path.join(extractDir, topDir), nodeDir)
+
+  const nodeBinary = process.platform === "win32" ? path.join(nodeDir, "node.exe") : path.join(nodeDir, "bin", "node")
+  if (!fs.existsSync(nodeBinary)) {
+    fail(`extracted node dist has no runnable node at ${nodeBinary}`)
+  }
 }
 
-const work = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-node-payload-"))
-const archive = `node-${version}-${distName}-${distArch}.${distExt}`
-const extractDir = path.join(work, "extract")
-const nodeDir = path.join(work, "node-payload")
-fs.mkdirSync(extractDir, { recursive: true })
-
-console.log(`[build-bundled] payload node: ${version}`)
-run("curl", ["-fsSL", "-o", path.join(work, archive), `https://nodejs.org/dist/${version}/${archive}`])
-run(hostTarBin(), ["-xf", path.join(work, archive), "-C", extractDir])
-const [topDir] = fs.readdirSync(extractDir)
-fs.renameSync(path.join(extractDir, topDir), nodeDir)
-
-const nodeBinary = process.platform === "win32" ? path.join(nodeDir, "node.exe") : path.join(nodeDir, "bin", "node")
-if (!fs.existsSync(nodeBinary)) {
-  fail(`extracted node dist has no runnable node at ${nodeBinary}`)
-}
-
-// ── 5-6. bundled desktop build + package ────────────────────────────────────
+// ── 5-6. desktop build + package ────────────────────────────────────────────
 
 const env = {
   ...process.env,
-  HERMES_DESKTOP_VARIANT: "bundled",
+  HERMES_DESKTOP_VARIANT: variant,
   HERMES_PAYLOAD_TAG: tag,
   HERMES_PAYLOAD_PYTHON: process.env.HERMES_PAYLOAD_PYTHON || "3.11",
-  HERMES_PAYLOAD_NODE_DIST: nodeDir,
+  ...(nodeDir ? { HERMES_PAYLOAD_NODE_DIST: nodeDir } : {}),
 }
 
 const desktop = path.join(REPO_ROOT, "apps", "desktop")
@@ -268,4 +289,6 @@ run(
 )
 console.log(`[build-bundled] artifacts: ${path.join(desktop, "release")}`)
 
-fs.rmSync(work, { recursive: true, force: true })
+if (work) {
+  fs.rmSync(work, { recursive: true, force: true })
+}

@@ -57,6 +57,46 @@ def log_warn(msg: str):
     print(f"{color('⚠', Colors.YELLOW)} {msg}")
 
 
+def _refresh_desktop_databases(applications_dir: Path) -> "list[str]":
+    """Reindex the Linux menu caches. Run each tool only when it exists.
+
+    Returns the names of the tools that ran (for logging and tests). The
+    Electron app owns entry INSTALLATION (electron/linux-desktop-entry.ts);
+    this uninstaller only needs the cache refresh after removing entries.
+    """
+    import subprocess
+
+    ran: list[str] = []
+
+    def _run_quiet(cmd: "list[str]") -> bool:
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return result.returncode == 0
+
+    update_db = shutil.which("update-desktop-database")
+    if update_db and _run_quiet([update_db, str(applications_dir)]):
+        ran.append("update-desktop-database")
+
+    # Plasma 6 first, then Plasma 5. Only one of them is ever installed.
+    for tool in ("kbuildsycoca6", "kbuildsycoca5"):
+        resolved = shutil.which(tool)
+        if not resolved:
+            continue
+        if _run_quiet([resolved, "--noincremental"]):
+            ran.append(tool)
+        break
+
+    return ran
+
+
 # ---------------------------------------------------------------------------
 # Discovery
 # ---------------------------------------------------------------------------
@@ -137,21 +177,25 @@ def packaged_gui_app_paths() -> "list[Path]":
             paths.append(Path(program_files) / "Hermes")
     else:
         # Linux: AppImage is a single file the user placed somewhere; we can
-        # only reliably clean the desktop entry + icon we know the name of.
-        # The AppImage itself lives wherever the user put it, so we surface a
-        # hint rather than guessing. deb/rpm installs are owned by the system
-        # package manager and must be removed via apt/dnf — see the message in
-        # ``uninstall_gui``.
-        from hermes_cli.linux_desktop_entry import desktop_entry_path
-
+        # only reliably clean the desktop entries + icons we know the names
+        # of. The AppImage itself lives wherever the user put it, so we
+        # surface a hint rather than guessing.
         data = os.environ.get("XDG_DATA_HOME")
         data_base = Path(data) if data else (home / ".local" / "share")
+        applications = data_base / "applications"
+        icons = data_base / "icons" / "hicolor" / "1024x1024" / "apps"
         paths += [
-            # The launcher entry `hermes desktop` installs. Its icon lives
-            # in the checkout, not in the installed app.
-            desktop_entry_path(),
-            # Some packaged builds emit this casing.
-            data_base / "applications" / "Hermes.desktop",
+            applications / "com.nousresearch.hermes.desktop",
+            icons / "com.nousresearch.hermes.png",
+            # Hermes Light installs beside full Hermes under its own appId, so
+            # its launcher entry and icon are separate files with separate
+            # names. An uninstall that skipped them would leave a dead menu
+            # entry behind.
+            applications / "com.nousresearch.hermes-light.desktop",
+            icons / "com.nousresearch.hermes-light.png",
+            # old ones
+            applications / "hermes.desktop",
+            applications / "Hermes.desktop",
         ]
     return paths
 
@@ -249,8 +293,7 @@ def uninstall_gui(hermes_home: "Path | None" = None, *, remove_userdata: bool = 
 
     Removes:
       - source-built GUI artifacts (dist/release/node_modules/build-stamp)
-      - the packaged app bundle / install dir (best-effort; deb/rpm need the
-        system package manager and are reported, not force-removed)
+      - the packaged app bundle / install dir.
       - the Electron ``userData`` directory (unless ``remove_userdata=False``)
 
     Never touches ``hermes-agent/hermes_cli`` (agent source), ``venv/``, or any
@@ -290,31 +333,16 @@ def uninstall_gui(hermes_home: "Path | None" = None, *, remove_userdata: bool = 
     if not removed:
         log_info("No desktop GUI artifacts found to remove")
 
-    # Linux deb/rpm installs are owned by the package manager; we can't (and
-    # shouldn't) rmtree files under /usr. Surface the hint so the user can
-    # finish the job. AppImages live wherever the user dropped them.
     if sys.platform.startswith("linux"):
-        # The desktop entry was removed above (it is in
-        # ``packaged_gui_app_paths``), but the menu caches still list it.
+        # The desktop entries were removed above (they are in
+        # ``packaged_gui_app_paths``), but the menu caches still list them.
         # Reindex so Hermes disappears from the launcher.
         try:
-            from hermes_cli.linux_desktop_entry import (
-                desktop_entry_path,
-                refresh_desktop_databases,
-            )
-
-            entry = desktop_entry_path()
-            if entry in removed:
-                for tool in refresh_desktop_databases(entry.parent):
+            removed_entries = [p for p in removed if p.suffix == ".desktop"]
+            if removed_entries:
+                for tool in _refresh_desktop_databases(removed_entries[0].parent):
                     log_success(f"Refreshed the application menu cache ({tool})")
         except Exception as e:
             log_warn(f"Could not refresh the application menu cache: {e}")
-
-        log_info(
-            "If you installed the desktop via a .deb / .rpm package, remove it "
-            "with your package manager (e.g. 'sudo apt remove hermes' or "
-            "'sudo dnf remove hermes'). AppImage builds are a single file you "
-            "can delete from wherever you saved it."
-        )
 
     return removed

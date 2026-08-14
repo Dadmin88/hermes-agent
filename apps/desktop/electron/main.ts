@@ -155,6 +155,11 @@ import { cursorPointInWindow } from './hud-cursor'
 import { buildHudWindowUrl } from './hud-url'
 import { INSTALL_STAMP } from './install-stamp'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
+import {
+  installLinuxDesktopEntry,
+  LINUX_DESKTOP_ENTRY,
+  resolveLauncherExec
+} from './linux-desktop-entry'
 import { ensureMainWindow } from './main-window-lifecycle'
 import {
   oauthGuardMayHardFail,
@@ -12950,6 +12955,40 @@ app.on('open-url', (event, url) => {
   handleDeepLink(url)
 })
 
+// Install (or refresh) the XDG launcher entry. Linux packaged runs only:
+// the entry text is baked at build time from electron-builder's own
+// generator, variant-named, so Hermes and Hermes Light coexist. Nix ships
+// its entry from the store derivation instead — a per-user copy would
+// duplicate it in the menu.
+function registerLinuxLauncherEntry(): void {
+  if (process.platform !== 'linux' || !LINUX_DESKTOP_ENTRY) {
+    return
+  }
+
+  if (INSTALL_STAMP?.distribution === 'nix') {
+    return
+  }
+
+  const exec = resolveLauncherExec(process.env, process.execPath, IS_PACKAGED)
+
+  if (!exec) {
+    return
+  }
+
+  const iconCandidate = path.join(APP_ROOT, 'public', 'apple-touch-icon.png')
+
+  const result = installLinuxDesktopEntry({
+    entry: LINUX_DESKTOP_ENTRY,
+    execPath: exec,
+    iconPath: fs.existsSync(iconCandidate) ? iconCandidate : null,
+    env: process.env
+  })
+
+  if (result.changed) {
+    rememberLog(`[launcher] installed desktop entry: ${result.entryPath}`)
+  }
+}
+
 app.whenReady().then(() => {
   const systemCa = installWindowsSystemCaTrust(tls)
 
@@ -12980,6 +13019,7 @@ app.whenReady().then(() => {
   registerMediaProtocol()
   installEmbedReferer()
   registerDeepLinkProtocol()
+  registerLinuxLauncherEntry()
   ensureWslWindowsFonts()
   configureSpellChecker()
   registerPowerResumeListeners()

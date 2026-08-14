@@ -6015,6 +6015,10 @@ def _desktop_build_needed(desktop_dir: Path, project_root: Path, *, source_mode:
     if stamp_data.get("sourceMode") != source_mode:
         return True
 
+    # If the variant changed, force a rebuild
+    if stamp_data.get("variant") != os.environ.get("HERMES_DESKTOP_VARIANT", ""):
+        return True
+
     saved_hash = stamp_data.get("contentHash")
     if not saved_hash:
         return True
@@ -6034,6 +6038,7 @@ def _write_desktop_build_stamp(project_root: Path, *, source_mode: bool) -> None
             "contentHash": content_hash,
             "sourceMode": source_mode,
             "builtAt": datetime.now(timezone.utc).isoformat(),
+            "variant": os.environ.get("HERMES_DESKTOP_VARIANT", "")
         }
         stamp_file.write_text(json.dumps(stamp_data, indent=2) + "\n", encoding="utf-8")
     except Exception as exc:
@@ -6045,19 +6050,24 @@ def _desktop_packaged_executable(desktop_dir: Path) -> Optional[Path]:
     """Return the current platform's unpacked Electron app executable."""
     release_dir = desktop_dir / "release"
     if sys.platform == "darwin":
-        candidates = list(release_dir.glob("mac*/Hermes.app/Contents/MacOS/Hermes"))
+        candidates = list(release_dir.glob("mac*/Hermes*.app/Contents/MacOS/Hermes*"))
     elif sys.platform == "win32":
         candidates = [
             release_dir / "win-unpacked" / "Hermes.exe",
+            release_dir / "win-unpacked" / "Hermes Light.exe",
             release_dir / "win-ia32-unpacked" / "Hermes.exe",
+            release_dir / "win-ia32-unpacked" / "Hermes Light.exe",
             release_dir / "win-arm64-unpacked" / "Hermes.exe",
+            release_dir / "win-arm64-unpacked" / "Hermes Light.exe",
         ]
     else:
         candidates = [
             release_dir / "linux-unpacked" / "hermes",
             release_dir / "linux-unpacked" / "Hermes",
+            release_dir / "linux-unpacked" / "Hermes Light",
             release_dir / "linux-arm64-unpacked" / "hermes",
             release_dir / "linux-arm64-unpacked" / "Hermes",
+            release_dir / "linux-arm64-unpacked" / "Hermes Light",
         ]
 
     existing = [p for p in candidates if p.exists()]
@@ -7136,25 +7146,6 @@ def _desktop_launch_options() -> tuple[list[str], str, str]:
     return flags, disable_gpu, password_store
 
 
-def _register_linux_desktop_entry() -> None:
-    """Install the XDG desktop entry for Hermes Desktop (Linux only, best-effort).
-
-    Gives the Electron app a launcher presence: a menu item and an icon.
-    ``Exec`` and ``Icon`` are absolute, so the entry works outside a login
-    shell. ``hermes uninstall --gui`` removes it.
-    """
-    try:
-        from hermes_cli.linux_desktop_entry import install_desktop_entry, is_supported
-
-        if not is_supported():
-            return
-        entry = install_desktop_entry(PROJECT_ROOT)
-        if entry:
-            print(f"✓ Desktop launcher entry installed: {entry}")
-    except Exception as exc:  # never block a launch on launcher plumbing
-        print(f"⚠ Could not install the desktop launcher entry: {exc}")
-
-
 def cmd_gui(args: argparse.Namespace):
     """Build and launch the native Electron desktop GUI."""
     desktop_dir = PROJECT_ROOT / "apps" / "desktop"
@@ -7371,10 +7362,9 @@ def cmd_gui(args: argparse.Namespace):
             # Build succeeded — write the stamp so next run can skip
             _write_desktop_build_stamp(PROJECT_ROOT, source_mode=source_mode)
 
-    # Linux: register the app in the desktop launcher, so Hermes shows up
-    # in the application menu with its icon. Best-effort and idempotent.
-    # A failure must never stop the app from launching.
-    _register_linux_desktop_entry()
+    # (The Linux launcher entry is installed by the Electron app itself on
+    # startup — electron/linux-desktop-entry.ts — from the entry baked at
+    # build time. No Python-side registration.)
 
     # --build-only: produce the artifact but do NOT launch. The installer's
     # --update flow drives the rebuild headlessly and then launches the desktop
