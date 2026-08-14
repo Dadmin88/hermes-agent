@@ -10,7 +10,8 @@ import {
   hermesManagedNodePathEntries,
   normalizeHermesHomeRoot,
   pathEnvKey,
-  POSIX_SANE_PATH_ENTRIES
+  POSIX_SANE_PATH_ENTRIES,
+  readRuntimeFacts
 } from './backend-env'
 
 test('desktop backend PATH adds Hermes-managed bins and missing POSIX sane entries', () => {

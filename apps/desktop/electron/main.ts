@@ -51,6 +51,7 @@ import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from 
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
 import { runBootstrap } from './bootstrap-runner'
 import { findEmbeddedPython, latestReleaseFromLsRemote, resolvePayload, updateChannelFromConfig } from './bundled-runtime'
+import { decideResidentRuntime, findResidentPython, latestReleaseFromLsRemote, resolveChannel, resolvePayload } from './bundled-runtime'
 import { applyConnectionChange, resolveTerminalConnection } from './connection-apply'
 import {
   authModeFromStatus,
@@ -3053,6 +3054,22 @@ async function applyUpdates(opts = {}) {
     }
   }
 
+  // Bundled installs: download the new app from the GitHub Releases feed,
+  // then quit and install. After the relaunch, the marker-tag mismatch
+  // triggers the offline agent rebuild — no git, no venv mutation while
+  // the app runs, and the Windows setup-binary handoff is unnecessary.
+  if (bundledUpdaterActive()) {
+    updateInFlight = true
+
+    try {
+      return await applyAppUpdate(percent =>
+        emitUpdateProgress({ stage: 'download', message: 'Downloading the app update…', percent })
+      )
+    } finally {
+      updateInFlight = false
+    }
+  }
+
   // Every path below mutates the checkout (stash, branch switch, rebuild).
   // Refuse before touching anything that isn't the managed install — the
   // same guard `hermes update` applies (and --yes is not a bypass there
@@ -3919,6 +3936,33 @@ function readTextOrNull(filePath) {
 //   }
 function readBootstrapMarker() {
   return readJson(BOOTSTRAP_COMPLETE_MARKER)
+}
+
+// ─── Embedded-runtime facts ─────────────────────────────────────────────────
+
+/**
+ * The embedded payload of this artifact, or null on external builds.
+ * Resolution re-reads cheap file facts on every call; the answer is a
+ * constant of the artifact in practice (the payload ships inside the
+ * sealed resources and never changes at runtime).
+ */
+function embeddedPayload() {
+  return resolvePayload(process.resourcesPath)
+}
+
+/**
+ * True when app updates go through electron-updater instead of git.
+ * A constant of the artifact: embedded builds self-update, external
+ * builds never do. No machine state has a say — an eject replaces the
+ * whole app with a source-built external one.
+ */
+function bundledUpdaterActive(): boolean {
+  const stamp = INSTALL_STAMP as any
+
+  return shouldUseAppUpdater({
+    stampHasPayload: Boolean(stamp && stamp.payload),
+    isPackaged: app.isPackaged
+  })
 }
 
 // ─── Embedded-runtime facts ─────────────────────────────────────────────────
