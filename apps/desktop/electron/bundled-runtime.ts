@@ -63,7 +63,7 @@ export function resolvePayload(
     return null
   }
 
-  if (!EMBEDDED_RUNTIME_ITEMS.every(item => dirExists(path.join(dir, item)))) {
+  if (!embeddedRuntimeItems().every(item => dirExists(path.join(dir, item)))) {
     return null
   }
 
@@ -82,8 +82,13 @@ export const PAYLOAD_SCHEMA_VERSION = 3
 // never installs the runtime (site-packages ships prebuilt), but runtime
 // lazy installs for plugins are a mandatory feature, and uv is what
 // installs them into the writable overlay. A payload without uv is an
-// incomplete artifact, not a degraded one.
-export const EMBEDDED_RUNTIME_ITEMS = ['repo', 'uv', 'python', 'site-packages', 'node'] as const
+// incomplete artifact, not a degraded one. git is Windows-only: macOS has
+// /usr/bin/git (Xcode CLT) and Linux has system git, so the staging script
+// only downloads PortableGit for win32.
+export function embeddedRuntimeItems(platform: NodeJS.Platform = process.platform): readonly string[] {
+  const base = ['repo', 'uv', 'python', 'site-packages', 'node'] as const
+  return platform === 'win32' ? [...base, 'git'] : base
+}
 
 /**
  * Locate the payload CPython binary. The install directory is

@@ -12,6 +12,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _install_root_is_tmp(tmp_path, monkeypatch):
+    """managed_uv now resolves through get_runtime_dir() -> install root.
+    Point the install root at tmp_path so every test's managed uv lands
+    in an isolated .hermes-runtime (hermes-home lifetime split, 2.5)."""
+    monkeypatch.setenv("HERMES_INSTALL_ROOT", str(tmp_path))
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -80,7 +88,7 @@ class TestManagedUvPath:
     def test_posix(self, tmp_path):
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path):
             from hermes_cli.managed_uv import managed_uv_path
-            assert managed_uv_path() == tmp_path / "bin" / "uv"
+            assert managed_uv_path() == tmp_path / ".hermes-runtime" / "uv" / "uv"
 
 
 # ---------------------------------------------------------------------------
@@ -90,14 +98,14 @@ class TestManagedUvPath:
 class TestResolveUv:
 
     def test_existing_executable(self, tmp_path):
-        _make_executable(tmp_path / "bin" / "uv")
+        _make_executable(tmp_path / ".hermes-runtime" / "uv" / "uv")
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path):
             from hermes_cli.managed_uv import resolve_uv
             result = resolve_uv()
-            assert result == str(tmp_path / "bin" / "uv")
+            assert result == str(tmp_path / ".hermes-runtime" / "uv" / "uv")
 
     def test_non_executable_file_returns_none(self, tmp_path):
-        uv = tmp_path / "bin" / "uv"
+        uv = tmp_path / ".hermes-runtime" / "uv" / "uv"
         uv.parent.mkdir(parents=True)
         uv.write_text("not a binary")
         # Ensure no execute bit
@@ -124,7 +132,7 @@ class TestEnsureUv:
 
             from hermes_cli.managed_uv import ensure_uv
             path = ensure_uv()
-            assert path == str(tmp_path / "bin" / "uv")
+            assert path == str(tmp_path / ".hermes-runtime" / "uv" / "uv")
             mock_install.assert_called_once()
 
     def test_install_reports_runtime_repair_to_observer(self, tmp_path):
@@ -155,7 +163,7 @@ class TestEnsureUv:
         ):
             path = ensure_uv(repair_observer=observed.append)
 
-        assert path == str(tmp_path / "bin" / "uv")
+        assert path == str(tmp_path / ".hermes-runtime" / "uv" / "uv")
         assert observed == [repair]
 
 
@@ -182,21 +190,21 @@ class TestEnsureUvUpdateBoundary:
     """
 
     def test_success_usable_as_single_value(self, tmp_path):
-        _make_executable(tmp_path / "bin" / "uv")
+        _make_executable(tmp_path / ".hermes-runtime" / "uv" / "uv")
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
              patch("hermes_cli.managed_uv.repair_vulnerable_runtime", return_value=_RRR("not-applicable")):
             from hermes_cli.managed_uv import ensure_uv
             uv_bin = ensure_uv()
-            assert uv_bin == str(tmp_path / "bin" / "uv")
+            assert uv_bin == str(tmp_path / ".hermes-runtime" / "uv" / "uv")
             assert bool(uv_bin) is True
 
     def test_success_unpacks_as_legacy_two_tuple(self, tmp_path):
-        _make_executable(tmp_path / "bin" / "uv")
+        _make_executable(tmp_path / ".hermes-runtime" / "uv" / "uv")
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
              patch("hermes_cli.managed_uv.repair_vulnerable_runtime", return_value=_RRR("not-applicable")):
             from hermes_cli.managed_uv import ensure_uv
             uv_bin, fresh = ensure_uv()  # old: uv_bin, fresh_bootstrap = ensure_uv()
-            assert uv_bin == str(tmp_path / "bin" / "uv")
+            assert uv_bin == str(tmp_path / ".hermes-runtime" / "uv" / "uv")
             assert fresh is False
 
     def test_failure_unpacks_without_raising(self, tmp_path):
@@ -266,7 +274,7 @@ class TestUpdateManagedUv:
         vulnerable-runtime repair probe still runs (CVE repair is never gated)."""
         from hermes_cli.managed_uv import RuntimeRepairResult, update_managed_uv
 
-        uv = tmp_path / "bin" / "uv"
+        uv = tmp_path / ".hermes-runtime" / "uv" / "uv"
         _make_executable(uv)
         # Fresh stamp under the isolated HERMES_HOME.
         import hermes_constants
@@ -293,7 +301,7 @@ class TestUpdateManagedUv:
 
         from hermes_cli.managed_uv import UV_SELF_UPDATE_INTERVAL_SECONDS, update_managed_uv
 
-        uv = tmp_path / "bin" / "uv"
+        uv = tmp_path / ".hermes-runtime" / "uv" / "uv"
         _make_executable(uv)
         import hermes_constants
         stamp = hermes_constants.get_hermes_home() / "cache" / ".uv_self_update_stamp"
@@ -607,13 +615,13 @@ class TestRuntimeCutover:
 
 class TestInstallUvInternals:
     def test_posix_sets_uv_unmanaged_install(self, tmp_path):
-        target = tmp_path / "bin" / "uv"
+        target = tmp_path / ".hermes-runtime" / "uv" / "uv"
         with patch("hermes_cli.managed_uv._install_uv_posix") as mock_posix:
             from hermes_cli.managed_uv import _install_uv
             _install_uv(target)
             mock_posix.assert_called_once()
             call_env = mock_posix.call_args[0][0]
-            assert call_env["UV_UNMANAGED_INSTALL"] == str(tmp_path / "bin")
+            assert call_env["UV_UNMANAGED_INSTALL"] == str(target.parent)
 
 
 class TestRuntimeRequestMinorLine:

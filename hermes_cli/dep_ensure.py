@@ -80,17 +80,13 @@ def _has_npx_agent_browser() -> bool:
 
 
 def _has_hermes_agent_browser() -> bool:
-    from hermes_constants import get_hermes_home
-    home = get_hermes_home()
-    if _IS_WINDOWS:
-        # npm -g --prefix puts .cmd shims directly in the prefix dir on Windows
-        return (home / "node" / "agent-browser.cmd").is_file()
-    # install.sh installs globally into $HERMES_HOME/node/bin/ via npm -g --prefix
-    # Also check legacy node_modules/.bin/ path for git-clone installs.
-    return (
-        (home / "node" / "bin" / "agent-browser").is_file()
-        or (home / "node_modules" / ".bin" / "agent-browser").is_file()
-    )
+    from hermes_constants import iter_hermes_node_dirs
+
+    # The managed Node tree is install-scoped; iter_hermes_node_dirs owns
+    # where it lives and the per-platform layout order (npm -g --prefix
+    # drops .cmd shims in the prefix root on Windows, bin/ on POSIX).
+    name = "agent-browser.cmd" if _IS_WINDOWS else "agent-browser"
+    return any((directory / name).is_file() for directory in iter_hermes_node_dirs())
 
 
 def _find_install_script(

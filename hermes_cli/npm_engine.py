@@ -143,7 +143,9 @@ def managed_npm_prefix(npm: str | os.PathLike[str] | None) -> Path | None:
     """
     if not npm:
         return None
-    prefix = get_hermes_home() / "node"
+    from hermes_constants import get_runtime_dir
+
+    prefix = get_runtime_dir() / "node"
     try:
         resolved = Path(npm).resolve()
         prefix_resolved = prefix.resolve()

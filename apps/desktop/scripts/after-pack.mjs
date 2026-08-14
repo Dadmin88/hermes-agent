@@ -22,6 +22,7 @@
 import path from 'node:path'
 
 import { stampExeIdentity } from './set-exe-identity.mjs'
+import { sanitizeTree } from './sanitize-pe-signatures.mjs'
 
 export default async function afterPack(context) {
   if (context.electronPlatformName !== 'win32') {
@@ -31,6 +32,18 @@ export default async function afterPack(context) {
   const productName = context.packager?.appInfo?.productFilename || 'Hermes'
   const exe = path.join(context.appOutDir, `${productName}.exe`)
   const desktopRoot = path.resolve(import.meta.dirname, '..')
+
+  // Repair dangling PE certificate tables BEFORE electron-builder signs the
+  // tree. A stripped-but-still-declared signature makes signtool reject the
+  // file with 0x800700C1, and AppxSIP inspects every PE inside the MSIX, so
+  // one bad payload DLL fails the whole package. Unlike the stamp below this
+  // is NOT best-effort: shipping past it means shipping an unsignable bundle.
+  // this is a hack until https://github.com/astral-sh/python-build-standalone/pull/1217 is merged.
+  const { scanned, repaired } = sanitizeTree(context.appOutDir)
+  console.log(`[after-pack] ${scanned} PEs scanned, ${repaired.length} dangling certificate tables cleared`)
+  for (const file of repaired) {
+    console.log(`  ${file}`)
+  }
 
   try {
     await stampExeIdentity(exe, desktopRoot)

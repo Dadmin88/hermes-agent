@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'vitest'
 
-import { archMatches, classifyHeader, findUnpackedDirs, peArch } from '../scripts/audit-bundle-arch.mjs'
+import { archMatches, classifyHeader, findUnpackedDirs, isExemptPath, peArch } from '../scripts/audit-bundle-arch.mjs'
 
 // ─── header builders: the smallest buffers each format needs ───────────────
 
@@ -94,4 +94,31 @@ test('findUnpackedDirs matches electron-builder output shapes only', () => {
     'win-unpacked', 'win-arm64-unpacked', 'linux-unpacked', 'linux-arm64-unpacked',
     'mac', 'mac-arm64'
   ])
+})
+
+// ─── the git exemption is PortableGit-shaped, not git-shaped ───────────────
+
+test('PortableGit internals stay exempt from the arch audit', () => {
+  // .NET assemblies report ia32 because they are format-neutral, and the
+  // staging script PE-probes cmd/git.exe itself.
+  for (const relPath of [
+    'resources/agent-payload/git/mingw64/bin/Atlassian.Bitbucket.UI.exe',
+    'resources/agent-payload/git/clangarm64/libexec/git-core/Avalonia.dll',
+    'resources/agent-payload/git/clangarm64/libexec/git-core/msalruntime.dll',
+    'resources/agent-payload/git/usr/libexec/getprocaddr32.exe',
+    'resources/agent-payload/git/cmd/git.exe'
+  ]) {
+    assert.equal(isExemptPath(relPath), true, relPath)
+  }
+})
+
+test('dugite-native git IS audited — it has no format-neutral binaries', () => {
+  // Exempting the whole git/ tree would hide a wrong-arch git in exactly
+  // the payload that has no system git to fall back to.
+  for (const relPath of [
+    'resources/agent-payload/git/bin/git',
+    'resources/agent-payload/git/libexec/git-core/git-remote-https'
+  ]) {
+    assert.equal(isExemptPath(relPath), false, relPath)
+  }
 })

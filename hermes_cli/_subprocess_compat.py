@@ -371,8 +371,32 @@ def noninteractive_git_env(
     This is for internal plumbing calls only — the agent-facing terminal tool
     has its own policy layer and user-visible PTY, where prompting can be
     legitimate.
+
+    The managed-runtime env is layered in UNDER the caller's own values.
+    Hermes may be running a git it provisioned itself (dugite-native on
+    POSIX, PortableGit on Windows), and a relocated git resolves its
+    helpers, templates and system config against a build-time prefix that
+    no longer exists — so it needs GIT_EXEC_PATH and friends or a plain
+    `git clone https://...` dies with "'remote-http' is not a git
+    command" long before any credential prompt is reachable. Dugite's own
+    ``setupEnvironment()`` does exactly this before every invocation.
+    Adding it here rather than at each call site means the fix reaches
+    every internal caller — MCP installs, plugin updates, worktree
+    fetches, the desktop review pane — instead of the one that noticed.
     """
     env = dict(base if base is not None else os.environ)
+
+    # Imported lazily: this is a leaf compat module and runtime_env pulls
+    # in the registry. Fail-open — a broken/absent runtime dir must not
+    # take down git invocations that were working with a system git.
+    try:
+        from hermes_cli.runtime_env import managed_tool_env
+
+        for key, value in managed_tool_env().items():
+            env.setdefault(key, value)
+    except Exception:
+        pass
+
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GCM_INTERACTIVE"] = "Never"
     return env

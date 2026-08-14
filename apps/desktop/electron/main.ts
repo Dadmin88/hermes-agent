@@ -36,7 +36,13 @@ import { applyAppUpdate, checkAppUpdate, shouldUseAppUpdater } from './app-updat
 import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
-import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
+import {
+  buildDesktopBackendEnv,
+  gitOnPathSkippingShim,
+  managedRuntimePathEntries,
+  normalizeHermesHomeRoot,
+  readRuntimeFacts
+} from './backend-env'
 import { isReauthRequiredError, waitForHermesReady } from './backend-health'
 import {
   canImportHermesCli,
@@ -293,6 +299,7 @@ const DEV_SERVER = process.env.HERMES_DESKTOP_DEV_SERVER
 const IS_PACKAGED = app.isPackaged || Boolean(process.env.HERMES_DESKTOP_IS_PACKAGED)
 const IS_MAC = process.platform === 'darwin'
 const IS_WINDOWS = process.platform === 'win32'
+const IS_MACOS = process.platform === 'darwin'
 const IS_WSL = isWslEnvironment()
 // Truthful macOS kernel major (Tahoe = 25). Product version lies (16 vs 26) per
 // build SDK, so gate Tahoe workarounds on Darwin instead.
@@ -573,8 +580,15 @@ function resolveHermesHome() {
 
 const HERMES_HOME = resolveHermesHome()
 
+// Managed runtime tools (node, npm, uv, git, gh, ripgrep) live in the INSTALL's
+// runtime dir, not in HERMES_HOME — profile state and install artifacts have
+// different lifetimes, and two installs sharing a home must not share
+// binaries. The registry's facts file says which tools exist and where;
+// backend-env reads it (same data hermes_cli/runtime_env.py serves Python).
+const ACTIVE_RUNTIME_DIR = path.join(HERMES_HOME, 'hermes-agent', '.hermes-runtime')
+
 function pathWithHermesManagedNode(...entries) {
-  const managed = hermesManagedNodePathEntries(HERMES_HOME).filter(directoryExists)
+  const managed = managedRuntimePathEntries(ACTIVE_RUNTIME_DIR)
 
   return [...managed, ...entries, process.env.PATH].filter(Boolean).join(path.delimiter)
 }
@@ -2216,7 +2230,7 @@ function findSystemPython() {
 function findGitBash() {
   return _findGitBash({
     isWindows: IS_WINDOWS,
-    env: process.env,
+    env: { ...process.env, HERMES_RESOURCES_PATH: process.resourcesPath },
     fileExists,
     findOnPath
   })
@@ -2261,8 +2275,62 @@ function makeDashboardReadyFile() {
 // standard Git-for-Windows locations, then PATH. Cached after first probe.
 let _gitBinaryCache = null
 
+/**
+ * A managed tool's binary, from the registry facts of every runtime dir
+ * this app might be running against — the bundled payload first, then the
+ * source install's. One reader; no per-tool candidate lists.
+ */
+function managedToolBinary(tool: string): string | null {
+  const roots: string[] = []
+
+  if (process.resourcesPath) {
+    roots.push(path.join(process.resourcesPath, 'agent-payload'))
+  }
+  roots.push(ACTIVE_RUNTIME_DIR)
+
+  for (const root of roots) {
+    const fact = readRuntimeFacts(root)[tool]
+
+    if (fact?.path) {
+      const binary = path.join(root, fact.path)
+
+      if (fileExists(binary)) {
+        return binary
+      }
+    }
+  }
+
+  return null
+}
+
+function gitOnPathSkippingXcodeShim(): string | null {
+  return gitOnPathSkippingShim(process.env.PATH || '', { exists: fileExists })
+}
+
 function resolveGitBinary() {
   if (_gitBinaryCache) {
+    return _gitBinaryCache
+  }
+
+  // Managed git wins everywhere: it is the one we pinned and verified.
+  const managed = managedToolBinary('git')
+
+  if (managed) {
+    _gitBinaryCache = managed
+
+    return _gitBinaryCache
+  }
+
+  if (IS_MACOS) {
+    // Deliberately NO '/usr/bin/git' fallback and no bare 'git'. On macOS
+    // that path is the xcode-select SHIM: running it without the Command
+    // Line Tools installed pops a modal install dialog the user never
+    // asked for, mid-session, from a background process. findOnPath skips
+    // the shim (see gitOnPathSkippingXcodeShim); when nothing else is
+    // installed we fail loudly instead, because a clear error beats
+    // hijacking the user's screen.
+    _gitBinaryCache = gitOnPathSkippingXcodeShim() || null
+
     return _gitBinaryCache
   }
 
@@ -2274,6 +2342,13 @@ function resolveGitBinary() {
 
   const localAppData = process.env.LOCALAPPDATA || ''
   const candidates = []
+
+  // Bundled PortableGit inside the app's resources (embedded runtime).
+  // Checked first so a bundled app always uses its own git.
+  if (process.resourcesPath) {
+    candidates.push(path.join(process.resourcesPath, 'agent-payload', 'git', 'cmd', 'git.exe'))
+    candidates.push(path.join(process.resourcesPath, 'agent-payload', 'git', 'bin', 'git.exe'))
+  }
 
   if (localAppData) {
     candidates.push(path.join(localAppData, 'hermes', 'git', 'cmd', 'git.exe'))
@@ -2300,6 +2375,16 @@ let _ghBinaryCache = null
 
 function resolveGhBinary() {
   if (_ghBinaryCache) {
+    return _ghBinaryCache
+  }
+
+  // Managed gh first: bundling it is what removed the Program Files /
+  // WinGet / Homebrew guessing this list used to be.
+  const managed = managedToolBinary('gh')
+
+  if (managed) {
+    _ghBinaryCache = managed
+
     return _ghBinaryCache
   }
 
@@ -4247,14 +4332,21 @@ function createEmbeddedBackend(backendArgs) {
     delete env.PYTHONPATH
   }
 
-  // The payload's own node and uv lead PATH so the backend's subprocesses
-  // (TUI builds never happen, but browser tools and lazy installs do)
-  // find the bundled runtimes before any system ones.
+  // The payload's own node, uv, and git lead PATH so the backend's
+  // subprocesses (TUI builds never happen, but browser tools, git
+  // operations, and lazy installs do) find the bundled runtimes before
+  // any system ones.
   const pathKey = Object.keys(env).find(key => key.toUpperCase() === 'PATH') || 'PATH'
 
-  env[pathKey] = [path.join(payload.dir, 'node', 'bin'), path.join(payload.dir, 'node'), path.join(payload.dir, 'uv'), env[pathKey]]
-    .filter(Boolean)
-    .join(path.delimiter)
+  env[pathKey] = [
+    path.join(payload.dir, 'node', 'bin'),
+    path.join(payload.dir, 'node'),
+    path.join(payload.dir, 'uv'),
+    path.join(payload.dir, 'git', 'cmd'),
+    path.join(payload.dir, 'git', 'bin'),
+    path.join(payload.dir, 'git', 'usr', 'bin'),
+    env[pathKey]
+  ].filter(Boolean).join(path.delimiter)
 
   return {
     kind: 'python',

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { test } from 'vitest'
 
 import {
-  EMBEDDED_RUNTIME_ITEMS,
+  embeddedRuntimeItems,
   findEmbeddedPython,
   latestReleaseFromLsRemote,
   PAYLOAD_SCHEMA_VERSION,
@@ -60,7 +60,8 @@ test('resolvePayload rejects a payload with a missing item directory', () => {
   // damaged or truncated artifact.
   assert.equal(resolvePayload('/res', readerFor(completeManifest), noDirsExist), null)
 
-  // One missing item out of five is still a rejection.
+  // One missing item is still a rejection regardless of how many
+  // items the platform requires.
   const allButUv = (p: string) => !p.endsWith('/uv')
 
   assert.equal(resolvePayload('/res', readerFor(completeManifest), allButUv), null)
@@ -75,7 +76,22 @@ test('resolvePayload returns dir + tag for a complete payload', () => {
 })
 
 test('the required items include uv — plugin lazy installs are mandatory', () => {
-  assert.deepEqual([...EMBEDDED_RUNTIME_ITEMS].sort(), ['node', 'python', 'repo', 'site-packages', 'uv'])
+  // A payload without uv cannot lazy-install plugin deps into the
+  // writable overlay: incomplete artifact, not a degraded one.
+  assert.ok(embeddedRuntimeItems('darwin').includes('uv'))
+})
+
+test('every platform requires git and gh in the payload', () => {
+  assert.deepEqual([...embeddedRuntimeItems('darwin')].sort(), ['node', 'python', 'repo', 'site-packages', 'uv'])
+})
+
+test('the required items include git on Windows', () => {
+  assert.deepEqual([...embeddedRuntimeItems('win32')].sort(), ['git', 'node', 'python', 'repo', 'site-packages', 'uv'])
+})
+
+test('the required items exclude git on non-Windows', () => {
+  assert.ok(!embeddedRuntimeItems('darwin').includes('git'))
+  assert.ok(!embeddedRuntimeItems('linux').includes('git'))
 })
 
 // ─── findEmbeddedPython ────────────────────────────────────────────

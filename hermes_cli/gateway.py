@@ -2811,13 +2811,13 @@ def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
     if _is_dir(node_bin):
         candidates.append(str(node_bin))
 
-    hermes_home = get_hermes_home()
-    hermes_node = hermes_home / "node" / "bin"
-    if _is_dir(hermes_node):
-        candidates.append(str(hermes_node))
-    hermes_nm = hermes_home / "node_modules" / ".bin"
-    if _is_dir(hermes_nm):
-        candidates.append(str(hermes_nm))
+    # Managed Node is install-scoped; iter_hermes_node_dirs owns its
+    # location and platform ordering (hermes-home lifetime split).
+    from hermes_constants import iter_hermes_node_dirs
+
+    for managed in iter_hermes_node_dirs():
+        if _is_dir(managed):
+            candidates.append(str(managed))
 
     return candidates
 

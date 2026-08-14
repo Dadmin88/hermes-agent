@@ -16,11 +16,12 @@ Design doc: .hermes/plans/2026-08-12_hermes-home-lifetime-split.md (phase 1).
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Mapping, Optional
 
 from hermes_constants import get_runtime_dir
-from hermes_cli.runtime_registry import RuntimeFact, load_facts
+from hermes_cli.runtime_registry import RuntimeFact, load_facts, load_path_order
 
 __all__ = [
     "managed_path_dirs",
@@ -28,11 +29,6 @@ __all__ = [
     "runtime_cache_dir",
     "with_managed_runtimes",
 ]
-
-# PATH assembly order. Deliberate, stable, and data — not emergent from
-# dict iteration. node before uv (npm shims may exec node), git's multi-dir
-# spread preserved via pathDirs.
-_PATH_ORDER: tuple[str, ...] = ("node", "uv", "git", "gh", "ripgrep")
 
 
 def runtime_cache_dir(runtime_dir: Path | None = None) -> Path:
@@ -50,6 +46,11 @@ def _dirs_for(fact: RuntimeFact, base: Path) -> list[Path]:
 def managed_path_dirs(runtime_dir: Path | None = None) -> list[Path]:
     """Existing bin dirs of every provisioned tool, in assembly order.
 
+    The order is DATA, recorded in the facts file by the provisioner from
+    the pin table's ``extends`` edges — a tool that extends another must
+    be found first, or the copy it supersedes wins (npm before node, or
+    node's bundled npm shadows the pinned one). Nothing here restates it.
+
     Tools absent from facts (or recorded but vanished) contribute nothing:
     an unprovisioned install degrades to system tools instead of shipping
     dead PATH entries.
@@ -57,7 +58,7 @@ def managed_path_dirs(runtime_dir: Path | None = None) -> list[Path]:
     base = runtime_dir if runtime_dir is not None else get_runtime_dir()
     facts = load_facts(base)
     dirs: list[Path] = []
-    for tool in _PATH_ORDER:
+    for tool in load_path_order(base):
         fact = facts.get(tool)
         if fact is None or not (base / fact.path).is_file():
             continue
@@ -67,11 +68,56 @@ def managed_path_dirs(runtime_dir: Path | None = None) -> list[Path]:
     return dirs
 
 
+# macOS paths that are the xcode-select STUB, not a real tool. On a Mac
+# without the Command Line Tools these do nothing but pop a modal
+# "install developer tools?" dialog — which a background agent process
+# must never trigger.
+_MACOS_XCODE_SHIMS = frozenset({"/usr/bin/git", "/usr/bin/xcrun"})
+
+
+def is_macos_xcode_shim(binary: str | Path | None) -> bool:
+    """True when *binary* is the macOS developer-tools stub."""
+    if not binary or sys.platform != "darwin":
+        return False
+    return str(binary) in _MACOS_XCODE_SHIMS
+
+
+def managed_tool_binary(
+    tool: str, runtime_dir: Path | None = None
+) -> Optional[Path]:
+    """The managed binary for *tool*, or None when it is not provisioned.
+
+    The single lookup every locator should use before falling back to a
+    system copy — resolves from the registry facts, so it knows about a
+    tool the moment the provisioner records it.
+    """
+    base = runtime_dir if runtime_dir is not None else get_runtime_dir()
+    fact = load_facts(base).get(tool)
+    if fact is None:
+        return None
+    binary = base / fact.path
+    return binary if binary.is_file() else None
+
+
 def managed_tool_env(runtime_dir: Path | None = None) -> dict[str, str]:
     """Tool-specific env for managed runtimes.
 
     - npm_config_cache: npm's package cache → install-keyed cache dir,
       only when node is managed (a system node keeps the user's ~/.npm).
+    - GIT_EXEC_PATH / GIT_TEMPLATE_DIR / GIT_CONFIG_SYSTEM / GIT_SSL_CAINFO
+      / PREFIX: the portable-git contract, and the same set dugite's own
+      ``setupEnvironment()`` exports before every invocation. A
+      relocatable git resolves helpers, templates and config against its
+      BUILD-time prefix, so a copy running from anywhere else needs to be
+      told where it actually lives; dugite's source says so directly
+      ("when building Git for Linux and then running it from an
+      arbitrary location, you should set PREFIX"). Pointing at them
+      explicitly also makes the managed git immune to a child process
+      rewriting PATH, and stops it reading /etc/gitconfig from whatever
+      machine it landed on. Only emitted for a layout that actually has
+      these dirs (dugite-native / PortableGit both do); a system git is
+      left entirely alone, because exporting GIT_EXEC_PATH at a git we do
+      not own breaks it.
     """
     base = runtime_dir if runtime_dir is not None else get_runtime_dir()
     facts = load_facts(base)
@@ -79,6 +125,26 @@ def managed_tool_env(runtime_dir: Path | None = None) -> dict[str, str]:
     node = facts.get("node")
     if node is not None and (base / node.path).is_file():
         env["npm_config_cache"] = str(runtime_cache_dir(base) / "npm")
+
+    git = facts.get("git")
+    if git is not None and (base / git.path).is_file():
+        root = (base / git.path).parent.parent
+        for key, relative in (
+            ("GIT_EXEC_PATH", Path("libexec") / "git-core"),
+            ("GIT_TEMPLATE_DIR", Path("share") / "git-core" / "templates"),
+            ("GIT_CONFIG_SYSTEM", Path("etc") / "gitconfig"),
+            ("GIT_SSL_CAINFO", Path("ssl") / "cacert.pem"),
+        ):
+            target = root / relative
+            if target.exists():
+                env[key] = str(target)
+        # PREFIX is the git root itself, not a file under it, so it has
+        # no existence probe of its own — the git fact already proved the
+        # tree is there. Linux only: dugite sets it only on linux, and it
+        # is a generic-enough name that exporting it on other platforms
+        # risks colliding with unrelated build tooling.
+        if sys.platform.startswith("linux"):
+            env["PREFIX"] = str(root)
     return env
 
 

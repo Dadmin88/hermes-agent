@@ -1,15 +1,24 @@
 """Provision managed runtime tools into <install>/.hermes-runtime/.
 
-THE one dep engine (design doc phase 1, item 4): both `hermes update`
-(post-update MACHINE_STEPS) and the installers (`--install-phase` after
-venv + uv sync) run this same code. The bash/ps1 tool-download
-implementations it replaces are deleted in phase 3.
+THE one dep engine: `hermes update` (post-update MACHINE_STEPS), the
+installers (`--install-phase`, after venv + uv sync), and the desktop
+payload staging all run this same code.
 
-Per tool: resolve pin → check facts + on-disk binary → (salvage from a
-legacy location | download) → verify by RUNNING the binary (version
-banner must satisfy the pin) → record fact. A tool that cannot be
-verified is not recorded — readers then see it as unprovisioned and fall
-back to system PATH, and the next update retries.
+Per tool: read the EXACT pin for this target (url + sha256) → download →
+verify the digest BEFORE extracting → stage into the tool's directory →
+verify by RUNNING the binary → record the fact. A tool that cannot be
+verified is not recorded: readers see it as unprovisioned and fall back
+to system PATH, and the next run retries.
+
+Tools are visited in the pin table's dependency order, so a tool that
+declares ``extends`` is staged after what it extends — npm is unpacked by
+running the node it extends. The same edge, read the other way, is the
+PATH order recorded into the facts file for both language readers.
+
+There is no salvage and no "reuse whatever is lying around". A tool is
+either the exact pinned artifact, verified by digest, or it is absent.
+Adopting an unverified tree from a previous install would defeat the
+point of pinning digests at all.
 
 Progress streams as installer stage-JSON lines when --json is on, so the
 GUI install driver renders provisioning natively.
@@ -17,10 +26,10 @@ GUI install driver renders provisioning natively.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
-import platform
 import shutil
 import subprocess
 import sys
@@ -32,12 +41,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from hermes_constants import get_hermes_home, get_runtime_dir
+from hermes_constants import get_install_root, get_runtime_dir
+from hermes_cli.runtime_tree import Sealed, runtime_tree
 from hermes_cli.runtime_registry import (
+    PinnedFile,
     RuntimeFact,
+    current_target,
+    install_order,
     load_facts,
     load_pins,
-    satisfies,
+    path_order,
+    pinned_file,
     save_facts,
 )
 
@@ -45,35 +59,12 @@ logger = logging.getLogger(__name__)
 
 _UA = {"User-Agent": "hermes-agent-provisioner"}
 
-# Download endpoints. Version-shaped URL templates, resolved against the
-# pin at provision time by the per-tool `latest satisfying` resolvers.
-_NODE_DIST_INDEX = "https://nodejs.org/dist/index.json"
-_NODE_DIST_TMPL = "https://nodejs.org/dist/{ver}/{name}"
-_GH_RELEASES = "https://api.github.com/repos/cli/cli/releases/latest"
-_RG_RELEASES = "https://api.github.com/repos/BurntSushi/ripgrep/releases/latest"
-_PORTABLE_GIT_TMPL = (
-    "https://github.com/git-for-windows/git/releases/download/{tag}/{asset}"
-)
-
 
 def _is_windows() -> bool:
-    return sys.platform == "win32"
+    return sys.platform.startswith("win")
 
 
-def _machine_arch() -> str:
-    m = platform.machine().lower()
-    if m in ("x86_64", "amd64"):
-        return "x64"
-    if m in ("aarch64", "arm64"):
-        return "arm64"
-    return m
-
-
-def _fetch_json(url: str) -> object:
-    with urllib.request.urlopen(
-        urllib.request.Request(url, headers=_UA), timeout=60
-    ) as resp:
-        return json.load(resp)
+# ─── download + verify + extract ────────────────────────────────────────────
 
 
 def _download(url: str, dest: Path) -> None:
@@ -84,8 +75,36 @@ def _download(url: str, dest: Path) -> None:
         shutil.copyfileobj(resp, out)
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _fetch_verified(pin: PinnedFile, into: Path) -> Path:
+    """Download a pinned artifact and prove it is the pinned bytes.
+
+    The digest check happens BEFORE anything is unpacked or executed: a
+    mismatched archive is deleted, never extracted. This is the only
+    thing standing between a compromised CDN and a user's machine.
+    """
+    archive = into / pin.filename
+    _download(pin.url, archive)
+
+    actual = _sha256(archive)
+    if actual != pin.sha256:
+        archive.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"sha256 mismatch for {pin.filename}: "
+            f"pinned {pin.sha256}, downloaded {actual}"
+        )
+    return archive
+
+
 def _extract(archive: Path, dest: Path) -> None:
-    """Extract tar.gz/tgz/zip. dest is wiped first (idempotent staging)."""
+    """Extract tar.gz/tar.xz/zip into a freshly emptied *dest*."""
     shutil.rmtree(dest, ignore_errors=True)
     dest.mkdir(parents=True, exist_ok=True)
     name = archive.name.lower()
@@ -107,6 +126,13 @@ def _extract(archive: Path, dest: Path) -> None:
                     written.chmod(mode & 0o777)
     else:
         raise ValueError(f"unsupported archive: {archive.name}")
+
+
+# Directory names that are part of a tool's OWN layout. An archive whose
+# single top-level entry is one of these is already unwrapped — hoisting
+# it would destroy the layout (a lone `bin/` became `gh` and `gh/bin/gh`
+# vanished).
+_LAYOUT_DIRS = frozenset({"bin", "cmd", "lib", "libexec", "share", "etc", "usr"})
 
 
 def _flatten_single_dir(dest: Path) -> None:
@@ -147,10 +173,14 @@ def _flatten_single_dir(dest: Path) -> None:
     inner.rmdir()
 
 
-def _probe_version(binary: Path, args: list[str] | None = None) -> Optional[str]:
-    """Run `<binary> --version`, return the first token that parses as a
-    version. None when the binary doesn't run — callers treat that as
-    unprovisioned, never as fatal."""
+def _probe_version(
+    binary: Path, args: list[str] | None = None, env: dict[str, str] | None = None
+) -> Optional[str]:
+    """Run `<binary> --version` and return the first version-shaped token.
+
+    None when the binary does not run — callers treat that as
+    unprovisioned, never as fatal.
+    """
     try:
         out = subprocess.run(
             [str(binary)] + (args or ["--version"]),
@@ -158,6 +188,7 @@ def _probe_version(binary: Path, args: list[str] | None = None) -> Optional[str]
             text=True,
             timeout=30,
             check=False,
+            env=env,
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return None
@@ -167,234 +198,179 @@ def _probe_version(binary: Path, args: list[str] | None = None) -> Optional[str]
     return m.group(0) if m else None
 
 
-# ─── per-tool provisioning ──────────────────────────────────────────────────
+def _probe_env(entry: dict, rt: Path) -> Optional[dict[str, str]]:
+    """Environment for the run-the-binary check.
+
+    Most tools are self-contained executables and need nothing. A tool
+    that extends another is a script launched by it — npm's shim is
+    ``#!/usr/bin/env node`` — so the probe has to see the runtime dir's
+    own tools on PATH, or it reports "does not run" on any host without a
+    system copy and the tool is never recorded.
+    """
+    if not entry.get("extends"):
+        return None
+    from hermes_cli.runtime_env import with_managed_runtimes
+
+    return with_managed_runtimes(runtime_dir=rt)
+
+
+# ─── per-tool layout + staging ──────────────────────────────────────────────
 
 
 @dataclass
 class ToolResult:
     tool: str
-    action: str  # "kept" | "salvaged" | "downloaded" | "skipped" | "failed"
+    action: str  # kept | downloaded | failed
     version: Optional[str] = None
-    detail: str = ""
+    detail: Optional[str] = None
 
     @property
     def ok(self) -> bool:
         return self.action != "failed"
 
 
-def _binary_rel(tool: str) -> str:
-    """The facts `path` for each tool in OUR layout (relative, stable)."""
-    ext = ".exe" if _is_windows() else ""
+def _binary_rel(tool: str, target: str) -> str:
+    """Where each tool's binary lands, relative to the runtime dir."""
+    win = target.startswith("win32")
+    ext = ".exe" if win else ""
     return {
-        "node": f"node/bin/node{ext}" if not _is_windows() else "node/node.exe",
+        # The Windows node zip has node.exe at the root; POSIX has bin/node.
+        "node": "node/node.exe" if win else "node/bin/node",
+        # `npm -g --prefix` drops .cmd shims in the prefix root on Windows
+        # and POSIX shims in bin/ (same split dep_ensure documents).
+        "npm": "npm/npm.cmd" if win else "npm/bin/npm",
         "uv": f"uv/uv{ext}",
-        "git": "git/cmd/git.exe",  # windows-only tool for now (phase 16+ adds dugite)
+        # PortableGit exposes cmd/git.exe; dugite-native uses bin/git.
+        "git": "git/cmd/git.exe" if win else "git/bin/git",
         "gh": f"gh/bin/gh{ext}",
         "ripgrep": f"ripgrep/rg{ext}",
     }[tool]
 
 
-def _path_dirs(tool: str) -> Optional[list[str]]:
-    if tool == "git":
+def _path_dirs(tool: str, target: str) -> Optional[list[str]]:
+    """PATH dirs for tools whose surface is more than the binary's dir.
+
+    PortableGit needs three: bash.exe and the coreutils live outside
+    cmd/. Everything else is covered by the binary's own directory.
+    """
+    if tool == "git" and target.startswith("win32"):
         return ["git/cmd", "git/bin", "git/usr/bin"]
     return None
 
 
-def _legacy_locations(tool: str) -> list[Path]:
-    """Where pre-split installs put this tool (salvage sources)."""
-    home = get_hermes_home()
-    if tool == "node":
-        return [home / "node"]
-    if tool == "uv":
-        return [home / "bin"]
-    if tool == "git" and _is_windows():
-        return [home / "git"]
-    return []
+def _stage_archive(pin: PinnedFile, dest: Path, tmp: Path) -> None:
+    """The common case: fetch, verify, extract, un-nest.
 
-
-def _salvage(tool: str, runtime_dir: Path, spec: str) -> Optional[str]:
-    """Move a healthy legacy tree in when its version satisfies the pin.
-    Returns the version on success. mv beats redownload; a failed or
-    unsatisfying tree is left alone for uninstall/doctor."""
-    rel = _binary_rel(tool)
-    tool_root = runtime_dir / rel.split("/")[0]
-    for legacy in _legacy_locations(tool):
-        if not legacy.is_dir():
-            continue
-        # The legacy layout for uv is a bare bin/ dir with the binary in
-        # it; for node/git the whole tree maps 1:1.
-        candidate_bin = (
-            legacy / Path(rel).name if tool == "uv" else legacy / Path(*rel.split("/")[1:])
-        )
-        version = _probe_version(candidate_bin)
-        if version is None or not satisfies(version, spec):
-            continue
-        shutil.rmtree(tool_root, ignore_errors=True)
-        tool_root.parent.mkdir(parents=True, exist_ok=True)
-        if tool == "uv":
-            tool_root.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(candidate_bin), tool_root / candidate_bin.name)
-        else:
-            shutil.move(str(legacy), tool_root)
-        return version
-    return None
-
-
-def _resolve_node_download(spec: str) -> tuple[str, str]:
-    """Pick the newest nodejs.org dist satisfying the pin. Returns
-    (version_tag, archive_name)."""
-    index = _fetch_json(_NODE_DIST_INDEX)
-    assert isinstance(index, list)
-    arch = _machine_arch()
-    plat = {"win32": "win", "darwin": "darwin", "linux": "linux"}[sys.platform]
-    ext = "zip" if _is_windows() else "tar.gz"
-    for entry in index:  # index.json is newest-first
-        ver = entry.get("version", "")
-        if satisfies(ver, spec):
-            name = f"node-{ver}-{plat}-{arch}.{ext}"
-            return ver, name
-    raise RuntimeError(f"no nodejs.org dist satisfies {spec!r}")
-
-
-def _install_node(runtime_dir: Path, spec: str) -> str:
-    ver, name = _resolve_node_download(spec)
-    dest = runtime_dir / "node"
-    with tempfile.TemporaryDirectory() as td:
-        archive = Path(td) / name
-        _download(_NODE_DIST_TMPL.format(ver=ver, name=name), archive)
-        _extract(archive, dest)
+    Flattening is decided by what the archive actually CONTAINS, not by a
+    per-tool list: several projects nest under a versioned top-level dir
+    on one platform and unpack flat on another (uv's POSIX tarball nests,
+    its Windows zip does not — a hardcoded list got that wrong).
+    ``_flatten_single_dir`` no-ops unless there is exactly one top-level
+    directory, so applying it unconditionally is safe.
+    """
+    archive = _fetch_verified(pin, tmp)
+    _extract(archive, dest)
     _flatten_single_dir(dest)
-    return ver.lstrip("v")
 
 
-def _install_uv(runtime_dir: Path, spec: str) -> str:
-    """uv installs via its official standalone installer, pointed at our
-    dir (same mechanism managed_uv.py uses today — UV_UNMANAGED_INSTALL)."""
-    dest = runtime_dir / "uv"
-    dest.mkdir(parents=True, exist_ok=True)
-    if _is_windows():
-        script = _download_text("https://astral.sh/uv/install.ps1")
-        cmd = ["powershell", "-NoProfile", "-Command", script]
-        env = {**os.environ, "UV_INSTALL_DIR": str(dest), "UV_NO_MODIFY_PATH": "1"}
-    else:
-        script = _download_text("https://astral.sh/uv/install.sh")
-        cmd = ["sh", "-c", script]
-        env = {**os.environ, "UV_UNMANAGED_INSTALL": str(dest)}
-    subprocess.run(cmd, env=env, check=True, capture_output=True, timeout=600)
-    binary = runtime_dir / _binary_rel("uv")
-    version = _probe_version(binary)
-    if version is None or not satisfies(version, spec):
-        raise RuntimeError(f"installed uv reports {version!r}, want {spec!r}")
-    return version
+def _stage_portable_git(pin: PinnedFile, dest: Path, tmp: Path) -> None:
+    """PortableGit is a self-extracting 7z, not an archive we can read.
 
-
-def _download_text(url: str) -> str:
-    with urllib.request.urlopen(
-        urllib.request.Request(url, headers=_UA), timeout=60
-    ) as resp:
-        return resp.read().decode("utf-8")
-
-
-def _install_gh(runtime_dir: Path, spec: str) -> str:
-    release = _fetch_json(_GH_RELEASES)
-    assert isinstance(release, dict)
-    tag = release.get("tag_name", "")
-    if not satisfies(tag, spec):
-        raise RuntimeError(f"latest gh {tag} does not satisfy {spec!r}")
-    ver = tag.lstrip("v")
-    arch = {"x64": "amd64", "arm64": "arm64"}[_machine_arch()]
-    if _is_windows():
-        name = f"gh_{ver}_windows_{arch}.zip"
-    elif sys.platform == "darwin":
-        name = f"gh_{ver}_macOS_{arch}.zip"
-    else:
-        name = f"gh_{ver}_linux_{arch}.tar.gz"
-    url = next(
-        a["browser_download_url"]
-        for a in release["assets"]
-        if a["name"] == name
-    )
-    dest = runtime_dir / "gh"
-    with tempfile.TemporaryDirectory() as td:
-        archive = Path(td) / name
-        _download(url, archive)
-        _extract(archive, dest)
-    _flatten_single_dir(dest)
-    return ver
-
-
-def _install_ripgrep(runtime_dir: Path, spec: str) -> str:
-    release = _fetch_json(_RG_RELEASES)
-    assert isinstance(release, dict)
-    tag = release.get("tag_name", "")
-    if not satisfies(tag, spec):
-        raise RuntimeError(f"latest ripgrep {tag} does not satisfy {spec!r}")
-    arch = _machine_arch()
-    if _is_windows():
-        needle = f"{tag}-x86_64-pc-windows-msvc.zip" if arch == "x64" else f"{tag}-aarch64-pc-windows-msvc.zip"
-    elif sys.platform == "darwin":
-        needle = f"{tag}-x86_64-apple-darwin.tar.gz" if arch == "x64" else f"{tag}-aarch64-apple-darwin.tar.gz"
-    else:
-        needle = f"{tag}-x86_64-unknown-linux-musl.tar.gz" if arch == "x64" else f"{tag}-aarch64-unknown-linux-gnu.tar.gz"
-    asset = next(a for a in release["assets"] if a["name"].endswith(needle))
-    dest = runtime_dir / "ripgrep"
-    with tempfile.TemporaryDirectory() as td:
-        archive = Path(td) / asset["name"]
-        _download(asset["browser_download_url"], archive)
-        _extract(archive, dest)
-    _flatten_single_dir(dest)
-    return tag
-
-
-def _install_git_windows(runtime_dir: Path, spec: str) -> str:
-    """PortableGit for win32 (mirrors the install.ps1 pin this replaces).
-    darwin/linux git arrives with dugite-native in phase 17."""
-    # Pin lives in runtime-pins.json as 2.55.x; PortableGit assets need
-    # the full tag. Resolve from the git-for-windows latest release and
-    # check satisfaction — same shape as gh/rg.
-    release = _fetch_json(
-        "https://api.github.com/repos/git-for-windows/git/releases/latest"
-    )
-    assert isinstance(release, dict)
-    tag = release.get("tag_name", "")  # v2.55.0.windows.3
-    if not satisfies(tag.removeprefix("v"), spec):
-        raise RuntimeError(f"latest PortableGit {tag} does not satisfy {spec!r}")
-    arch = "arm64" if _machine_arch() == "arm64" else "64-bit"
-    asset = next(
-        a
-        for a in release["assets"]
-        if a["name"].startswith("PortableGit-") and a["name"].endswith(f"-{arch}.7z.exe")
-    )
-    dest = runtime_dir / "git"
+    It is the one asset that must be EXECUTED to unpack, so the digest
+    check matters more here than anywhere else — ``_fetch_verified`` has
+    already proven the bytes before this runs it.
+    """
+    sfx = _fetch_verified(pin, tmp)
     shutil.rmtree(dest, ignore_errors=True)
     dest.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory() as td:
-        sfx = Path(td) / asset["name"]
-        _download(asset["browser_download_url"], sfx)
-        proc = subprocess.run(
-            [str(sfx), f"-o{dest}", "-y"], capture_output=True, timeout=600
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(f"PortableGit extraction exited {proc.returncode}")
-    version = _probe_version(dest / "cmd" / "git.exe")
-    if version is None:
-        raise RuntimeError("extracted git.exe does not run")
-    return version
+    sfx.chmod(0o755)
+    proc = subprocess.run(
+        [str(sfx), f"-o{dest}", "-y"], capture_output=True, timeout=900
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"PortableGit self-extractor exited {proc.returncode}")
 
 
-_INSTALLERS: dict[str, Callable[[Path, str], str]] = {
-    "node": _install_node,
-    "uv": _install_uv,
-    "gh": _install_gh,
-    "ripgrep": _install_ripgrep,
-}
+def _stage_npm(pin: PinnedFile, dest: Path, tmp: Path, rt: Path, target: str) -> None:
+    """npm installs itself, using the node it extends.
+
+    npm is not a relocatable archive: its own ``bin/npm`` resolves the cli
+    from ``dirname(process.execPath)``, so a plain unpack on PATH finds
+    the npm BUNDLED inside node and fails outright. Letting npm do a
+    global install into a prefix produces the launchers each platform
+    actually needs (POSIX symlinks in ``bin/``, ``.cmd``/``.ps1`` shims in
+    the prefix root) instead of us hand-writing shims per OS.
+
+    The bytes are still the pinned, digest-verified tarball —
+    ``--offline`` guarantees the registry is never consulted, so this
+    installs exactly what the pin table says and nothing else.
+    """
+    tarball = _fetch_verified(pin, tmp)
+    node = rt / _binary_rel("node", target)
+    if not node.is_file():
+        raise RuntimeError("npm extends node, which is not provisioned")
+
+    # node's BUNDLED npm performs the install; the pinned npm replaces it
+    # on PATH afterwards. Driving npm-cli.js through node directly avoids
+    # depending on any npm shim already being resolvable.
+    bundled_cli = (
+        node.parent / "node_modules" / "npm" / "bin" / "npm-cli.js"
+        if target.startswith("win32")
+        else node.parent.parent / "lib" / "node_modules" / "npm" / "bin" / "npm-cli.js"
+    )
+    if not bundled_cli.is_file():
+        raise RuntimeError(f"node ships no bundled npm at {bundled_cli}")
+
+    shutil.rmtree(dest, ignore_errors=True)
+    dest.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(
+        [
+            str(node),
+            str(bundled_cli),
+            "install",
+            "--global",
+            "--prefix",
+            str(dest),
+            "--offline",
+            "--no-audit",
+            "--no-fund",
+            str(tarball),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=900,
+        # Keep the install off the user's ~/.npm: an install-scoped tool
+        # writes install-scoped state.
+        env={**os.environ, "npm_config_cache": str(rt / "cache" / "npm")},
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"npm install exited {proc.returncode}: {proc.stderr[-400:]}")
 
 
-def _tool_applies(tool: str) -> bool:
-    # git is provisioned on Windows only until dugite lands (phase 17).
-    if tool == "git":
-        return _is_windows()
-    return True
+def _stage(
+    tool: str, pin: PinnedFile, dest: Path, tmp: Path, target: str, rt: Path
+) -> None:
+    """Unpack one tool into its runtime-dir home.
+
+    Branching lives here and nowhere else: every tool arrives through the
+    same fetch-and-verify, and differs only in how its artifact unpacks.
+    """
+    if tool == "git" and target.startswith("win32"):
+        _stage_portable_git(pin, dest, tmp)
+        return
+
+    if tool == "npm":
+        _stage_npm(pin, dest, tmp, rt, target)
+        return
+
+    _stage_archive(pin, dest, tmp)
+    if tool == "git" and not target.startswith("win32"):
+        # delete useless DLLs
+        dlls_dir = dest / "libexec" / "git-core"
+
+        for dll_file in dlls_dir.rglob("*.dll"):
+            print(f"deleted unused git dll: {dll_file}")
+            dll_file.unlink()
 
 
 # ─── the provisioning loop ──────────────────────────────────────────────────
@@ -427,6 +403,7 @@ def _provision_one(
     facts: dict[str, RuntimeFact],
     target: str,
     verify_runs: bool = True,
+    path_order: list[str] | None = None,
 ) -> ToolResult:
     """Bring ONE tool to the pinned state. Never raises."""
     rel = _binary_rel(tool, target)
@@ -445,7 +422,7 @@ def _provision_one(
     try:
         td = Path(tempfile.mkdtemp(prefix="hermes-provision-"))
         try:
-            _stage(tool, pin, rt / tool, Path(td), target)
+            _stage(tool, pin, rt / tool, Path(td), target, rt)
         finally:
             _discard_scratch(td)
 
@@ -458,13 +435,13 @@ def _provision_one(
         # or half-extracted binary fails here rather than at first use.
         # Skipped when staging FOR another target, where the binary
         # cannot run on this host by definition.
-        if verify_runs and _probe_version(binary) is None:
+        if verify_runs and _probe_version(binary, env=_probe_env(entry, rt)) is None:
             return ToolResult(tool, "failed", detail="provisioned binary does not run")
 
         facts[tool] = RuntimeFact(
             version=pin.version, path=rel, path_dirs=_path_dirs(tool, target)
         )
-        save_facts(facts, rt)
+        save_facts(facts, rt, path_order=path_order)
         return ToolResult(tool, "downloaded", version=pin.version)
     except Exception as exc:  # noqa: BLE001 — per-tool isolation is the contract
         logger.warning("provisioning %s failed: %s", tool, exc)
@@ -484,27 +461,61 @@ def provision_tool(
     """
     rt = runtime_dir if runtime_dir is not None else get_runtime_dir()
     rt.mkdir(parents=True, exist_ok=True)
-    entry = load_pins(install_root).get(tool)
+    pins = load_pins(install_root)
+    entry = pins.get(tool)
     if entry is None:
         return ToolResult(tool, "failed", detail=f"{tool} is not pinned")
-    return _provision_one(tool, entry, rt, load_facts(rt), target or current_target())
+    return _provision_one(
+        tool,
+        entry,
+        rt,
+        load_facts(rt),
+        target or current_target(),
+        path_order=path_order(pins),
+    )
 
 
 def provision_runtimes(
     runtime_dir: Path | None = None,
     install_root: Path | None = None,
     emit: Callable[[dict], None] | None = None,
+    target: str | None = None,
+    only: list[str] | None = None,
 ) -> list[ToolResult]:
-    """Bring every pinned tool to a satisfying state. Never raises for a
-    single tool — each failure is recorded and the rest proceed (a broken
-    ripgrep download must not kill node provisioning)."""
+    """Bring every pinned tool to its pinned version.
+
+    Never raises for a single tool — each failure is recorded and the
+    rest proceed (a broken ripgrep download must not kill node).
+
+    Tools are provisioned in the pin table's dependency order, so a tool
+    that extends another is staged after it — npm is unpacked by running
+    the node it extends, which has to exist first.
+
+    When *target* names a platform other than this host, the staged
+    binaries cannot be executed here, so the run-the-binary check is
+    skipped. That is the desktop cross-build path.
+    """
     rt = runtime_dir if runtime_dir is not None else get_runtime_dir()
     rt.mkdir(parents=True, exist_ok=True)
+    host = current_target()
+    resolved_target = target or host
     pins = load_pins(install_root)
     facts = load_facts(rt)
     results: list[ToolResult] = []
+    order = path_order(pins)
 
-    def _emit(result: ToolResult) -> None:
+    for tool in install_order(pins):
+        if only and tool not in only:
+            continue
+        result = _provision_one(
+            tool,
+            pins[tool],
+            rt,
+            facts,
+            resolved_target,
+            verify_runs=resolved_target == host,
+            path_order=order,
+        )
         results.append(result)
         if emit:
             emit(
@@ -517,46 +528,81 @@ def provision_runtimes(
                 }
             )
 
-    for tool, entry in pins.items():
-        spec = entry["version"]
-        if not _tool_applies(tool):
-            _emit(ToolResult(tool, "skipped", detail="not managed on this platform"))
-            continue
-
-        # Already good? Fact recorded, binary present, version satisfies.
-        fact = facts.get(tool)
-        if fact is not None and (rt / fact.path).is_file() and satisfies(fact.version, spec):
-            _emit(ToolResult(tool, "kept", version=fact.version))
-            continue
-
-        try:
-            salvaged = _salvage(tool, rt, spec)
-            if salvaged is not None:
-                action, version = "salvaged", salvaged
-            else:
-                installer = _INSTALLERS.get(tool) if tool != "git" else _install_git_windows
-                if installer is None:
-                    _emit(ToolResult(tool, "failed", detail="no installer"))
-                    continue
-                version = installer(rt, spec)
-                action = "downloaded"
-            # Verify by running THE binary we recorded, not trusting the
-            # installer's word.
-            binary = rt / _binary_rel(tool)
-            probed = _probe_version(binary)
-            if probed is None:
-                _emit(ToolResult(tool, "failed", detail="provisioned binary does not run"))
-                continue
-            facts[tool] = RuntimeFact(
-                version=version, path=_binary_rel(tool), path_dirs=_path_dirs(tool)
-            )
-            save_facts(facts, rt)
-            _emit(ToolResult(tool, action, version=version))
-        except Exception as exc:  # noqa: BLE001 — per-tool isolation is the contract
-            logger.warning("provisioning %s failed: %s", tool, exc)
-            _emit(ToolResult(tool, "failed", detail=str(exc)))
-
     return results
+
+
+def stale_tools(
+    runtime_dir: Path | None = None,
+    install_root: Path | None = None,
+    target: str | None = None,
+) -> dict[str, tuple[str, Optional[str]]]:
+    """Pinned tools whose installed state does not match the pin table.
+
+    Maps tool → (pinned version, installed version or None). Empty means
+    every pin is satisfied. This is the same equality check
+    ``_provision_one`` makes before deciding to re-download — exact pins
+    make it an equality check, not a range check.
+    """
+    rt = runtime_dir if runtime_dir is not None else get_runtime_dir()
+    resolved_target = target or current_target()
+    facts = load_facts(rt)
+    drift: dict[str, tuple[str, Optional[str]]] = {}
+
+    for tool, entry in load_pins(install_root).items():
+        fact = facts.get(tool)
+        installed = fact.version if fact is not None else None
+        if fact is not None and not (rt / _binary_rel(tool, resolved_target)).is_file():
+            # Recorded but vanished reads as unprovisioned everywhere
+            # else; say so here too rather than reporting it as current.
+            installed = None
+        if installed != entry["version"]:
+            drift[tool] = (entry["version"], installed)
+    return drift
+
+
+class StaleManagedRuntimes(RuntimeError):
+    """A sealed install's runtime tools disagree with its pin table."""
+
+
+def require_current_runtimes(
+    project_root: Path | None = None,
+    runtime_dir: Path | None = None,
+    install_root: Path | None = None,
+) -> None:
+    """Fail fast when a SEALED install ships out-of-date runtime tools.
+
+    A git checkout provisions on demand: drift there is a normal state
+    that the next `hermes update` (or the self-heal path) resolves, and
+    raising would break the very run that fixes it.
+
+    A sealed tree cannot self-heal. Its steward — Nix, Docker, the
+    desktop bundle — builds the runtime tools as part of the artifact, so
+    drift means the artifact was assembled against a different pin table
+    than the code it ships. Every consequence of that is worse and more
+    confusing than stopping here: tools silently missing from PATH,
+    or a version the code does not expect. The steward has to rebuild.
+    """
+    root = project_root if project_root is not None else get_install_root()
+    tree = runtime_tree(root)
+    if not isinstance(tree, Sealed):
+        return
+
+    drift = stale_tools(runtime_dir=runtime_dir, install_root=install_root)
+    if not drift:
+        return
+
+    lines = [
+        f"  {tool}: pinned {pinned}, installed {installed or 'nothing'}"
+        for tool, (pinned, installed) in sorted(drift.items())
+    ]
+    raise StaleManagedRuntimes(
+        f"This Hermes is a sealed install managed by {tree.steward!r}, and its "
+        "managed runtime tools do not match runtime-pins.json:\n"
+        + "\n".join(lines)
+        + "\n\nThe artifact was built against a different pin table than the code "
+        "it ships. Rebuild it with its steward — a sealed tree cannot provision "
+        "these itself."
+    )
 
 
 def step_provision_runtimes() -> dict:
@@ -566,5 +612,52 @@ def step_provision_runtimes() -> dict:
     return {
         "ok": not failed,
         "tools": {r.tool: r.action for r in results},
-        **({"error": "; ".join(f"{r.tool}: {r.detail}" for r in failed)} if failed else {}),
+        **(
+            {"error": "; ".join(f"{r.tool}: {r.detail}" for r in failed)}
+            if failed
+            else {}
+        ),
     }
+
+
+def main(argv: list[str] | None = None) -> int:
+    """``python -m hermes_cli.runtime_provisioner`` — provision into a dir.
+
+    The desktop payload staging shells out to this rather than carrying a
+    second implementation of download-and-verify in JavaScript.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="python -m hermes_cli.runtime_provisioner")
+    parser.add_argument(
+        "--runtime-dir",
+        type=Path,
+        help="Where to install (default: this install's .hermes-runtime).",
+    )
+    parser.add_argument(
+        "--target",
+        help="Pin target to provision, e.g. darwin-arm64 (default: this host). "
+        "Cross-target staging skips the run-the-binary check.",
+    )
+    parser.add_argument(
+        "--only", action="append", help="Provision just this tool (repeatable)."
+    )
+    parser.add_argument("--json", action="store_true", help="Emit JSON lines.")
+    ns = parser.parse_args(argv)
+
+    def emit(event: dict) -> None:
+        if ns.json:
+            print(json.dumps(event), flush=True)
+        else:
+            version = f" {event['version']}" if event.get("version") else ""
+            detail = f" — {event['detail']}" if event.get("detail") else ""
+            print(f"  {event['tool']}: {event['action']}{version}{detail}", flush=True)
+
+    results = provision_runtimes(
+        runtime_dir=ns.runtime_dir, emit=emit, target=ns.target, only=ns.only
+    )
+    return 0 if all(r.ok for r in results) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

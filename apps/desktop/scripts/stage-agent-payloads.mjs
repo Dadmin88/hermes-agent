@@ -34,6 +34,7 @@
 import { execSync, spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import fs from "node:fs"
+import os from "node:os"
 import path from "node:path"
 
 import { isMain } from "./utils.mjs"
@@ -269,7 +270,7 @@ function loadPins() {
 }
 
 /**
- * Managed runtime tools (node, uv, git, gh, ripgrep) for the payload.
+ * Managed runtime tools (node, npm, uv, git, gh, ripgrep) for the payload.
  *
  * The payload IS a runtime dir, so this shells out to the SAME Python
  * provisioner a source install and `hermes update` use. Everything about
@@ -279,11 +280,14 @@ function loadPins() {
  * be a second thing to keep correct, and the digest verification is not
  * something to reimplement twice.
  *
- * Cross-building is normal here (a linux runner staging the macOS
- * payload), so `--target` is passed explicitly rather than inferred, and
- * the provisioner skips its run-the-binary check for a foreign target.
- * `assertPayloadArch` below re-checks the arch from the file headers,
- * which works regardless of what can execute.
+ * The staging runner IS the target machine (see `resolveTargets`: one CI
+ * runner per (os, arch) pair, because electron-builder needs per-OS
+ * runners for signing anyway). `--target` is still passed explicitly so
+ * the payload's target is stated rather than inferred from whatever
+ * interpreter happens to run this, but it names the host, so the
+ * provisioner's run-the-binary check does execute here.
+ * `assertPayloadArch` below independently re-checks the arch from the
+ * file headers.
  */
 function stageManagedRuntimes(target, outDir, pythonExe) {
   const targetKey = `${target.platform}-${target.arch}`
@@ -506,26 +510,14 @@ function stageRepo(tag, outDir) {
   run("uv", [
     "run", "--no-project", "--python", "3",
     path.join(repoDir, "scripts", "write_install_stamp.py"),
-    "--output", path.join(repoDir, ".hermes_build_info.json"),
+    "--output", path.join(repoDir, "install-stamp.json"),
     "--commit", commit,
     "--commit-date", commitDate,
     "--base-version", tag.slice(1),
     "--distance", "0",
     "--source", "ci",
+    "--distribution", "desktop-app",
   ])
-  // The install manifest is BUILD metadata for a resident bundle: the
-  // payload repo is always desktop-managed, always the stable channel,
-  // always pinned to this tag. Shipping it statically means the Python
-  // side (update refusal, eject, channel vocabulary) reads the same file
-  // in a resident bundle as in a materialized checkout.
-  fs.writeFileSync(
-    path.join(repoDir, ".hermes-install.json"),
-    JSON.stringify(
-      { schemaVersion: 1, installMode: "bundled", channel: "stable", manageStyle: "adopted", pinnedTag: tag },
-      null,
-      2
-    ) + "\n"
-  )
   return commit
 }
 

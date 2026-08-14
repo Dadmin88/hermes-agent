@@ -94,8 +94,16 @@ That logs you in, sets Nous as your provider, and turns on the Tool Gateway in o
 - **ripgrep** (fast file search)
 - **ffmpeg** (audio format conversion for TTS)
 
-:::info
-You do **not** need to install Python, Node.js, ripgrep, or ffmpeg manually. The installer detects what's missing and installs it for you. Just make sure `git` is available (`git --version`). On Linux, ensure `curl` and `xz-utils` are installed (`sudo apt install curl xz-utils` on Debian/Ubuntu). For the desktop app, also install `build-essential` (`sudo apt install build-essential`).
+:::note Managed runtimes
+Node, npm, ripgrep, gh and uv are **managed runtimes**: Hermes installs pinned versions
+(see `runtime-pins.json`) into its own install directory rather than changing your
+system toolchain, and keeps them current on every `hermes update`. They never
+shadow a tool you installed yourself outside Hermes, and two Hermes installs on
+one machine keep separate copies. `hermes doctor` reports the version of each.
+
+The pinned npm is newer than the one bundled inside the pinned Node, so it is
+installed after Node and placed ahead of it — the pin table states that with
+`"extends": ["node"]`, and both orders are derived from it.
 :::
 
 :::tip Nix users

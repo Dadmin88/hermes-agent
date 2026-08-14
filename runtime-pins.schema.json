@@ -45,9 +45,15 @@
           "type": "string",
           "description": "Notes on why this tool/version/build variant was chosen."
         },
+        "extends": {
+          "type": "array",
+          "description": "Tools this one plugs into. One edge, two consequences, both derived rather than restated in code: the tool is INSTALLED after everything it extends (staging may run them), and its bin dir sorts BEFORE theirs on PATH (it exists to supersede a copy they ship). npm extends node for exactly that reason.",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
         "files": {
           "type": "object",
-          "description": "Map of '<platform>-<arch>' targets to their pinned artifacts.",
+          "description": "Map of '<platform>-<arch>' targets to their pinned artifacts, or the single key 'any' when one artifact serves every target.",
           "minProperties": 1,
           "propertyNames": {
             "$ref": "#/$defs/target"
@@ -58,8 +64,9 @@
     },
     "target": {
       "type": "string",
-      "description": "Target architecture for binaries",
+      "description": "Target architecture for binaries, or 'any' for a target-independent artifact (a source/registry tarball whose bytes do not vary).",
       "enum": [
+        "any",
         "darwin-arm64",
         "darwin-x64",
         "linux-arm64",

@@ -719,18 +719,40 @@ class TestLocalEnvironmentWindowsTempDir:
 
 
 class TestLocalEnvironmentPathInjectionGated:
-    """Sane PATH completion must stay POSIX-only."""
+    """POSIX ``_SANE_PATH`` completion stays POSIX-only; managed runtime
+    dirs are appended on every platform."""
 
     @pytest.mark.windows_only
-    def test_windows_path_is_left_unchanged(self):
-        """``windows_only``: the assertion is that a real Windows ``PATH``
-        (``;``-separated, drive-lettered) comes back untouched. On Linux the
-        old ``_IS_WINDOWS`` patch made the function return early without ever
-        meeting a genuine Windows PATH."""
-        from tools.environments.local import _append_missing_sane_path_entries
+    def test_windows_path_keeps_its_own_entries_and_gains_no_posix_dirs(self, monkeypatch):
+        """``windows_only``: a real Windows ``PATH`` (``;``-separated,
+        drive-lettered) is never rewritten and never collects ``/usr/bin``
+        and friends. On Linux the old ``_IS_WINDOWS`` patch made the
+        function return early without ever meeting a genuine Windows PATH."""
+        from tools.environments import local
 
+        monkeypatch.setattr(local, "_managed_runtime_path_entries", lambda: [])
         path = r"C:\Windows\System32;C:\Program Files\Git\bin"
-        assert _append_missing_sane_path_entries(path) == path
+        assert local._append_missing_sane_path_entries(path) == path
+
+    @pytest.mark.windows_only
+    def test_windows_appends_managed_dirs_case_insensitively(self, monkeypatch):
+        """``windows_only``: managed runtime dirs are appended after the
+        caller's own entries, and one already present under different
+        casing/separators is not duplicated (Windows paths are
+        case-insensitive; a raw string compare would miss it)."""
+        from tools.environments import local
+
+        monkeypatch.setattr(
+            local,
+            "_managed_runtime_path_entries",
+            lambda: [r"C:\Hermes\.hermes-runtime\node", r"C:\Hermes\.hermes-runtime\uv"],
+        )
+        path = r"C:\Windows\System32;c:\hermes\.hermes-runtime\NODE"
+        result = local._append_missing_sane_path_entries(path)
+
+        assert result.startswith(path)  # caller entries keep precedence
+        assert result.count(".hermes-runtime") == 2  # the node dup was skipped
+        assert result.endswith(r"C:\Hermes\.hermes-runtime\uv")
 
 
 # ---------------------------------------------------------------------------

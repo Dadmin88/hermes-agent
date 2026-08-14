@@ -1,3 +1,4 @@
+import fs from 'node:fs'
 import path from 'node:path'
 
 // Match the POSIX fallback surface used by the Python terminal environment.
@@ -61,46 +62,192 @@ function appendUniquePathEntries(entries, { delimiter = path.delimiter } = {}) {
 }
 
 /**
- * Hermes-managed Node.js directories, in preferred lookup order.
+ * Paths that are the macOS xcode-select STUB rather than a real git.
  *
- * There are two on-disk layouts. `scripts/install.ps1` unpacks portable Node
- * straight into `%LOCALAPPDATA%\hermes\node` (node.exe at the root, no `bin\`);
- * `scripts/install.sh` and the node-bootstrap helper use the POSIX
- * `$HERMES_HOME/node/bin`. Emit BOTH on every platform so mixed and migrated
- * installs resolve, leading with the layout native to the current platform.
- *
- * This is the single source of truth for the ordering rule on the Node side —
- * `main.ts` imports it rather than keeping its own copy. Mirrors
- * `iter_hermes_node_dirs()` in hermes_constants.py, which the Electron main
- * process cannot import.
+ * `/usr/bin/git` on a Mac without the Command Line Tools is a shim whose
+ * only behaviour is to pop a modal "install developer tools?" dialog.
+ * `/usr/bin/xcrun` fronts the same mechanism. A background process must
+ * never invoke either: the user gets a dialog they did not ask for, from
+ * an app that looks idle.
  */
-function hermesManagedNodePathEntries(
-  hermesHome,
-  { platform = process.platform, pathModule = pathModuleForPlatform(platform) }: any = {}
-) {
-  if (!hermesHome) {
-    return []
+const MACOS_XCODE_SHIM_PATHS = Object.freeze(['/usr/bin/git', '/usr/bin/xcrun'])
+
+export function isMacosXcodeShim(binaryPath: string | null | undefined): boolean {
+  if (!binaryPath) {
+    return false
   }
 
-  const root = pathModule.join(hermesHome, 'node')
-  const bin = pathModule.join(root, 'bin')
+  return MACOS_XCODE_SHIM_PATHS.includes(binaryPath)
+}
 
-  return platform === 'win32' ? [root, bin] : [bin, root]
+/**
+ * The first real git on PATH, skipping the xcode-select shim.
+ *
+ * Returns null when the only git available is the shim — callers must
+ * treat that as "no git", because using it is worse than not having one.
+ */
+export function gitOnPathSkippingShim(
+  pathValue: string,
+  {
+    delimiter = path.delimiter,
+    pathModule = path,
+    exists
+  }: { delimiter?: string; pathModule?: typeof path; exists: (candidate: string) => boolean }
+): string | null {
+  for (const entry of String(pathValue || '').split(delimiter)) {
+    if (!entry) {
+      continue
+    }
+
+    const candidate = pathModule.join(entry, 'git')
+
+    if (isMacosXcodeShim(candidate)) {
+      continue
+    }
+
+    if (exists(candidate)) {
+      return candidate
+    }
+  }
+
+  return null
+}
+
+/** One managed tool as recorded in `<runtime dir>/runtimes.json`. */
+export type RuntimeFact = {
+  version: string
+  /** Binary path, RELATIVE to the runtime dir. */
+  path: string
+  installedAt?: string
+  /** Optional multi-dir PATH surface (PortableGit: cmd, bin, usr/bin). */
+  pathDirs?: string[]
+}
+
+export type RuntimeFacts = {
+  schemaVersion: number
+  /** PATH assembly order, derived from the pin table's `extends` edges. */
+  pathOrder?: string[]
+  tools: Record<string, RuntimeFact>
+}
+
+/** The facts file the provisioner writes; the ONLY writer. */
+export const RUNTIME_FACTS_FILENAME = 'runtimes.json'
+export const RUNTIME_FACTS_SCHEMA_VERSION = 1
+
+/**
+ * Read the runtime registry's facts. Missing/foreign-schema/malformed all
+ * mean "nothing provisioned" — the desktop then falls back to system tools,
+ * which is a degrade, not a break.
+ */
+export function readRuntimeFacts(
+  runtimeDir: string,
+  { fsImpl = fs, pathModule = path }: { fsImpl?: typeof fs; pathModule?: typeof path } = {}
+): Record<string, RuntimeFact> {
+  return readRuntimeFactsFile(runtimeDir, { fsImpl, pathModule })?.tools || {}
+}
+
+/**
+ * The whole parsed facts file, or null when there is nothing usable.
+ * Callers that need the recorded PATH order read this; `readRuntimeFacts`
+ * stays the narrow tools-only accessor it always was.
+ */
+function readRuntimeFactsFile(
+  runtimeDir: string,
+  { fsImpl = fs, pathModule = path }: { fsImpl?: typeof fs; pathModule?: typeof path } = {}
+): RuntimeFacts | null {
+  if (!runtimeDir) {
+    return null
+  }
+
+  try {
+    const raw = fsImpl.readFileSync(pathModule.join(runtimeDir, RUNTIME_FACTS_FILENAME), 'utf8')
+    const parsed = JSON.parse(raw) as RuntimeFacts
+
+    if (parsed?.schemaVersion !== RUNTIME_FACTS_SCHEMA_VERSION) {
+      return null
+    }
+
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Managed runtime bin dirs, in assembly order.
+ *
+ * The registry's facts file decides WHICH tools exist, WHERE, and in WHAT
+ * ORDER — this is a reader of the same data hermes_cli/runtime_env.py
+ * serves to the Python side, not a second copy of the layout rules. That
+ * mattered twice: an earlier version hard-coded `$HERMES_HOME/node{,/bin}`
+ * and had to be kept in sync with `iter_hermes_node_dirs()` by comment,
+ * and the order was a literal array here that a test could only police by
+ * reading this file's source text. Both are data now; the provisioner
+ * derives the order from the pin table's `extends` edges and records it.
+ *
+ * `main.ts` imports this rather than keeping its own copy.
+ */
+export function managedRuntimePathEntries(
+  runtimeDir: string,
+  {
+    fsImpl = fs,
+    pathModule = path
+  }: { fsImpl?: typeof fs; pathModule?: typeof path } = {}
+): string[] {
+  const parsed = readRuntimeFactsFile(runtimeDir, { fsImpl, pathModule })
+  const facts = parsed?.tools || {}
+  // A hand-edited facts file may predate pathOrder; its own key order is
+  // the only remaining signal, and matches what Python falls back to.
+  const order = parsed?.pathOrder || Object.keys(facts)
+  const dirs: string[] = []
+
+  for (const tool of order) {
+    const fact = facts[tool]
+
+    if (!fact?.path) {
+      continue
+    }
+
+    const binary = pathModule.join(runtimeDir, fact.path)
+
+    // A recorded-but-vanished binary reads as unprovisioned: never emit a
+    // PATH entry for a tool that is not actually there.
+    try {
+      if (!fsImpl.statSync(binary).isFile()) {
+        continue
+      }
+    } catch {
+      continue
+    }
+
+    const entries = fact.pathDirs
+      ? fact.pathDirs.map(dir => pathModule.join(runtimeDir, dir))
+      : [pathModule.dirname(binary)]
+
+    for (const entry of entries) {
+      if (!dirs.includes(entry)) {
+        dirs.push(entry)
+      }
+    }
+  }
+
+  return dirs
 }
 
 function buildDesktopBackendPath({
-  hermesHome,
+  runtimeDir,
   venvRoot,
   currentPath = '',
   platform = process.platform,
-  pathModule = pathModuleForPlatform(platform)
+  pathModule = pathModuleForPlatform(platform),
+  fsImpl = fs
 }: any = {}) {
   const delimiter = delimiterForPlatform(platform)
-  const hermesNodeDirs = hermesManagedNodePathEntries(hermesHome, { platform, pathModule })
+  const managedDirs = runtimeDir ? managedRuntimePathEntries(runtimeDir, { fsImpl, pathModule }) : []
   const venvBin = venvRoot ? pathModule.join(venvRoot, platform === 'win32' ? 'Scripts' : 'bin') : null
   const saneEntries = platform === 'win32' ? [] : POSIX_SANE_PATH_ENTRIES
 
-  return appendUniquePathEntries([hermesNodeDirs, venvBin, currentPath, saneEntries], { delimiter })
+  return appendUniquePathEntries([managedDirs, venvBin, currentPath, saneEntries], { delimiter })
 }
 
 function normalizeHermesHomeRoot(hermesHome, { pathModule = pathModuleForPlatform(process.platform) }: any = {}) {
@@ -120,11 +267,13 @@ function normalizeHermesHomeRoot(hermesHome, { pathModule = pathModuleForPlatfor
 
 function buildDesktopBackendEnv({
   hermesHome,
+  runtimeDir,
   pythonPathEntries = [],
   venvRoot,
   currentEnv = process.env,
   platform = process.platform,
-  pathModule = pathModuleForPlatform(platform)
+  pathModule = pathModuleForPlatform(platform),
+  fsImpl = fs
 }: any = {}) {
   const delimiter = delimiterForPlatform(platform)
   const currentPythonPath = currentEnv?.PYTHONPATH || ''
@@ -140,11 +289,12 @@ function buildDesktopBackendEnv({
     // this. User's explicit setting wins. Re-port of PR #56499 (echoriver89).
     PYTHONUTF8: currentEnv?.PYTHONUTF8 ?? '1',
     [key]: buildDesktopBackendPath({
-      hermesHome,
+      runtimeDir,
       venvRoot,
       currentPath: currentPathValue(currentEnv, platform),
       platform,
-      pathModule
+      pathModule,
+      fsImpl
     })
   }
 }
@@ -154,7 +304,6 @@ export {
   buildDesktopBackendEnv,
   buildDesktopBackendPath,
   delimiterForPlatform,
-  hermesManagedNodePathEntries,
   normalizeHermesHomeRoot,
   pathEnvKey,
   POSIX_SANE_PATH_ENTRIES

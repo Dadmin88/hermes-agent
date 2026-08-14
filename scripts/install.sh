@@ -941,11 +941,16 @@ install_node() {
     local tmp_dir
     tmp_dir=$(mktemp -d)
 
-    log_info "Downloading $tarball_name..."
-    if ! curl -fsSL "$download_url" -o "$tmp_dir/$tarball_name"; then
-        log_warn "Download failed"
-        rm -rf "$tmp_dir"
-        HAS_NODE=false
+provision_managed_runtimes() {
+    # THE dep engine, shared with `hermes update`: one implementation of
+    # "download the pinned tools", in Python, reading runtime-pins.json.
+    # The installer's job ends at "python can run"; everything below that
+    # line (node, git, gh, ripgrep) belongs to the provisioner.
+    log_info "Provisioning managed runtimes (node, npm, git, gh, ripgrep)..."
+
+    local py="$INSTALL_DIR/venv/bin/python"
+    if [ ! -x "$py" ]; then
+        log_warn "No venv python at $py — skipping runtime provisioning"
         return 0
     fi
 

@@ -91,15 +91,18 @@ class TestManagedDetection:
 
     @pytest.fixture
     def managed_tree(self, tmp_path, monkeypatch):
-        home = tmp_path / ".hermes"
-        node = home / "node"
+        # The managed Node tree is install-scoped now (hermes-home lifetime
+        # split): <install>/.hermes-runtime/node, not $HERMES_HOME/node.
+        install_root = tmp_path / "checkout"
+        runtime = install_root / ".hermes-runtime"
+        node = runtime / "node"
         (node / "bin").mkdir(parents=True)
         (node / "lib" / "node_modules" / "npm" / "bin").mkdir(parents=True)
         cli = node / "lib" / "node_modules" / "npm" / "bin" / "npm-cli.js"
         cli.write_text("#!/usr/bin/env node\n", encoding="utf-8")
         (node / "bin" / "npm").symlink_to(cli)
-        monkeypatch.setenv("HERMES_HOME", str(home))
-        return home
+        monkeypatch.setenv("HERMES_INSTALL_ROOT", str(install_root))
+        return runtime
 
     def test_direct_managed_bin_is_managed(self, managed_tree):
         npm = managed_tree / "node" / "bin" / "npm"
@@ -132,13 +135,13 @@ class TestRepairDecision:
 
     @pytest.fixture
     def managed_npm(self, tmp_path, monkeypatch):
-        home = tmp_path / ".hermes"
-        bin_dir = home / "node" / "bin"
+        install_root = tmp_path / "checkout"
+        bin_dir = install_root / ".hermes-runtime" / "node" / "bin"
         bin_dir.mkdir(parents=True)
         npm = bin_dir / "npm"
         npm.write_text("#!/bin/sh\n", encoding="utf-8")
         npm.chmod(0o755)
-        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_INSTALL_ROOT", str(install_root))
         return npm
 
     def test_upgrades_managed_npm_with_the_range_npm_asked_for(
@@ -195,12 +198,12 @@ class TestRepairDecision:
     ):
         """A system/nvm/brew/Nix npm is never modified — Hermes provisions its
         own managed tree, upgrades THAT npm into range, and returns it."""
-        home = tmp_path / ".hermes"
-        monkeypatch.setenv("HERMES_HOME", str(home))
+        install_root = tmp_path / "checkout"
+        monkeypatch.setenv("HERMES_INSTALL_ROOT", str(install_root))
         system_npm = tmp_path / "usr-bin-npm"
         system_npm.write_text("#!/bin/sh\n", encoding="utf-8")
 
-        managed = home / "node" / "bin" / "npm"
+        managed = install_root / ".hermes-runtime" / "node" / "bin" / "npm"
 
         import hermes_cli.npm_engine as npm_engine
 
@@ -262,7 +265,9 @@ class TestRepairDecision:
         managed tree ships a supported Node — provisioning covers it. The
         managed npm is still upgraded to the repo's own engines.npm range."""
         home = tmp_path / ".hermes"
+        install_root = tmp_path / "checkout"
         monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_INSTALL_ROOT", str(install_root))
         system_npm = tmp_path / "usr-bin-npm"
         system_npm.write_text("#!/bin/sh\n", encoding="utf-8")
 
@@ -272,7 +277,7 @@ class TestRepairDecision:
             'npm error notsup Actual:   {"npm":"10.9.8","node":"v18.0.0"}\n'
         )
 
-        managed = home / "node" / "bin" / "npm"
+        managed = install_root / ".hermes-runtime" / "node" / "bin" / "npm"
 
         import hermes_cli.npm_engine as npm_engine
 

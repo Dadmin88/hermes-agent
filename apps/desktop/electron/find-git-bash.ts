@@ -37,6 +37,15 @@ export function findGitBash(opts: GitBashOptions): string | null {
   // on POSIX CI hosts too), so join with win32 semantics explicitly.
   const joinWin = path.win32.join
 
+  // Bundled PortableGit inside the app's resources (embedded runtime).
+  // Checked before the Hermes-managed install and system locations so a
+  // bundled app always uses its own git.
+  const resourcesPath = env.HERMES_RESOURCES_PATH
+  if (resourcesPath) {
+    candidates.push(joinWin(resourcesPath, 'agent-payload', 'git', 'bin', 'bash.exe'))
+    candidates.push(joinWin(resourcesPath, 'agent-payload', 'git', 'usr', 'bin', 'bash.exe'))
+  }
+
   if (localAppData) {
     candidates.push(joinWin(localAppData, 'hermes', 'git', 'bin', 'bash.exe'))
     candidates.push(joinWin(localAppData, 'hermes', 'git', 'usr', 'bin', 'bash.exe'))

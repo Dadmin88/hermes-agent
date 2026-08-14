@@ -1146,26 +1146,53 @@ def _managed_runtime_path_entries() -> list[str]:
     The terminal tool spawns a subshell whose PATH is the agent process's PATH
     plus ``_SANE_PATH``. Neither carries the runtimes Hermes installs for
     itself, so on a machine where Hermes provisioned its own toolchain a
-    command the agent runs resolves a system copy instead — or nothing at all:
+    command the agent runs resolves a system copy instead — or nothing at all.
 
-    - ``$HERMES_HOME/node`` (+ ``/bin``) — installed to satisfy the desktop and
-      browser toolchain. ``tools/browser_tool.py`` already does this for its own
-      subprocesses; the agent's shell deserves the same.
-    - ``$HERMES_HOME/bin`` — the managed ``uv``. ``install.sh`` writes it there
-      and nothing has ever put that directory on PATH, so an install whose only
-      uv is the managed one looks uv-less to both the agent and the model.
+    The runtime registry owns which tools exist and where (node, uv, git, gh,
+    ripgrep — hermes-home lifetime split, phase 2.7); this is one call into
+    the single PATH assembler rather than a hand-kept list of directories.
+    Ripgrep in particular used to be a system-package hope: ``search_files``
+    silently degraded to grep/find when no system rg existed, and nothing
+    ever provisioned one.
 
-    Resolved per call rather than cached in a module constant because
-    ``get_hermes_home()`` is profile-scoped and a managed tree can appear
-    mid-process (``heal_hermes_managed_node``, a first browser install).
+    Resolved per call rather than cached in a module constant because a
+    managed tree can appear mid-process (a heal, a first browser install).
     """
     try:
-        from hermes_constants import get_hermes_home, iter_hermes_node_dirs
+        from hermes_cli.runtime_env import managed_path_dirs
 
-        candidates = [*iter_hermes_node_dirs(), get_hermes_home() / "bin"]
-        return [str(d) for d in candidates if d.is_dir()]
+        return [str(d) for d in managed_path_dirs()]
     except Exception:
         return []
+
+
+def _apply_managed_runtime_tool_env(env: dict) -> None:
+    """Add the managed runtimes' tool env to a subshell environment.
+
+    PATH alone is not enough to make a managed tool work. The bundled git
+    (dugite-native on POSIX, PortableGit on Windows) is a RELOCATED build:
+    it resolves its helpers, templates and system config against a prefix
+    that existed on the build machine, so without GIT_EXEC_PATH and
+    friends an agent's ``git clone https://…`` fails with "'remote-http'
+    is not a git command" — while ``git --version`` keeps working, which
+    is why this hid. Dugite's own ``setupEnvironment()`` exports the same
+    set before every invocation; this is that contract, from the one
+    assembler that knows the layout.
+
+    Never overwrites a value the caller already set: a user or a
+    passthrough var pointing at their own git tooling wins.
+
+    Fail-open and resolved per call, matching
+    :func:`_managed_runtime_path_entries` — a managed tree can appear
+    mid-process, and a broken runtime dir must not break the terminal.
+    """
+    try:
+        from hermes_cli.runtime_env import managed_tool_env
+
+        for key, value in managed_tool_env().items():
+            env.setdefault(key, value)
+    except Exception:
+        return
 
 
 def _append_missing_sane_path_entries(existing_path: str) -> str:
@@ -1192,11 +1219,25 @@ def _append_missing_sane_path_entries(existing_path: str) -> str:
 
     For a well-formed PATH (no empties, no duplicates) the leading segment is
     byte-identical to the input and ordering is preserved; only the missing
-    sane entries are appended. On Windows this is a no-op passthrough (the
-    separator is ``;`` and the native PATH must not be touched).
+    sane entries are appended. On Windows the POSIX ``_SANE_PATH`` entries are
+    meaningless and the native PATH must not be rewritten, but the managed
+    runtime dirs still get appended (with ``;``) — Windows is precisely where
+    Hermes-managed git/node/gh are the only copies on the machine.
     """
     if _IS_WINDOWS:
-        return existing_path
+        # Append (never rewrite) the managed dirs. Windows paths are
+        # case-insensitive and slash-flexible, so the already-present check
+        # compares os.path.normcase forms — a raw string comparison would
+        # miss C:\... vs c:/... and append a duplicate.
+        present = {os.path.normcase(entry) for entry in existing_path.split(";") if entry}
+        managed = [
+            entry
+            for entry in _managed_runtime_path_entries()
+            if os.path.normcase(entry) not in present
+        ]
+        if not managed:
+            return existing_path
+        return ";".join([existing_path, *managed]) if existing_path else ";".join(managed)
 
     sane_entries = [entry for entry in _SANE_PATH.split(":") if entry]
     sane_entries.extend(
@@ -1307,6 +1348,8 @@ def _make_run_env(env: dict) -> dict:
         # to bare ``hermes`` via the terminal tool even when the gateway was
         # launched without it on PATH (systemd, service managers, cron, etc.).
         run_env[path_key] = _prepend_hermes_bin_dir(new_path)
+
+    _apply_managed_runtime_tool_env(run_env)
 
     _inject_context_hermes_home(run_env)
 

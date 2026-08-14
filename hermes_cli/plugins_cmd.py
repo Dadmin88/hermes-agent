@@ -24,6 +24,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_constants import get_hermes_home
+from hermes_cli.runtime_env import (
+    is_macos_xcode_shim as _is_macos_xcode_shim,
+    managed_tool_binary,
+)
 from hermes_cli._subprocess_compat import noninteractive_git_env
 from hermes_cli.config import cfg_get
 from hermes_cli.secret_prompt import masked_secret_prompt
@@ -36,11 +40,21 @@ logger = logging.getLogger(__name__)
 def _resolve_git_executable() -> Optional[str]:
     """Resolve a git binary for subprocess use when ``PATH`` may be minimal.
 
-    Matches other Hermes subprocess resolution: :func:`shutil.which` first,
-    then common Git for Windows install paths and POSIX defaults.
+    Order: the managed git this install provisioned, then
+    :func:`shutil.which`, then common Git for Windows install paths.
+
+    macOS never falls back to ``/usr/bin/git``: that path is the
+    xcode-select SHIM, and running it on a machine without the Command
+    Line Tools pops a modal install dialog. Returning None (the caller
+    reports "git unavailable") beats hijacking the user's screen from a
+    background process.
     """
+    managed = managed_tool_binary("git")
+    if managed:
+        return str(managed)
+
     found = shutil.which("git")
-    if found:
+    if found and not _is_macos_xcode_shim(found):
         return found
     if os.name == "nt":
         prog = os.environ.get("ProgramFiles", r"C:\Program Files")
@@ -59,6 +73,9 @@ def _resolve_git_executable() -> Optional[str]:
                     os.path.join(local, "Programs", "Git", "bin", "git.exe"),
                 )
             )
+    elif sys.platform == "darwin":
+        # No /usr/bin/git — see the docstring. Homebrew's is a real git.
+        candidates = ["/opt/homebrew/bin/git", "/usr/local/bin/git"]
     else:
         candidates = ["/usr/bin/git", "/usr/local/bin/git", "/bin/git"]
     for c in candidates:

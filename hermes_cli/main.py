@@ -1810,12 +1810,11 @@ def _tui_need_rebuild(root: Path) -> bool:
 def _ensure_tui_node() -> None:
     """Make sure `node` + `npm` are on PATH for the TUI.
 
-    If either is missing and scripts/lib/node-bootstrap.sh is available, source
-    it and call `ensure_node` (fnm/nvm/proto/brew/bundled cascade). After
-    install, capture the resolved node binary path from the bash subprocess
-    and prepend its directory to os.environ["PATH"] so shutil.which finds the
-    new binaries in this Python process — regardless of which version manager
-    was used (nvm, fnm, proto, brew, or the bundled fallback).
+    Missing Node is provisioned by the runtime provisioner (the ONE dep
+    engine — hermes-home lifetime split, phase 2.6), which installs the
+    pinned version into the install-scoped runtime dir. The managed bin
+    dirs are then prepended to this process's PATH so ``shutil.which``
+    finds them.
 
     Idempotent no-op when node+npm are already discoverable. Set
     ``HERMES_SKIP_NODE_BOOTSTRAP=1`` to disable auto-install.
@@ -1825,45 +1824,19 @@ def _ensure_tui_node() -> None:
     if os.environ.get("HERMES_SKIP_NODE_BOOTSTRAP"):
         return
 
-    helper = PROJECT_ROOT / "scripts" / "lib" / "node-bootstrap.sh"
-    if not helper.is_file():
-        return
-
-    from hermes_constants import get_hermes_home
-
-    hermes_home = str(get_hermes_home())
     try:
-        # Helper writes logs to stderr; we ask bash to print `command -v node`
-        # on stdout once ensure_node succeeds. Subshell PATH edits don't leak
-        # back into Python, so the stdout capture is the bridge.
-        result = subprocess.run(
-            [
-                "bash",
-                "-c",
-                f'source "{helper}" >&2 && ensure_node >&2 && command -v node',
-            ],
-            env={**os.environ, "HERMES_HOME": hermes_home},
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
+        from hermes_cli.runtime_provisioner import provision_tool
+
+        provision_tool("node")
+    except Exception:  # noqa: BLE001 — no Node is a degrade, not a crash
         return
+
+    from hermes_cli.runtime_env import managed_path_dirs
 
     parts = os.environ.get("PATH", "").split(os.pathsep)
-    extras: list[Path] = []
-
-    resolved = (result.stdout or "").strip()
-    if resolved:
-        extras.append(Path(resolved).resolve().parent)
-
-    extras.extend([Path(hermes_home) / "node" / "bin", Path.home() / ".local" / "bin"])
-
-    for extra in extras:
+    for extra in managed_path_dirs():
         s = str(extra)
-        if extra.is_dir() and s not in parts:
+        if s not in parts:
             parts.insert(0, s)
     os.environ["PATH"] = os.pathsep.join(parts)
 

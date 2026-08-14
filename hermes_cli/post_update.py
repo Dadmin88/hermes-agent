@@ -194,7 +194,7 @@ def step_cua_driver_refresh() -> dict:
 
 
 def step_provision_runtimes() -> dict:
-    """Provision managed runtime tools (node, uv, git, gh, ripgrep) into
+    """Provision managed runtime tools (node, npm, uv, git, gh, ripgrep) into
     the install-scoped runtime dir from runtime-pins.json. THE dep engine
     for updates AND fresh installs (--install-phase); see
     hermes_cli/runtime_provisioner.py."""

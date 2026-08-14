@@ -1306,9 +1306,9 @@ function Install-Git {
         # routinely hit the limit, breaking the installer.
         # Static github.com/.../releases/download/<tag>/<asset> URLs
         # are not subject to the API rate limit.
-        $gitTag    = "v2.54.0.windows.1"
-        $gitVer    = "2.54.0"
-        $gitVerTag = "$gitVer.windows.1"
+        $gitTag    = "v2.55.0.windows.3"
+        $gitVer    = "2.55.0.3"
+        $gitVerTag = "v2.55.0.windows.3"
 
         if ($arch -eq "32-bit-mingit") {
             Write-Warn "32-bit Windows detected -- PortableGit is 64-bit only.  Installing MinGit 32-bit as a last resort; bash-dependent Hermes features (terminal tool, agent-browser) will not work on this machine."
@@ -1498,18 +1498,20 @@ function Test-Node {
         Write-Warn "Node.js $version is too old (Hermes requires Node >=26)"
     }
 
-    # Prefer a Hermes-managed Node from a previous run over a too-old system one.
-    $managedNode = "$HermesHome\node\node.exe"
-    if ((Test-Path $managedNode) -and (Test-NodeVersionOk (& $managedNode --version))) {
-        $version = & $managedNode --version
-        $env:Path = "$HermesHome\node;$env:Path"
-        Set-ManagedNodeFirstOnUserPath "$HermesHome\node"
-        Write-Success "Node.js $version found (Hermes-managed)"
-        # A tree from an older install still has that Node major's bundled
-        # npm, which is below the current engines.npm floor. No-ops when the
-        # npm is already in range, so reruns cost one --version probe.
-        Update-ManagedNpm "$HermesHome\node" | Out-Null
-        $script:HasNode = $true
+    $script:HasNode = $false
+    return $true
+}
+
+function Invoke-RuntimeProvisioning {
+    # THE dep engine, shared with `hermes update`: one implementation of
+    # "download the pinned tools", in Python, reading runtime-pins.json.
+    # This installer's job ends at "python can run"; node, git, gh and
+    # ripgrep below that line belong to the provisioner.
+    Write-Info "Provisioning managed runtimes (node, npm, git, gh, ripgrep)..."
+
+    $py = Join-Path $InstallDir "venv\Scripts\python.exe"
+    if (-not (Test-Path $py)) {
+        Write-Warn "No venv python at $py -- skipping runtime provisioning"
         return $true
     }
 
