@@ -210,6 +210,83 @@ def get_default_hermes_root() -> Path:
     return env_path
 
 
+# ─── Install-scoped runtime dir (design: 2026-08-12_hermes-home-lifetime-split) ──
+#
+# HERMES_HOME holds PROFILE state (config, sessions, skills). Install-scoped
+# artifacts — managed binaries, venvs, true caches, update bookkeeping —
+# belong to ONE install of Hermes and live beside its code in
+# ``<install root>/.hermes-runtime/``. Two installs sharing one home must
+# never share these (different node versions, venv ABIs, update stamps).
+
+RUNTIME_DIR_NAME = ".hermes-runtime"
+
+_INSTALL_ROOT_OVERRIDE: ContextVar[str | object] = ContextVar(
+    "_INSTALL_ROOT_OVERRIDE", default=_UNSET
+)
+
+
+def set_install_root_override(path: str | Path | None) -> Token:
+    """Override the install root for this context (desktop resourcesPath,
+    tests). Pass ``None`` to explicitly restore the default derivation."""
+    value: str | object = _UNSET if path is None else str(path)
+    return _INSTALL_ROOT_OVERRIDE.set(value)
+
+
+def reset_install_root_override(token: Token) -> None:
+    _INSTALL_ROOT_OVERRIDE.reset(token)
+
+
+def get_install_root() -> Path:
+    """Return the root directory of THIS install of Hermes.
+
+    Resolution order:
+      1. ``HERMES_INSTALL_ROOT`` env var — set by the desktop app
+         (resources payload) and by tests. An env var rather than only a
+         ContextVar because child processes (post-update phase, tool
+         subprocesses) must inherit it across the process boundary.
+      2. Context override (``set_install_root_override``) — in-process
+         callers that cannot mutate the environment.
+      3. The directory containing this module — for a source checkout
+         this IS the repo root (``hermes_constants.py`` sits at top
+         level; same derivation ``managed_uv.py`` uses for
+         ``_PROJECT_ROOT``).
+
+    pip/wheel layouts are unsupported by design (setup.py blocks wheel
+    builds outside Nix), so rung 3 is always a real, writable checkout —
+    or the caller set rung 1/2.
+    """
+    env_root = os.environ.get("HERMES_INSTALL_ROOT", "")
+    if env_root:
+        return Path(env_root)
+    override = _INSTALL_ROOT_OVERRIDE.get()
+    if override is not _UNSET:
+        return Path(str(override))
+    return Path(__file__).resolve().parent
+
+
+def get_runtime_dir(install_root: Path | None = None) -> Path:
+    """Return the install-scoped runtime directory ``<root>/.hermes-runtime``.
+
+    Holds managed binaries (node, npm, uv, git, gh, ripgrep), install-keyed
+    caches, and the ``runtimes.json`` facts manifest. Callers must treat
+    the location as opaque and go through the runtime registry for tool
+    lookup — no path literals.
+
+    ``HERMES_RUNTIME_DIR`` overrides it for packagers that BUILD the
+    runtime dir instead of provisioning it: the Nix package assembles one
+    from the pin table at build time and points here, because its install
+    root is an immutable store path that no provisioner can write to. An
+    explicit *install_root* still wins — a caller naming a root means
+    that root.
+    """
+    if install_root is None:
+        override = os.environ.get("HERMES_RUNTIME_DIR", "").strip()
+        if override:
+            return Path(override)
+    root = install_root if install_root is not None else get_install_root()
+    return root / RUNTIME_DIR_NAME
+
+
 def get_optional_skills_dir(default: Path | None = None) -> Path:
     """Return the optional-skills directory, honoring package-manager wrappers.
 
@@ -297,12 +374,22 @@ def get_hermes_dir(
 def iter_hermes_node_dirs(home: Path | None = None) -> list[Path]:
     """Return Hermes-managed Node.js directories in preferred lookup order.
 
-    Windows installs from ``scripts/install.ps1`` unpack portable Node directly
-    into ``%LOCALAPPDATA%\\hermes\\node``. POSIX installs use
-    ``$HERMES_HOME/node/bin``. Include both shapes on every platform so mixed
-    or migrated installs still work.
+    The managed Node tree lives in the install-scoped runtime dir
+    (``<install>/.hermes-runtime/node``) — install artifacts never share a
+    profile home (hermes-home lifetime split, phase 2.6). The runtime
+    provisioner salvages a legacy ``$HERMES_HOME/node`` tree by move on
+    first run; until it does, callers simply find no managed Node and fall
+    back to system Node, which is a degrade, not a break.
+
+    Windows unpacks portable Node flat (``node/node.exe``); POSIX uses
+    ``node/bin``. Both shapes are returned on every platform, leading with
+    the native one.
+
+    The optional *home* argument is retained for callers that pass an
+    explicit root (tests, cross-install inspection); it now names the
+    INSTALL root rather than HERMES_HOME.
     """
-    root = home or get_hermes_home()
+    root = get_runtime_dir() if home is None else Path(home)
     dirs = [root / "node"]
     bin_dir = root / "node" / "bin"
     # NOTE: keep this ordering in sync with hermesManagedNodePathEntries() in
@@ -329,7 +416,32 @@ def _candidate_node_command_names(command: str) -> list[str]:
     return [f"{base}.cmd", f"{base}.exe", base]
 
 
-_HERMES_NODE_TARGET_MAJOR = int(os.environ.get("HERMES_NODE_TARGET_MAJOR", "22"))
+def _node_target_major() -> int:
+    """The Node major this install expects, from runtime-pins.json.
+
+    One source of truth: the pin file the provisioner installs from. The
+    constant this replaced said 22 while the pins said 26 — exactly the
+    drift a second source invites. HERMES_NODE_TARGET_MAJOR still wins for
+    ad-hoc overrides; a broken/absent pin file falls back to the historical
+    floor rather than crashing a resolver.
+    """
+    override = os.environ.get("HERMES_NODE_TARGET_MAJOR", "").strip()
+    if override:
+        return int(override)
+    try:
+        from hermes_cli.runtime_registry import load_pins
+
+        # Pins ship WITH the code, so they are read relative to this module
+        # — not from get_install_root(), which callers can point elsewhere
+        # (desktop resourcesPath, tests) and which would then silently lose
+        # the pin file and fall back.
+        pins = load_pins(Path(__file__).resolve().parent)
+        # Pins are exact ("26.7.0"), so the major is just the first field.
+        return int(pins["node"]["version"].split(".")[0])
+    except Exception:
+        return 22
+
+
 _managed_node_heal_attempted = False
 _NODE_BOOTSTRAP_SCRIPT = Path(__file__).resolve().parent / "scripts" / "lib" / "node-bootstrap.sh"
 
@@ -406,7 +518,7 @@ def _heal_managed_node_windows() -> bool:
         return False
 
     home = get_hermes_home()
-    index_url = f"https://nodejs.org/dist/latest-v{_HERMES_NODE_TARGET_MAJOR}.x/"
+    index_url = f"https://nodejs.org/dist/latest-v{_node_target_major()}.x/"
     try:
         with urllib.request.urlopen(index_url, timeout=60) as response:
             index_html = response.read().decode("utf-8", errors="replace")
@@ -414,7 +526,7 @@ def _heal_managed_node_windows() -> bool:
         return False
 
     match = re.search(
-        rf"node-v{_HERMES_NODE_TARGET_MAJOR}\.\d+\.\d+-win-{node_arch}\.zip",
+        rf"node-v{_node_target_major()}\.\d+\.\d+-win-{node_arch}\.zip",
         index_html,
     )
     if not match:
@@ -569,7 +681,7 @@ def _managed_node_tree_outdated(home: Path | None = None) -> bool:
     An outdated managed Node (e.g. a 22 tree from an older install) heals the
     same way a broken one does: :func:`find_hermes_node_executable` triggers
     the once-per-process heal, which redownloads
-    ``latest-v{_HERMES_NODE_TARGET_MAJOR}.x`` — so existing users are upgraded
+    ``latest-v<target major>.x`` — so existing users are upgraded
     on next launch, not just on the next installer re-run. Mirrors
     ``_nb_managed_node_outdated`` in ``scripts/lib/node-bootstrap.sh``.
     """
@@ -594,14 +706,14 @@ def _managed_node_tree_outdated(home: Path | None = None) -> bool:
                 major = int(result.stdout.decode().strip().lstrip("v").split(".")[0])
             except (OSError, subprocess.TimeoutExpired, ValueError, IndexError):
                 return False  # broken, not outdated — the runnable probe handles it
-            return major < _HERMES_NODE_TARGET_MAJOR
+            return major < _node_target_major()
     return False
 
 
 def find_hermes_node_executable(command: str) -> str | None:
     """Return a Hermes-managed Node/npm executable path, healing broken trees.
 
-    Outdated trees (node major below ``_HERMES_NODE_TARGET_MAJOR``) heal the
+    Outdated trees (node major below the pinned target) heal the
     same way broken ones do — the once-per-process heal redownloads the target
     major, upgrading existing users on next launch rather than next reinstall.
     When the heal fails (offline, download error), an outdated-but-runnable

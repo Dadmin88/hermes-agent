@@ -1,0 +1,166 @@
+{
+  "$schema": "./runtime-pins.schema.json",
+  "$comment": "ONE source of truth, read by the Python provisioner (hermes_cli/runtime_provisioner.py) and by the desktop payload staging, which shells out to it. Every entry pins an EXACT version plus, per target, the exact download URL and its sha256. No ranges, no 'resolve latest and hope': a build is reproducible, needs no GitHub API (unauthenticated callers get 60 requests/hour), and a tool cannot silently change under users. Bump deliberately: change the version, refresh every url+sha256 for that tool, verify, commit. Tool ORDER is derived from this file too — see 'extends'.",
+  "schemaVersion": 2,
+  "tools": {
+    "node": {
+      "version": "26.7.0",
+      "files": {
+        "darwin-arm64": {
+          "url": "https://nodejs.org/dist/v26.7.0/node-v26.7.0-darwin-arm64.tar.gz",
+          "sha256": "7ee659a7768e641bbfd5360940660b8e8fd0052f77488f365562bac522fc15d4"
+        },
+        "darwin-x64": {
+          "url": "https://nodejs.org/dist/v26.7.0/node-v26.7.0-darwin-x64.tar.gz",
+          "sha256": "f279d1ed28ce57f7788bf23435d2ad7fdd7438904ad5c4d8a1081a7cde3d4b96"
+        },
+        "linux-x64": {
+          "url": "https://nodejs.org/dist/v26.7.0/node-v26.7.0-linux-x64.tar.xz",
+          "sha256": "982aa24dd8be4c889c6a8ab337ddff3b0896645b20f4239356e80552c16277ee"
+        },
+        "linux-arm64": {
+          "url": "https://nodejs.org/dist/v26.7.0/node-v26.7.0-linux-arm64.tar.xz",
+          "sha256": "afc7a004018485092ac8985b817b0d5684472bd9472e0b57d2ab88737e50090d"
+        },
+        "win32-x64": {
+          "url": "https://nodejs.org/dist/v26.7.0/node-v26.7.0-win-x64.zip",
+          "sha256": "d3bd72755141ed32bbcd841228ee81897c8a98d50dfa7dae2179399a0a7c90f8"
+        },
+        "win32-arm64": {
+          "url": "https://nodejs.org/dist/v26.7.0/node-v26.7.0-win-arm64.zip",
+          "sha256": "be8775204cfceca5a73c30f91bf0de5e85274c01b776dc13f16b91aa251ebb01"
+        }
+      }
+    },
+    "npm": {
+      "version": "12.0.2",
+      "extends": ["node"],
+      "$comment": "Newer than the npm bundled inside the pinned node. 'extends' says both things that follow from that: install npm AFTER node (staging runs node's own npm to unpack this tarball), and put npm's bin dir BEFORE node's on PATH, or node's bundled npm shadows this one. The registry tarball is the same bytes for every target, so it pins one 'any' artifact; the per-target part is the shim layout npm writes on install, which _binary_rel owns.",
+      "files": {
+        "any": {
+          "url": "https://registry.npmjs.org/npm/-/npm-12.0.2.tgz",
+          "sha256": "5dbb86c71d07a1957f2e90734092dd6a58bdcd9ebc2d8d41ca1c6e6a21d364e1"
+        }
+      }
+    },
+    "uv": {
+      "version": "0.12.3",
+      "files": {
+        "darwin-arm64": {
+          "url": "https://github.com/astral-sh/uv/releases/download/0.12.3/uv-aarch64-apple-darwin.tar.gz",
+          "sha256": "546f7f8a6c70ff13a3a9d2bc958db3427298cebf3e0cb756f9177133b7068843"
+        },
+        "darwin-x64": {
+          "url": "https://github.com/astral-sh/uv/releases/download/0.12.3/uv-x86_64-apple-darwin.tar.gz",
+          "sha256": "4c9f52262a14da336e4a42ed24992d12d0c956acde87619e4611d321dffa602b"
+        },
+        "linux-x64": {
+          "url": "https://github.com/astral-sh/uv/releases/download/0.12.3/uv-x86_64-unknown-linux-gnu.tar.gz",
+          "sha256": "600cf9a742aca00d292673b16b5acffaa7b8c269a364ad0c2e79498dcb1fe101"
+        },
+        "linux-arm64": {
+          "url": "https://github.com/astral-sh/uv/releases/download/0.12.3/uv-aarch64-unknown-linux-gnu.tar.gz",
+          "sha256": "bb66cb52e7b1823aed1183630d8d8e5c958840d584a4c55ec10a4cfc168dcca2"
+        },
+        "win32-x64": {
+          "url": "https://github.com/astral-sh/uv/releases/download/0.12.3/uv-x86_64-pc-windows-msvc.zip",
+          "sha256": "b23350c79e8ad0192b8124af13a0f17e8d4e4549524785e1aef389ae5a06990e"
+        },
+        "win32-arm64": {
+          "url": "https://github.com/astral-sh/uv/releases/download/0.12.3/uv-aarch64-pc-windows-msvc.zip",
+          "sha256": "4343217d668727b8a8eb5cad92389a1d2eeead93c89940d1b955ba1bb15462eb"
+        }
+      }
+    },
+    "git": {
+      "version": "2.53.0",
+      "$comment": "On Windows, we need git bash. On MacOS, we avoid using system git because it causes xcode commandline tools installation (big and heavy). On Linux, it's possible to not have a bundled git.",
+      "files": {
+        "darwin-arm64": {
+          "url": "https://github.com/desktop/dugite-native/releases/download/v2.53.0-4/dugite-native-v2.53.0-4098283-macOS-arm64.tar.gz",
+          "sha256": "f9dc64635a5b62fbd7ad95db73268bbb8912255ac516d65d37bf7af22fcb8ffe"
+        },
+        "darwin-x64": {
+          "url": "https://github.com/desktop/dugite-native/releases/download/v2.53.0-4/dugite-native-v2.53.0-4098283-macOS-x64.tar.gz",
+          "sha256": "ae6686718aa34f4140424db16b92a47dcffd6d1f312eb8b5f3b267f7404e2680"
+        },
+        "linux-x64": {
+          "url": "https://github.com/desktop/dugite-native/releases/download/v2.53.0-4/dugite-native-v2.53.0-4098283-ubuntu-x64.tar.gz",
+          "sha256": "cca76aa31ad9e835e771ee7f55b73934777fbd8d16757a10d307ba06de860901"
+        },
+        "linux-arm64": {
+          "url": "https://github.com/desktop/dugite-native/releases/download/v2.53.0-4/dugite-native-v2.53.0-4098283-ubuntu-arm64.tar.gz",
+          "sha256": "a161f45af4626bb7e0c688854bd4a9aee47cc514bca404cff0a5e3536ef1c0af"
+        },
+        "win32-x64": {
+          "url": "https://github.com/git-for-windows/git/releases/download/v2.53.0.windows.3/PortableGit-2.53.0.3-64-bit.7z.exe",
+          "sha256": "b365da794b1d2225eb24d5f5e09ef7792cfd5fa26c3a3586210280c80dff3a2a"
+        },
+        "win32-arm64": {
+          "url": "https://github.com/git-for-windows/git/releases/download/v2.53.0.windows.3/PortableGit-2.53.0.3-arm64.7z.exe",
+          "sha256": "0db54010054c01f35501cf69e1e32d3710138ecb934d188bd77093afed24300e"
+        }
+      }
+    },
+    "gh": {
+      "version": "2.97.0",
+      "$comment": "GitHub CLI.",
+      "files": {
+        "darwin-arm64": {
+          "url": "https://github.com/cli/cli/releases/download/v2.97.0/gh_2.97.0_macOS_arm64.zip",
+          "sha256": "a58b8fd77b417a38f47a0b54d1370c59b0fcdb324ccc9ca002b0998f7c4c999e"
+        },
+        "darwin-x64": {
+          "url": "https://github.com/cli/cli/releases/download/v2.97.0/gh_2.97.0_macOS_amd64.zip",
+          "sha256": "63298c998cc2a924c9e254c6af6a1caad6ece281122687a91f079bc0a462700e"
+        },
+        "linux-x64": {
+          "url": "https://github.com/cli/cli/releases/download/v2.97.0/gh_2.97.0_linux_amd64.tar.gz",
+          "sha256": "a2c9b8497e1f85b1ad0dfcb78b5a622e098801b8e461e459e88e1ee12f018112"
+        },
+        "linux-arm64": {
+          "url": "https://github.com/cli/cli/releases/download/v2.97.0/gh_2.97.0_linux_arm64.tar.gz",
+          "sha256": "73ea440ecad9c9e284429997ee6f93577bc6f7bc6fba357ef62c53ad8fb641a5"
+        },
+        "win32-x64": {
+          "url": "https://github.com/cli/cli/releases/download/v2.97.0/gh_2.97.0_windows_amd64.zip",
+          "sha256": "35d7fe05c4dd1411ffda1e73dfc7c6f44b75c936ca51fa6595c657fdc0350cec"
+        },
+        "win32-arm64": {
+          "url": "https://github.com/cli/cli/releases/download/v2.97.0/gh_2.97.0_windows_arm64.zip",
+          "sha256": "3e2d4a166da4ee5020c592737b65eec0e724946d5d5b962f5fe59d99116dc4bf"
+        }
+      }
+    },
+    "ripgrep": {
+      "version": "15.2.0",
+      "$comment": "Fast file search behind search_files. Linux uses the musl build so it does not depend on the host glibc.",
+      "files": {
+        "darwin-arm64": {
+          "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-apple-darwin.tar.gz",
+          "sha256": "3750b2e93f37e0c692657da574d7019a101c0084da05a790c83fd335bad973e4"
+        },
+        "darwin-x64": {
+          "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-apple-darwin.tar.gz",
+          "sha256": "af7825fcc69a2afc7a7aea55fc9af90e26421d8f20fe59df32e233c0b8a231c1"
+        },
+        "linux-x64": {
+          "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-unknown-linux-musl.tar.gz",
+          "sha256": "33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c"
+        },
+        "linux-arm64": {
+          "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-unknown-linux-musl.tar.gz",
+          "sha256": "800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915"
+        },
+        "win32-x64": {
+          "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-pc-windows-msvc.zip",
+          "sha256": "71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5"
+        },
+        "win32-arm64": {
+          "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-pc-windows-msvc.zip",
+          "sha256": "e4abca10c3a64ebea742667dd7009449d49403db5460dd6873e389fa2945360f"
+        }
+      }
+    }
+  }
+}

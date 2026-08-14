@@ -11,6 +11,9 @@ import {
   pipTargetArgs,
   pythonDirPattern,
   pythonRequest,
+  assertPayloadArch,
+  probeElfArch,
+  probeMachOArch,
   resolveTag,
   resolveTargets,
   stageCacheKey
@@ -196,4 +199,120 @@ test('stageCacheKey is stable for identical inputs and moves with each one', () 
   assert.notEqual(stageCacheKey(base), stageCacheKey({ ...base, requirementsText: 'cryptography==46.0.4\n' }))
   assert.notEqual(stageCacheKey(base), stageCacheKey({ ...base, pythonVersion: '3.12' }))
   assert.notEqual(stageCacheKey(base), stageCacheKey({ ...base, target: resolveTargets('win32', 'x64') }))
+})
+
+// ─── binary architecture probes ────────────────────────────────────
+
+import fs from 'node:fs'
+import os from 'node:os'
+
+/** Write a header-only fixture; the probes read the first bytes only. */
+function fixture(bytes) {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-probe-')), 'bin')
+  fs.writeFileSync(file, Buffer.from(bytes))
+  return file
+}
+
+function machO({ magic, cpuType, bigEndian = false }) {
+  const buf = Buffer.alloc(32)
+  if (bigEndian) {
+    buf.writeUInt32BE(magic, 0)
+    buf.writeUInt32BE(cpuType, 4)
+  } else {
+    buf.writeUInt32LE(magic, 0)
+    buf.writeUInt32LE(cpuType, 4)
+  }
+  return buf
+}
+
+function elf({ machine, bigEndian = false }) {
+  const buf = Buffer.alloc(32)
+  buf.writeUInt8(0x7f, 0)
+  buf.write('ELF', 1, 'ascii')
+  buf.writeUInt8(bigEndian ? 2 : 1, 5)
+  if (bigEndian) buf.writeUInt16BE(machine, 18)
+  else buf.writeUInt16LE(machine, 18)
+  return buf
+}
+
+test('probeMachOArch reads thin arm64 and x64 binaries', () => {
+  // 0xfeedfacf = MH_MAGIC_64; cputype 0x0100000c = ARM64, 0x01000007 = X86_64.
+  assert.equal(probeMachOArch(fixture(machO({ magic: 0xfeedfacf, cpuType: 0x0100000c }))), 'arm64')
+  assert.equal(probeMachOArch(fixture(machO({ magic: 0xfeedfacf, cpuType: 0x01000007 }))), 'x64')
+})
+
+test('probeMachOArch handles both byte orders', () => {
+  const swapped = machO({ magic: 0xfeedfacf, cpuType: 0x0100000c, bigEndian: true })
+  assert.equal(probeMachOArch(fixture(swapped)), 'arm64')
+})
+
+test('probeMachOArch reports a universal binary as universal, not a single arch', () => {
+  // Shipping a fat binary is not wrong; it just is not a single-arch
+  // answer, and the caller decides whether that is acceptable.
+  const fat = Buffer.alloc(16)
+  fat.writeUInt32BE(0xcafebabe, 0)
+  assert.equal(probeMachOArch(fixture(fat)), 'universal')
+})
+
+test('probeMachOArch returns null for a non-Mach-O file', () => {
+  assert.equal(probeMachOArch(fixture(elf({ machine: 0x3e }))), null)
+  assert.equal(probeMachOArch(fixture(Buffer.from('#!/bin/sh\n'))), null)
+})
+
+test('probeElfArch reads x64 and arm64 ELF binaries', () => {
+  assert.equal(probeElfArch(fixture(elf({ machine: 0x3e }))), 'x64')
+  assert.equal(probeElfArch(fixture(elf({ machine: 0xb7 }))), 'arm64')
+})
+
+test('probeElfArch honours the ELF data-encoding byte', () => {
+  assert.equal(probeElfArch(fixture(elf({ machine: 0xb7, bigEndian: true }))), 'arm64')
+})
+
+test('probeElfArch returns null for a non-ELF file', () => {
+  assert.equal(probeElfArch(fixture(machO({ magic: 0xfeedfacf, cpuType: 0x0100000c }))), null)
+})
+
+// ─── the payload's arch gate ───────────────────────────────────────
+
+test('assertPayloadArch accepts a payload whose binaries match the target', () => {
+  // The payload IS a runtime dir: its tools are staged by the Python
+  // provisioner from exact pins. This is the gate that the staged bytes
+  // are for the RIGHT platform — header inspection, because a cross-build
+  // host cannot run what it just staged.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-payload-'))
+  const target = resolveTargets('linux', 'x64')
+
+  for (const rel of ['node/bin/node', 'uv/uv', 'git/bin/git', 'gh/bin/gh', 'ripgrep/rg']) {
+    const file = path.join(dir, rel)
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, elf({ machine: 0x3e })) // EM_X86_64
+  }
+
+  assert.doesNotThrow(() => assertPayloadArch(target, dir))
+})
+
+test('assertPayloadArch rejects a wrong-arch binary', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-payload-'))
+  const target = resolveTargets('linux', 'x64')
+
+  for (const rel of ['node/bin/node', 'uv/uv', 'git/bin/git', 'gh/bin/gh', 'ripgrep/rg']) {
+    const file = path.join(dir, rel)
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, elf({ machine: 0x3e }))
+  }
+  // One arm64 straggler is exactly the defect this catches.
+  fs.writeFileSync(path.join(dir, 'gh/bin/gh'), elf({ machine: 0xb7 }))
+
+  assert.throws(() => assertPayloadArch(target, dir), /gh: staged binary is arm64/)
+})
+
+test('assertPayloadArch rejects a payload missing a tool entirely', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-payload-'))
+  const target = resolveTargets('linux', 'x64')
+
+  const file = path.join(dir, 'node/bin/node')
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  fs.writeFileSync(file, elf({ machine: 0x3e }))
+
+  assert.throws(() => assertPayloadArch(target, dir), /uv: uv\/uv missing/)
 })

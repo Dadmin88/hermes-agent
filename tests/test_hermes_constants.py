@@ -101,22 +101,22 @@ class TestHermesManagedNode:
     @pytest.mark.windows_only
     def test_windows_node_dir_prefers_portable_root(self, tmp_path, monkeypatch):
         home = tmp_path / "hermes"
-        node_dir = home / "node"
+        node_dir = home / ".hermes-runtime" / "node"
         bin_dir = node_dir / "bin"
         node_dir.mkdir(parents=True)
         bin_dir.mkdir()
-        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_INSTALL_ROOT", str(home))
 
         assert iter_hermes_node_dirs() == [node_dir, bin_dir]
 
     @pytest.mark.windows_only
     def test_windows_finds_npm_cmd_before_path(self, tmp_path, monkeypatch):
         home = tmp_path / "hermes"
-        node_dir = home / "node"
+        node_dir = home / ".hermes-runtime" / "node"
         node_dir.mkdir(parents=True)
         npm_cmd = node_dir / "npm.cmd"
         npm_cmd.write_text("@echo off\n")
-        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_INSTALL_ROOT", str(home))
         monkeypatch.setattr(hermes_constants, "node_tool_runnable", lambda path: True)
 
         assert find_hermes_node_executable("npm") == str(npm_cmd)
@@ -126,7 +126,7 @@ class TestHermesManagedNode:
     @pytest.mark.windows_only
     def test_windows_skips_broken_managed_npm_without_path_fallback(self, tmp_path, monkeypatch):
         home = tmp_path / "hermes"
-        managed_npm = home / "node" / "npm.cmd"
+        managed_npm = home / ".hermes-runtime" / "node" / "npm.cmd"
         managed_npm.parent.mkdir(parents=True)
         managed_npm.write_text("@echo off\n")
         bin_dir = tmp_path / "nodejs"
@@ -168,7 +168,7 @@ class TestNodeToolRunnable:
     def test_broken_managed_npm_heals_when_node_still_runs(self, tmp_path, monkeypatch):
         """npm can fail while node --version still succeeds (missing lib/cli.js)."""
         profile_home = tmp_path / "profiles" / "assistant"
-        managed_bin = profile_home / "node" / "bin"
+        managed_bin = profile_home / ".hermes-runtime" / "node" / "bin"
         managed_bin.mkdir(parents=True)
         self._stub(managed_bin, "node", "#!/bin/sh\necho '22.0.0'\nexit 0\n")
         broken_npm = self._stub(managed_bin, "npm", "#!/bin/sh\nexit 1\n")
@@ -179,6 +179,7 @@ class TestNodeToolRunnable:
         self._stub(system_bin, "npm", "#!/bin/sh\necho '11.10.0'\nexit 0\n")
 
         monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setenv("HERMES_INSTALL_ROOT", str(profile_home))
         monkeypatch.setenv("PATH", str(system_bin))
         monkeypatch.setattr(hermes_constants, "_managed_node_heal_attempted", False)
 
@@ -198,7 +199,7 @@ class TestNodeToolRunnable:
 
     def test_broken_managed_npm_returns_none_when_heal_fails(self, tmp_path, monkeypatch):
         profile_home = tmp_path / "profiles" / "assistant"
-        managed_bin = profile_home / "node" / "bin"
+        managed_bin = profile_home / ".hermes-runtime" / "node" / "bin"
         managed_bin.mkdir(parents=True)
         self._stub(managed_bin, "npm", "#!/bin/sh\nexit 1\n")
 
@@ -207,6 +208,7 @@ class TestNodeToolRunnable:
         self._stub(system_bin, "npm", "#!/bin/sh\necho '11.10.0'\nexit 0\n")
 
         monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setenv("HERMES_INSTALL_ROOT", str(profile_home))
         monkeypatch.setenv("PATH", str(system_bin))
         monkeypatch.setattr(hermes_constants, "_managed_node_heal_attempted", False)
         monkeypatch.setattr(hermes_constants, "heal_hermes_managed_node", lambda: False)
@@ -215,9 +217,9 @@ class TestNodeToolRunnable:
 
     def test_outdated_managed_node_heals_to_target_major(self, tmp_path, monkeypatch):
         """A healthy managed tree below the target major upgrades on next resolve."""
-        target = hermes_constants._HERMES_NODE_TARGET_MAJOR
+        target = hermes_constants._node_target_major()
         profile_home = tmp_path / "profiles" / "assistant"
-        managed_bin = profile_home / "node" / "bin"
+        managed_bin = profile_home / ".hermes-runtime" / "node" / "bin"
         managed_bin.mkdir(parents=True)
         old_node = self._stub(
             managed_bin, "node", f"#!/bin/sh\necho 'v{target - 1}.20.0'\nexit 0\n"
@@ -225,6 +227,7 @@ class TestNodeToolRunnable:
         heal_called = {"value": False}
 
         monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setenv("HERMES_INSTALL_ROOT", str(profile_home))
         monkeypatch.setenv("PATH", "")
         monkeypatch.setattr(hermes_constants, "_managed_node_heal_attempted", False)
 
@@ -242,15 +245,16 @@ class TestNodeToolRunnable:
 
     def test_outdated_managed_node_survives_failed_heal(self, tmp_path, monkeypatch):
         """Offline heal failure keeps serving the old tree — old Node beats no Node."""
-        target = hermes_constants._HERMES_NODE_TARGET_MAJOR
+        target = hermes_constants._node_target_major()
         profile_home = tmp_path / "profiles" / "assistant"
-        managed_bin = profile_home / "node" / "bin"
+        managed_bin = profile_home / ".hermes-runtime" / "node" / "bin"
         managed_bin.mkdir(parents=True)
         old_node = self._stub(
             managed_bin, "node", f"#!/bin/sh\necho 'v{target - 1}.20.0'\nexit 0\n"
         )
 
         monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setenv("HERMES_INSTALL_ROOT", str(profile_home))
         monkeypatch.setenv("PATH", "")
         monkeypatch.setattr(hermes_constants, "_managed_node_heal_attempted", False)
         monkeypatch.setattr(hermes_constants, "heal_hermes_managed_node", lambda: False)
@@ -259,15 +263,16 @@ class TestNodeToolRunnable:
 
     def test_target_major_managed_node_does_not_heal(self, tmp_path, monkeypatch):
         """A tree already at the target major never triggers the heal."""
-        target = hermes_constants._HERMES_NODE_TARGET_MAJOR
+        target = hermes_constants._node_target_major()
         profile_home = tmp_path / "profiles" / "assistant"
-        managed_bin = profile_home / "node" / "bin"
+        managed_bin = profile_home / ".hermes-runtime" / "node" / "bin"
         managed_bin.mkdir(parents=True)
         node = self._stub(
             managed_bin, "node", f"#!/bin/sh\necho 'v{target}.5.1'\nexit 0\n"
         )
 
         monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setenv("HERMES_INSTALL_ROOT", str(profile_home))
         monkeypatch.setenv("PATH", "")
         monkeypatch.setattr(hermes_constants, "_managed_node_heal_attempted", False)
 
@@ -666,3 +671,84 @@ class TestWslPathTranslation:
         assert hermes_constants.translate_cwd_for_wsl_backend(r"\\wsl.localhost\Ubuntu\home\alex") == "/home/alex"
         # Already-POSIX paths pass through untouched.
         assert hermes_constants.translate_cwd_for_wsl_backend("/home/alex") == "/home/alex"
+
+
+class TestInstallRootAndRuntimeDir:
+    """Install-scoped runtime dir resolvers (hermes-home lifetime split)."""
+
+    def test_default_install_root_is_the_checkout(self, monkeypatch):
+        monkeypatch.delenv("HERMES_INSTALL_ROOT", raising=False)
+        # Rung 3: the directory containing hermes_constants.py IS the repo
+        # root in a source checkout — the invariant, not a snapshot path.
+        expected = Path(hermes_constants.__file__).resolve().parent
+        assert hermes_constants.get_install_root() == expected
+
+    def test_env_var_wins(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_INSTALL_ROOT", str(tmp_path / "payload"))
+        assert hermes_constants.get_install_root() == tmp_path / "payload"
+
+    def test_context_override_wins_over_default_but_not_env(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("HERMES_INSTALL_ROOT", raising=False)
+        token = hermes_constants.set_install_root_override(tmp_path / "ctx")
+        try:
+            assert hermes_constants.get_install_root() == tmp_path / "ctx"
+            # Env var beats the context override: children inherit env,
+            # so it is the stronger, cross-process signal.
+            monkeypatch.setenv("HERMES_INSTALL_ROOT", str(tmp_path / "env"))
+            assert hermes_constants.get_install_root() == tmp_path / "env"
+        finally:
+            hermes_constants.reset_install_root_override(token)
+
+    def test_override_reset_restores_default(self, monkeypatch):
+        monkeypatch.delenv("HERMES_INSTALL_ROOT", raising=False)
+        default = hermes_constants.get_install_root()
+        token = hermes_constants.set_install_root_override("/elsewhere")
+        hermes_constants.reset_install_root_override(token)
+        assert hermes_constants.get_install_root() == default
+
+    def test_none_override_restores_default_derivation(self, monkeypatch):
+        monkeypatch.delenv("HERMES_INSTALL_ROOT", raising=False)
+        default = hermes_constants.get_install_root()
+        outer = hermes_constants.set_install_root_override("/elsewhere")
+        inner = hermes_constants.set_install_root_override(None)
+        try:
+            assert hermes_constants.get_install_root() == default
+        finally:
+            hermes_constants.reset_install_root_override(inner)
+            hermes_constants.reset_install_root_override(outer)
+
+    def test_runtime_dir_nests_in_install_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_INSTALL_ROOT", str(tmp_path))
+        assert (
+            hermes_constants.get_runtime_dir()
+            == tmp_path / hermes_constants.RUNTIME_DIR_NAME
+        )
+
+    def test_runtime_dir_explicit_root_bypasses_resolution(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_INSTALL_ROOT", str(tmp_path / "ignored"))
+        explicit = tmp_path / "other-install"
+        assert (
+            hermes_constants.get_runtime_dir(explicit)
+            == explicit / hermes_constants.RUNTIME_DIR_NAME
+        )
+
+    def test_runtime_dir_name_matches_managed_uv_convention(self):
+        # managed_uv.py predates these resolvers and already nests its
+        # python store under <checkout>/.hermes-runtime — the two must
+        # agree or the install grows two runtime dirs.
+        from hermes_cli import managed_uv
+
+        assert hermes_constants.RUNTIME_DIR_NAME == managed_uv._RUNTIME_DIR_NAME
+
+    def test_runtime_dir_is_not_under_hermes_home(self, tmp_path, monkeypatch):
+        # The design invariant: install artifacts never nest in profile
+        # state. A checkout that happens to live under ~/.hermes (the
+        # curl|bash layout: $HERMES_HOME/hermes-agent) is fine — the
+        # runtime dir keys off the INSTALL root, not off HERMES_HOME.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("HERMES_INSTALL_ROOT", str(tmp_path / "home" / "hermes-agent"))
+        runtime = hermes_constants.get_runtime_dir()
+        assert runtime == tmp_path / "home" / "hermes-agent" / ".hermes-runtime"
+        # ...and changing HERMES_HOME alone must not move it.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "other-home"))
+        assert hermes_constants.get_runtime_dir() == runtime

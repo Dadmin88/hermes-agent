@@ -1,7 +1,10 @@
 """Hermes-managed uv and Python runtime repair.
 
-Hermes owns its own uv binary at ``$HERMES_HOME/bin/uv`` (or ``uv.exe`` on
-Windows).  Every code path that needs uv resolves it from that single location.
+Hermes owns its own uv binary at ``<install>/.hermes-runtime/uv/uv`` (or
+``uv.exe`` on Windows) — install-scoped, never shared between two installs.
+An older install's ``$HERMES_HOME/bin/uv`` is ignored, never adopted: it
+is unverified bytes, and the pinned artifact is one download away.
+Every code path that needs uv resolves it from that single location.
 If the binary is missing, ``ensure_uv()`` bootstraps it via the official
 standalone installer with ``UV_UNMANAGED_INSTALL`` / ``UV_INSTALL_DIR`` pointed
 at ``$HERMES_HOME/bin`` so the installer writes directly there — no PATH
@@ -24,6 +27,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -53,14 +57,17 @@ _REPAIR_LOCK_NAME = "runtime-repair.lock"
 def managed_uv_path() -> Path:
     """Return the path where Hermes keeps *its* uv binary.
 
-    ``$HERMES_HOME/bin/uv`` on POSIX, ``$HERMES_HOME\\bin\\uv.exe`` on
-    Windows.  The directory may not exist yet — callers should use
-    ``ensure_uv()`` to bootstrap it.
+    ``<install>/.hermes-runtime/uv/uv`` (``uv.exe`` on Windows) — the
+    install-scoped runtime dir (hermes-home lifetime split, phase 2.5).
+    Previously ``$HERMES_HOME/bin/uv``, which two installs sharing one
+    home would fight over. A binary left in that old location is ignored
+    rather than adopted — it is unverified. The directory may not exist
+    yet; callers should use ``ensure_uv()`` to bootstrap it.
     """
-    home = get_hermes_home()
-    if platform.system() == "Windows":
-        return home / "bin" / "uv.exe"
-    return home / "bin" / "uv"
+    from hermes_constants import get_runtime_dir
+
+    name = "uv.exe" if platform.system() == "Windows" else "uv"
+    return get_runtime_dir() / "uv" / name
 
 
 def resolve_uv() -> Optional[str]:
@@ -72,6 +79,24 @@ def resolve_uv() -> Optional[str]:
     if p.is_file() and os.access(p, os.X_OK):
         return str(p)
     return None
+
+
+def _record_uv_fact(binary: Path) -> None:
+    """Record uv in the install's runtimes.json facts. Best-effort: the
+    facts file improves doctor/uninstall fidelity but a recording failure
+    must never break a working uv."""
+    try:
+        from hermes_cli.runtime_registry import record_fact
+
+        version_out = subprocess.run(
+            [str(binary), "--version"],
+            capture_output=True, text=True, timeout=30, check=False,
+        ).stdout
+        m = re.search(r"\d+(?:\.\d+)+", version_out or "")
+        if m:
+            record_fact("uv", m.group(0), f"uv/{binary.name}")
+    except Exception as exc:
+        logger.debug("uv fact recording failed: %s", exc)
 
 
 def managed_python_install_dir(project_root: Path | None = None) -> Path:
@@ -205,6 +230,9 @@ def _ensure_uv_path(
     target = managed_uv_path()
     target.parent.mkdir(parents=True, exist_ok=True)
 
+    # No salvage: a uv left in the pre-split location by an older install
+    # is bytes nobody verified against the pin table, and adopting it
+    # would defeat pinning digests at all. Download the pinned artifact.
     print(f"  → Installing managed uv into {target.parent} ...")
 
     try:
@@ -276,6 +304,19 @@ def ensure_uv(
     return _UvResult(result)
 
 
+def _uv_self_update_stamp_path() -> Path:
+    """Freshness stamp for ``uv self update``.
+
+    Install-scoped: it describes THIS install's managed uv binary, so two
+    installs sharing a home must not share it (one's update would silence
+    the other's for a week). Lives in the runtime dir's cache beside the
+    binary it is about (hermes-home lifetime split, phase 5.13).
+    """
+    from hermes_cli.runtime_env import runtime_cache_dir
+
+    return runtime_cache_dir() / ".uv_self_update_stamp"
+
+
 def _uv_self_update_is_fresh(now: float | None = None) -> bool:
     """Return True when ``uv self update`` ran recently enough to skip.
 
@@ -287,7 +328,7 @@ def _uv_self_update_is_fresh(now: float | None = None) -> bool:
     try:
         from hermes_constants import get_hermes_home
 
-        stamp = get_hermes_home() / "cache" / ".uv_self_update_stamp"
+        stamp = _uv_self_update_stamp_path()
         age = (now if now is not None else time.time()) - stamp.stat().st_mtime
         return 0 <= age < UV_SELF_UPDATE_INTERVAL_SECONDS
     except Exception:
@@ -298,7 +339,7 @@ def _touch_uv_self_update_stamp() -> None:
     try:
         from hermes_constants import get_hermes_home
 
-        stamp = get_hermes_home() / "cache" / ".uv_self_update_stamp"
+        stamp = _uv_self_update_stamp_path()
         stamp.parent.mkdir(parents=True, exist_ok=True)
         stamp.touch()
     except OSError:

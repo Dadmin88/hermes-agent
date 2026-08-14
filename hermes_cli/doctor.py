@@ -206,6 +206,54 @@ def _safe_which(cmd: str) -> str | None:
         return None
 
 
+def _check_managed_runtimes() -> None:
+    """Report the managed runtime tools from the registry's facts file.
+
+    The provisioner is the only writer of those facts, so doctor reads
+    them rather than re-deriving existence by probing paths (hermes-home
+    lifetime split, phase 3.10). Tools the registry does not know about
+    are still reported from PATH so a system copy is visible.
+    """
+    try:
+        from hermes_cli.runtime_registry import load_facts, load_pins
+        from hermes_constants import get_runtime_dir
+
+        runtime_dir = get_runtime_dir()
+        pins = load_pins()
+        facts = load_facts(runtime_dir)
+    except Exception as exc:
+        check_warn("Managed runtimes unreadable", f"({exc})")
+        return
+
+    for tool, pin in pins.items():
+        fact = facts.get(tool)
+        if fact is None:
+            system = _safe_which("rg" if tool == "ripgrep" else tool)
+            if system:
+                check_ok(f"{tool} (system)", f"at {system}")
+            else:
+                check_warn(
+                    f"{tool} not provisioned",
+                    "(installed on the next 'hermes update')",
+                )
+            continue
+        if not (runtime_dir / fact.path).is_file():
+            check_warn(
+                f"{tool} recorded but missing",
+                "(runtime dir was modified; 'hermes update' reinstalls it)",
+            )
+            continue
+        # Pins are exact, so this is equality: anything else means the
+        # pin moved and this install has not caught up yet.
+        if fact.version != pin["version"]:
+            check_warn(
+                f"{tool} {fact.version} does not match the pin {pin['version']}",
+                "(reprovisioned on the next 'hermes update')",
+            )
+            continue
+        check_ok(f"{tool} {fact.version}", "(managed)")
+
+
 def _termux_browser_setup_steps(node_installed: bool) -> list[str]:
     steps: list[str] = []
     step = 1

@@ -1,0 +1,90 @@
+{
+  "$id": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/runtime-pins.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Hermes Tool Provisioning Manifest",
+  "description": "Exact, verifiable pins for every tool Hermes manages per-install. One source of truth read by hermes_cli/runtime_provisioner.py and desktop payload staging. Every tool pins an exact version plus, per target, an exact download URL and its sha256.",
+  "type": "object",
+  "required": ["schemaVersion", "tools"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional pointer to this schema file for editor validation."
+    },
+    "$comment": {
+      "type": "string",
+      "description": "Documentation for maintainers. Ignored."
+    },
+    "schemaVersion": {
+      "type": "integer",
+      "const": 2,
+      "description": "Bump when the manifest shape changes."
+    },
+    "tools": {
+      "type": "object",
+      "description": "Map of tool name -> a pinned version & per-target artifacts.",
+      "minProperties": 1,
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9-]*$"
+      },
+      "additionalProperties": { "$ref": "#/$defs/toolEntry" }
+    }
+  },
+  "$defs": {
+    "toolEntry": {
+      "type": "object",
+      "required": ["version", "files"],
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "type": "string",
+          "description": "Exact upstream version string (no ranges).",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+([.-][0-9A-Za-z.]+)?$"
+        },
+        "$comment": {
+          "type": "string",
+          "description": "Notes on why this tool/version/build variant was chosen."
+        },
+        "files": {
+          "type": "object",
+          "description": "Map of '<platform>-<arch>' targets to their pinned artifacts.",
+          "minProperties": 1,
+          "propertyNames": {
+            "$ref": "#/$defs/target"
+          },
+          "additionalProperties": { "$ref": "#/$defs/artifact" }
+        }
+      }
+    },
+    "target": {
+      "type": "string",
+      "description": "Target architecture for binaries",
+      "enum": [
+        "darwin-arm64",
+        "darwin-x64",
+        "linux-arm64",
+        "linux-x64",
+        "win32-arm64",
+        "win32-x64"
+      ]
+    },
+    "artifact": {
+      "type": "object",
+      "required": ["url", "sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "type": "string",
+          "description": "URL from where this artifact can be downloaded from.",
+          "format": "uri",
+          "pattern": "^https://"
+        },
+        "sha256": {
+          "type": "string",
+          "description": "Lowercase hex-encoded SHA-256 digest of the downloaded artifact, exactly 64 characters.",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    }
+  }
+}

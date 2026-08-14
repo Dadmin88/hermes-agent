@@ -262,6 +262,167 @@ export function stageCacheKey({ target, pythonVersion, requirementsText }) {
 }
 
 // ─── impure staging steps (they shell out, have no unit tests, and run in CI) ──────
+function loadPins() {
+  const pins = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "runtime-pins.json"), "utf8"))
+
+  return pins.tools
+}
+
+/**
+ * Managed runtime tools (node, uv, git, gh, ripgrep) for the payload.
+ *
+ * The payload IS a runtime dir, so this shells out to the SAME Python
+ * provisioner a source install and `hermes update` use. Everything about
+ * a tool — its exact version, its per-target download URL and sha256, how
+ * its archive unpacks — lives in runtime-pins.json and
+ * hermes_cli/runtime_provisioner.py. A second implementation here would
+ * be a second thing to keep correct, and the digest verification is not
+ * something to reimplement twice.
+ *
+ * Cross-building is normal here (a linux runner staging the macOS
+ * payload), so `--target` is passed explicitly rather than inferred, and
+ * the provisioner skips its run-the-binary check for a foreign target.
+ * `assertPayloadArch` below re-checks the arch from the file headers,
+ * which works regardless of what can execute.
+ */
+function stageManagedRuntimes(target, outDir, pythonExe) {
+  const targetKey = `${target.platform}-${target.arch}`
+
+  run(pythonExe, [
+    "-m",
+    "hermes_cli.runtime_provisioner",
+    "--runtime-dir",
+    outDir,
+    "--target",
+    targetKey,
+  ], { cwd: REPO_ROOT })
+
+  assertPayloadArch(target, outDir)
+}
+
+/**
+ * Confirm every staged tool binary is built for the target.
+ *
+ * Header inspection, not execution: the build host usually cannot run
+ * what it just staged, and emulation would make a wrong-arch binary look
+ * fine anyway.
+ */
+export function assertPayloadArch(target, outDir) {
+  const win = target.platform === "win32"
+  const binaries = {
+    node: win ? "node/node.exe" : "node/bin/node",
+    uv: win ? "uv/uv.exe" : "uv/uv",
+    git: win ? "git/cmd/git.exe" : "git/bin/git",
+    gh: win ? "gh/bin/gh.exe" : "gh/bin/gh",
+    ripgrep: win ? "ripgrep/rg.exe" : "ripgrep/rg",
+  }
+
+  for (const [tool, rel] of Object.entries(binaries)) {
+    const binary = path.join(outDir, rel)
+    if (!fs.existsSync(binary)) {
+      throw new Error(`${tool}: ${rel} missing from the staged payload`)
+    }
+
+    const arch = win
+      ? probePeArch(binary)
+      : (probeMachOArch(binary) ?? probeElfArch(binary))
+
+    if (arch !== "unknown" && arch !== target.arch) {
+      throw new Error(`${tool}: staged binary is ${arch}, expected ${target.arch}`)
+    }
+  }
+}
+
+function probePeArch(exePath) {
+  const fd = fs.openSync(exePath, "r")
+  try {
+    const head = Buffer.alloc(64)
+    fs.readSync(fd, head, 0, 64, 0)
+    if (head[0] !== 0x4d || head[1] !== 0x5a) return "unknown"
+    const peOffset = head.readUInt32LE(0x3c)
+    const peHead = Buffer.alloc(6)
+    const n = fs.readSync(fd, peHead, 0, 6, peOffset)
+    if (n < 6 || peHead.readUInt32LE(0) !== 0x00004550) return "unknown"
+    const machine = peHead.readUInt16LE(4)
+    return PE_MACHINES[machine] || "unknown"
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
+const PE_MACHINES = {
+  0x014c: "ia32",
+  0x01c0: "arm",
+  0x01c4: "arm",
+  0x8664: "x64",
+  0xaa64: "arm64",
+}
+
+// Mach-O cputype values (mach/machine.h). CPU_ARCH_ABI64 (0x01000000) is
+// OR'd into the 64-bit variants.
+const MACHO_CPU_TYPES = {
+  0x01000007: "x64", // CPU_TYPE_X86_64
+  0x0100000c: "arm64", // CPU_TYPE_ARM64
+  0x00000007: "ia32", // CPU_TYPE_X86
+  0x0000000c: "arm", // CPU_TYPE_ARM
+}
+
+/**
+ * Architecture of a Mach-O binary, or null when it is not Mach-O.
+ *
+ * Handles thin binaries (both endiannesses) and universal/fat archives.
+ * A fat binary reports "universal" rather than a single arch: shipping
+ * one is not wrong, it just is not a single-arch answer, and the caller
+ * decides whether that is acceptable.
+ */
+export function probeMachOArch(binaryPath) {
+  const fd = fs.openSync(binaryPath, "r")
+  try {
+    const head = Buffer.alloc(8)
+    if (fs.readSync(fd, head, 0, 8, 0) < 8) return null
+    const magic = head.readUInt32BE(0)
+
+    // Universal binary: 0xcafebabe (fat) / 0xcafebabf (fat64), big-endian.
+    if (magic === 0xcafebabe || magic === 0xcafebabf) return "universal"
+
+    // Thin: 0xfeedface/0xfeedfacf, either byte order.
+    const le = head.readUInt32LE(0)
+    if (le === 0xfeedface || le === 0xfeedfacf) {
+      return MACHO_CPU_TYPES[head.readUInt32LE(4) >>> 0] || "unknown"
+    }
+    if (magic === 0xfeedface || magic === 0xfeedfacf) {
+      return MACHO_CPU_TYPES[head.readUInt32BE(4) >>> 0] || "unknown"
+    }
+    return null
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
+// ELF e_machine values (elf.h).
+const ELF_MACHINES = {
+  0x03: "ia32", // EM_386
+  0x28: "arm", // EM_ARM
+  0x3e: "x64", // EM_X86_64
+  0xb7: "arm64", // EM_AARCH64
+}
+
+/** Architecture of an ELF binary, or null when it is not ELF. */
+export function probeElfArch(binaryPath) {
+  const fd = fs.openSync(binaryPath, "r")
+  try {
+    const head = Buffer.alloc(20)
+    if (fs.readSync(fd, head, 0, 20, 0) < 20) return null
+    if (head[0] !== 0x7f || head[1] !== 0x45 || head[2] !== 0x4c || head[3] !== 0x46) {
+      return null
+    }
+    // e_ident[EI_DATA]: 1 = little-endian, 2 = big-endian.
+    const machine = head[5] === 2 ? head.readUInt16BE(18) : head.readUInt16LE(18)
+    return ELF_MACHINES[machine] || "unknown"
+  } finally {
+    fs.closeSync(fd)
+  }
+}
 
 function run(cmd, args, opts = {}) {
   // stdio: inherit — subprocess output (pip's resolution errors, uv's
@@ -422,54 +583,32 @@ export function hostTarBin() {
 }
 
 function stageUvAndPython(target, outDir, { reusePython = false } = {}) {
-  const uvDir = path.join(outDir, "uv")
   const pythonDir = path.join(outDir, "python")
   // Wipe before staging (stageRepo does the same). A rerun after a failed
   // or wrong-arch attempt must not leave a stale interpreter beside the
-  // new one — the banner probe would find the old build first. The uv
-  // stage is a cheap copy and is never reused; the python install is the
-  // expensive half, and a cache-key match (main) skips its reinstall.
-  fs.rmSync(uvDir, { recursive: true, force: true })
-  fs.mkdirSync(uvDir, { recursive: true })
+  // new one — the banner probe would find the old build first. The
+  // python install is the expensive half, and a cache-key match (main)
+  // skips its reinstall.
   if (!reusePython) {
     fs.rmSync(pythonDir, { recursive: true, force: true })
     fs.mkdirSync(pythonDir, { recursive: true })
   }
-  // Native runner: the uv that runs this build IS the target-platform uv.
-  // HERMES_PAYLOAD_UV overrides this for unusual setups. The default is
-  // `uv` on PATH.
-  const uvName = target.platform === "win32" ? "uv.exe" : "uv"
-  const uvSource =
-    process.env.HERMES_PAYLOAD_UV ||
-    execSync(
-      target.platform === "win32" ? "where uv" : "command -v uv",
-      { encoding: "utf8" }
-    ).split(/\r?\n/)[0].trim()
-  const uvStaged = path.join(uvDir, uvName)
-  fs.copyFileSync(uvSource, uvStaged)
+
+  // The uv that INSTALLS the payload interpreter is a BUILD tool: it runs
+  // here, on the build host, so it comes from PATH (HERMES_PAYLOAD_UV
+  // overrides). The uv that SHIPS in the payload is a managed runtime
+  // built for the target — the provisioner stages that one from the pin
+  // table, and on a cross-build the two are not the same architecture.
+  const buildUv = process.env.HERMES_PAYLOAD_UV || "uv"
 
   const expect = bannerExpectations(target)
-
-  // The staged uv must be built FOR the target triple, not merely run on
-  // this host (emulation makes a wrong-arch binary run fine here).
-  // uv prints its build triple in --version from 0.12 on; an older uv
-  // prints only the version number, which is unverifiable — refuse it
-  // with a message that says so instead of claiming a wrong arch.
-  const uvBanner = probe(uvStaged, ["--version"])
-  if (/^uv \d[\d.]*\s*$/.test(uvBanner.trim())) {
-    throw new Error(
-      `uv: "${uvBanner.trim()}" prints no build triple, so its architecture ` +
-        `cannot be verified. Use uv 0.12 or newer.`
-    )
-  }
-  assertBanner("uv", uvBanner, expect.uv)
 
   // --no-bin: staging must not write launcher shims into the build
   // host's ~/.local/bin (it collided with a preexisting python3.11.exe
   // on the Windows test box). On reuse the install is already on disk;
   // the probes below still run against it.
   if (!reusePython) {
-    run("uv", ["python", "install", "--no-bin", "--install-dir", pythonDir, pythonRequest(target)])
+    run(buildUv, ["python", "install", "--no-bin", "--install-dir", pythonDir, pythonRequest(target)])
   }
 
   // uv leaves two things beside the versioned install that must not ship:
@@ -649,36 +788,6 @@ function writeBundlePth(outDir, pythonBinary) {
   )
 }
 
-function stageNode(target, outDir) {
-  const nodeDir = path.join(outDir, "node")
-  // Idempotent: a leftover tree from an interrupted run makes cpSync
-  // throw EEXIST on directory merges; start clean every time.
-  fs.rmSync(nodeDir, { recursive: true, force: true })
-  fs.mkdirSync(nodeDir, { recursive: true })
-  const src = process.env.HERMES_PAYLOAD_NODE_DIST
-  if (!src) {
-    throw new Error("HERMES_PAYLOAD_NODE_DIST must point at the extracted node dist for the target")
-  }
-  fs.cpSync(src, nodeDir, { recursive: true })
-
-  // The dist must be FOR the target. Running the staged node is not a
-  // valid probe here: a wrong-arch binary can still run through the
-  // build host's emulation. `node -p process.arch` names the arch the
-  // binary was BUILT for, so execute it only to read that value; when
-  // the binary cannot run at all, that is the same wrong-arch verdict.
-  const nodeBinary = target.platform === "win32" ? path.join(nodeDir, "node.exe") : path.join(nodeDir, "bin", "node")
-  let reportedArch = null
-  try {
-    reportedArch = probe(nodeBinary, ["-p", "process.arch"]).trim()
-  } catch {
-    // Unrunnable on this host — for example an arm64 dist on an x64
-    // builder with no emulation. That is not proof of a wrong payload,
-    // but it IS unverifiable; refuse rather than ship unchecked.
-    throw new Error(`node: staged binary at ${nodeBinary} did not run, so its architecture is unverified`)
-  }
-  assertBanner("node", reportedArch, bannerExpectations(target).node)
-}
-
 function main() {
   if (process.env.HERMES_DESKTOP_VARIANT !== "bundled") {
     // bootstrap and light artifacts carry no payload: write a stub
@@ -747,8 +856,10 @@ function main() {
   // exist so a failed staging run never leaves a .pth that points at
   // nothing.
   writeBundlePth(OUT_DIR, payloadPython)
-  console.log(`[stage-agent-payloads] staging: node (${target.key}, ${tag})`)
-  stageNode(target, OUT_DIR)
+  // node, uv, git, gh, ripgrep in one call, from the pinned URLs and
+  // digests, writing the runtimes.json the desktop reads at launch.
+  console.log(`[stage-agent-payloads] staging: managed runtimes (${target.key}, ${tag})`)
+  stageManagedRuntimes(target, OUT_DIR, payloadPython)
   console.log(`[stage-agent-payloads] sanitizing symlinks`)
   sanitizeSymlinks(OUT_DIR)
 
