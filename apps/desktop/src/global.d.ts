@@ -107,6 +107,7 @@ declare global {
         onShown: (callback: () => void) => () => void
       }
       getBootProgress: () => Promise<DesktopBootProgress>
+      getBackendAvailability: () => Promise<DesktopBackendAvailability[]>
       getConnectionConfig: (profile?: null | string) => Promise<DesktopConnectionConfig>
       saveConnectionConfig: (payload: DesktopConnectionConfigInput) => Promise<DesktopConnectionConfig>
       applyConnectionConfig: (payload: DesktopConnectionConfigInput) => Promise<DesktopConnectionConfig>
@@ -627,6 +628,17 @@ export interface DesktopActiveProfile {
   // that defers to the sticky active_profile / default).
   profile: string | null
 }
+
+/**
+ * Availability of one connection mode, from the electron backend registry
+ * (electron/backends). Mirrors ModeAvailability there: a missing mode is
+ * an artifact/machine capability fact with a reason — 'light-artifact'
+ * (this build ships no local runtime) or 'missing-ssh' (no ssh client
+ * found). Transient failures are connect-time errors, never encoded here.
+ */
+export type DesktopBackendAvailability =
+  | { mode: 'local' | 'remote' | 'cloud' | 'ssh'; available: true }
+  | { mode: 'local' | 'remote' | 'cloud' | 'ssh'; available: false; reason: 'light-artifact' | 'missing-ssh' }
 
 export interface DesktopConnectionConfig {
   envOverride: boolean

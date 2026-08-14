@@ -13,8 +13,14 @@ const bootstrapBackend = {
 
 function startupOptions(overrides: Record<string, unknown> = {}) {
   return {
+    bootProgress: vi.fn(async () => {}),
     connectRemote: vi.fn(async remote => ({ baseUrl: remote.baseUrl, mode: 'remote' as const })),
     ensureLocalRuntime: vi.fn(async backend => ({ ...backend, command: 'hermes' })),
+    localMode: {
+      availability: { mode: 'local' as const, available: true as const },
+      setupBackend: bootstrapBackend
+    },
+    log: vi.fn(),
     prepareLocalBackend: vi.fn(async () => bootstrapBackend),
     resolveRemote: vi.fn(async () => null),
     waitForDecision: vi.fn(async () => 'continue-local' as const),
@@ -107,4 +113,93 @@ test('reset rejects with a typed error and never enters either backend', async (
   await assert.rejects(pending, error => error instanceof FirstRunSetupResetError && error.firstRunSetupReset)
   assert.equal(options.connectRemote.mock.calls.length, 0)
   assert.equal(options.ensureLocalRuntime.mock.calls.length, 0)
+})
+
+// ── local mode unavailable (light artifacts) ────────────────────────
+
+const unavailableLocal = {
+  availability: { mode: 'local' as const, available: false as const, reason: 'light-artifact' as const },
+  setupBackend: bootstrapBackend
+}
+
+test('with local unavailable, a saved remote still wins immediately', async () => {
+  const savedRemote = { baseUrl: 'https://gateway.example.com/hermes' }
+  const options = startupOptions({
+    localMode: unavailableLocal,
+    resolveRemote: vi.fn(async () => savedRemote)
+  })
+
+  assert.deepEqual(await runPrimaryBackendStartup(options), {
+    kind: 'remote',
+    connection: { baseUrl: savedRemote.baseUrl, mode: 'remote' }
+  })
+  assert.equal(options.waitForDecision.mock.calls.length, 0)
+})
+
+test('with local unavailable, first-run goes straight to the decision — no local rungs', async () => {
+  const gate = createFirstRunSetupGate({ stuckAfterMs: 0 })
+  const savedRemote = { baseUrl: 'https://gateway.example.com/hermes' }
+  let configuredRemote: typeof savedRemote | null = null
+
+  const options = startupOptions({
+    localMode: unavailableLocal,
+    resolveRemote: vi.fn(async () => configuredRemote),
+    waitForDecision: gate.wait
+  })
+
+  const pending = runPrimaryBackendStartup(options)
+
+  await vi.waitFor(() => assert.equal(gate.hasWaiter(), true))
+  configuredRemote = savedRemote
+  assert.equal(gate.abandonForRemoteApply(), true)
+
+  assert.deepEqual(await pending, {
+    kind: 'remote',
+    connection: { baseUrl: savedRemote.baseUrl, mode: 'remote' }
+  })
+  assert.equal(options.waitForLocalStart.mock.calls.length, 0)
+  assert.equal(options.prepareLocalBackend.mock.calls.length, 0)
+  assert.equal(options.ensureLocalRuntime.mock.calls.length, 0)
+})
+
+test('with local unavailable, a continue-local decision is a wiring bug, not a fallback', async () => {
+  const gate = createFirstRunSetupGate({ stuckAfterMs: 0 })
+  const options = startupOptions({ localMode: unavailableLocal, waitForDecision: gate.wait })
+  const pending = runPrimaryBackendStartup(options)
+
+  await vi.waitFor(() => assert.equal(gate.hasWaiter(), true))
+  gate.continueLocal()
+
+  await assert.rejects(pending, /offers no local backend \(light-artifact\)/)
+  assert.equal(options.prepareLocalBackend.mock.calls.length, 0)
+  assert.equal(options.ensureLocalRuntime.mock.calls.length, 0)
+})
+
+test('with local unavailable, reset still rejects with the typed error', async () => {
+  const gate = createFirstRunSetupGate({ stuckAfterMs: 0 })
+  const options = startupOptions({ localMode: unavailableLocal, waitForDecision: gate.wait })
+  const pending = runPrimaryBackendStartup(options)
+
+  await vi.waitFor(() => assert.equal(gate.hasWaiter(), true))
+  gate.resetForRetry()
+
+  await assert.rejects(pending, error => error instanceof FirstRunSetupResetError && error.firstRunSetupReset)
+})
+
+test('an AVAILABLE localMode keeps the normal local path', async () => {
+  const gate = createFirstRunSetupGate({ stuckAfterMs: 0 })
+  const runtimeBackend = { ...bootstrapBackend, command: 'hermes' }
+
+  const options = startupOptions({
+    ensureLocalRuntime: vi.fn(async () => runtimeBackend),
+    localMode: { availability: { mode: 'local' as const, available: true as const }, setupBackend: bootstrapBackend },
+    waitForDecision: gate.wait
+  })
+
+  const pending = runPrimaryBackendStartup(options)
+
+  await vi.waitFor(() => assert.equal(gate.hasWaiter(), true))
+  gate.continueLocal()
+
+  assert.deepEqual(await pending, { kind: 'local', backend: runtimeBackend })
 })

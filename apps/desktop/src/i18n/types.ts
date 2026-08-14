@@ -610,6 +610,10 @@ export interface Translations {
       sshTitle: string
       sshDesc: string
       sshTrustHint: string
+      // Shown as the mode-card description when a mode is unavailable:
+      // light artifacts have no local backend; ssh needs a local client.
+      modeUnavailableLight: string
+      modeUnavailableSsh: string
       sshHostTitle: string
       sshHostDesc: string
       sshHostPick: string

@@ -931,6 +931,8 @@ export const zh: Translations = {
       sshDesc:
         'Hermes 会通过 SSH 在远程启动并以隧道连接到本应用——无需自行启动或暴露任何服务。前提：已具备到该主机的密钥 SSH 访问。',
       sshTrustHint: '首次提供的主机密钥会被信任并固定；后续变更将被拒绝。',
+      modeUnavailableLight: '此 Hermes 版本不含本地后端——请连接远程网关。',
+      modeUnavailableSsh: '本机未找到 ssh 客户端。',
       sshHostTitle: '主机',
       sshHostDesc: 'user@host，或 ~/.ssh/config 中的 Host 别名。',
       sshHostPick: '选择主机…',

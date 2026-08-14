@@ -47,6 +47,8 @@ import {
 } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
 import { shouldLatchBackendStartFailure, shouldLatchRemoteReauthFailure } from './backend-start-failure'
+import { modeAvailability, probeSshClient, resolveBackendAvailability } from './backends'
+import type { ConnectionMode, ModeAvailability } from './backends'
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
 import { runBootstrap } from './bootstrap-runner'
@@ -491,6 +493,23 @@ if (INSTALL_STAMP) {
   throw new Error(
     '[hermes] no baked install stamp in this bundle. First-launch bootstrap will not have a pinned ref to install.'
   )
+}
+
+// Which connection modes this artifact + machine offer, resolved once from
+// the backend registry (electron/backends). The artifact half is a baked
+// constant; the ssh half is probed at first use and cached — a client
+// appearing mid-session is not a case worth re-probing for.
+let _backendAvailabilityCache: ModeAvailability[] | null = null
+
+function desktopBackendAvailability(): ModeAvailability[] {
+  if (!_backendAvailabilityCache) {
+    _backendAvailabilityCache = resolveBackendAvailability({
+      artifactKind: INSTALL_STAMP?.payload ?? 'bootstrap',
+      sshClientFound: probeSshClient()
+    })
+  }
+
+  return _backendAvailabilityCache
 }
 
 // HERMES_HOME — the user-facing root for everything Hermes-related. Mirrors
@@ -8595,6 +8614,19 @@ async function spawnPoolBackend(profile, entry) {
 
   const token = crypto.randomBytes(32).toString('base64url')
 
+  // No remote override for this profile → the local spawn path. On an
+  // artifact without a local mode (light), that path does not exist: fail
+  // with the availability reason instead of resolving a runtime this
+  // build does not ship. Mirrors the primary startup's registry gate.
+  const poolLocalAvailability: ModeAvailability = modeAvailability(desktopBackendAvailability(), 'local')
+
+  if (poolLocalAvailability.available === false) {
+    throw new Error(
+      `Profile "${profile}" has no remote connection configured, and this Hermes build has no local backend ` +
+        `(${poolLocalAvailability.reason}). Point the profile at a remote gateway in Settings.`
+    )
+  }
+
   // Same update mutual exclusion as the primary window's waitForLocalStart
   // (#73822): pool backends spawn from the same venv, so an ungated respawn
   // during applyUpdates' critical section re-locks the venv and trips the
@@ -8882,13 +8914,17 @@ async function startHermes() {
     }
 
     const setup = await runPrimaryBackendStartup({
+      bootProgress: advanceBootProgress,
       connectRemote,
       ensureLocalRuntime: ensureRuntime,
-      prepareLocalBackend: async () => {
-        await advanceBootProgress('backend.runtime', 'Resolving Hermes runtime', 28)
-
-        return resolveHermesBackend(backendArgs)
+      localMode: {
+        availability: modeAvailability(desktopBackendAvailability(), 'local'),
+        // The synthetic descriptor that arms the remote-only setup surface
+        // when this artifact offers no local backend.
+        setupBackend: { activeRoot: ACTIVE_HERMES_ROOT, kind: 'bootstrap-needed', platform: process.platform }
       },
+      log: rememberLog,
+      prepareLocalBackend: () => resolveHermesBackend(backendArgs),
       resolveRemote: () => {
         // Classify immediately before each throwing resolve. This callback runs
         // both for an already-saved remote and after first-run remote Apply.
@@ -10655,6 +10691,15 @@ ipcMain.handle('hermes:bootstrap:repair', async () => {
   return { ok: true }
 })
 ipcMain.handle('hermes:bootstrap:continue-local', async () => {
+  // A stale/legacy renderer can still send this on an artifact with no
+  // local mode; refuse here so the setup gate never resolves a decision
+  // the light startup path treats as a wiring bug.
+  const localAvailability: ModeAvailability = modeAvailability(desktopBackendAvailability(), 'local')
+
+  if (localAvailability.available === false) {
+    throw new Error('This Hermes build has no local backend. Connect to a remote gateway instead.')
+  }
+
   rememberLog('[bootstrap] local install selected by renderer; continuing first-launch bootstrap')
   continueFirstRunLocalBootstrap()
 
@@ -10681,6 +10726,10 @@ ipcMain.handle('hermes:bootstrap:get', async () => getBootstrapState())
 ipcMain.handle('hermes:connection-config:get', async (_event, profile) =>
   sanitizeDesktopConnectionConfig(readDesktopConnectionConfig(), profile)
 )
+// Which connection modes this artifact + machine offer, with reasons for
+// the missing ones. The renderer renders unavailable modes disabled (or
+// hidden) from this one answer instead of keeping its own artifact logic.
+ipcMain.handle('hermes:backends:availability', async () => desktopBackendAvailability())
 ipcMain.handle('hermes:ssh-config:hosts', async () => ({ hosts: collectSshConfigHosts() }))
 ipcMain.handle('hermes:ssh-config:resolve', async (_event, host) => {
   const value = String(host || '').trim()
@@ -10834,14 +10883,38 @@ ipcMain.handle('hermes:cloud:agent-sign-in', async (_event, dashboardUrl) => {
   // saves a cloud-mode connection pointed at this dashboardUrl.
   return cloudAgentSilentSignIn(dashboardUrl)
 })
+
+// Refuse persisting a connection mode this artifact/machine does not offer.
+// The renderer hides unavailable mode cards, but hiding is not a boundary —
+// the IPC surface must hold the invariant on its own (a stale renderer, a
+// hand-edited payload). Same rule as the update path: guard apply, not
+// just check.
+function assertConnectionModeAvailable(config: { mode: string }, profileKey: string | null): void {
+  // Per-profile scope: a local entry means "inherit the default", which is
+  // resolved at connect time against the GLOBAL mode — only the global
+  // block actually selects a backend kind.
+  const mode = profileKey ? null : (config.mode as ConnectionMode)
+  const availability: ModeAvailability | null = mode ? modeAvailability(desktopBackendAvailability(), mode) : null
+
+  if (availability && availability.available === false) {
+    throw new Error(
+      availability.reason === 'light-artifact'
+        ? 'This Hermes build has no local backend. Connect to a remote gateway instead.'
+        : `The '${mode}' connection mode is unavailable: ${availability.reason}`
+    )
+  }
+}
+
 ipcMain.handle('hermes:connection-config:save', async (_event, payload) => {
   const config = coerceDesktopConnectionConfig(payload)
+  assertConnectionModeAvailable(config, connectionScopeKey(payload?.profile))
   writeDesktopConnectionConfig(config)
 
   return sanitizeDesktopConnectionConfig(config, payload?.profile)
 })
 ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
   const config = coerceDesktopConnectionConfig(payload)
+  assertConnectionModeAvailable(config, connectionScopeKey(payload?.profile))
   writeDesktopConnectionConfig(config)
 
   const key = connectionScopeKey(payload?.profile)

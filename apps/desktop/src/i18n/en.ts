@@ -726,6 +726,8 @@ export const en: Translations = {
       sshDesc:
         'Hermes is launched on the remote over SSH and tunneled to this app — nothing to start or expose yourself. Requires working key-based SSH access to the host.',
       sshTrustHint: 'The first presented host key is trusted and pinned; later changes fail closed.',
+      modeUnavailableLight: 'This Hermes build has no local backend — connect to a remote gateway instead.',
+      modeUnavailableSsh: 'No ssh client was found on this machine.',
       sshHostTitle: 'Host',
       sshHostDesc: 'user@host, or a Host alias from ~/.ssh/config.',
       sshHostPick: 'Select a host…',
