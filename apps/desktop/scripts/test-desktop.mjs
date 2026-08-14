@@ -3,7 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { listPackage } from '@electron/asar'
+import { extractFile, listPackage } from '@electron/asar'
 
 import PACKAGE_JSON from '../package.json' with { type: 'json' }
 
@@ -14,7 +14,7 @@ const RELEASE_ROOT = path.join(DESKTOP_ROOT, 'release')
 const PLATFORM = process.platform
 
 // Platform-specific packaged-app layout. The thin installer ships an Electron
-// app shell plus extraResources (install-stamp.json + native-deps/) -- it
+// app shell plus extraResources (native-deps/) -- it
 // no longer bundles the Hermes Agent Python payload (that's fetched at first
 // launch via install.ps1 / install.sh, per the Phase 1 thin-installer flow).
 const APP = (() => {
@@ -284,7 +284,8 @@ function launchFresh() {
 // Validate the packaged bundle matches the thin-installer architecture:
 //   - The Hermes Agent Python payload is NOT shipped (it's fetched at first
 //     launch via install.ps1's stage protocol).
-//   - install-stamp.json IS shipped in resources/ with a valid commit + branch.
+//   - The install stamp is baked into the main bundle; this build's
+//     build/install-stamp.json carries a valid commit + branch.
 //   - node-pty IS shipped inside app.asar.unpacked/dist/node_modules/node-pty
 //     with package.json + lib/ + at least one .node binary (the renderer's
 //     integrated terminal needs this; see Phase 1F.6).
@@ -305,22 +306,32 @@ function validateBundle() {
     )
   }
 
-  // Positive assertion: install-stamp.json carries a sane commit + branch
-  const stampPath = path.join(APP.resourcesPath, 'install-stamp.json')
-  if (!exists(stampPath)) {
-    die(`Missing install-stamp.json (required for first-launch bootstrap pinning): ${stampPath}`)
+  // Positive assertion: the install stamp is baked INTO the shipped main
+  // bundle (bundle-electron-main.mjs defines it as a literal — there is no
+  // loose resources copy). Read the bundle the package actually ships and
+  // parse the stamp out of it, so this validates the artifact, not the
+  // build tree.
+  const bundledMainRelative = path.join('dist', 'electron-main.mjs')
+  const unpackedMain = path.join(path.dirname(APP.asarPath), 'app.asar.unpacked', bundledMainRelative)
+  let bundledMain
+  if (exists(unpackedMain)) {
+    bundledMain = fs.readFileSync(unpackedMain, 'utf8')
+  } else if (exists(APP.asarPath)) {
+    bundledMain = extractFile(APP.asarPath, bundledMainRelative).toString('utf8')
+  } else {
+    die(`Missing bundled electron main: neither ${unpackedMain} nor ${APP.asarPath} exists`)
   }
-  let stamp
-  try {
-    stamp = JSON.parse(fs.readFileSync(stampPath, 'utf8'))
-  } catch (err) {
-    die(`install-stamp.json is not valid JSON: ${err.message}`)
+  // esbuild's define inlines the stamp as a real object literal with
+  // UNQUOTED keys (schemaVersion: 2, commit: "..."), so match that shape.
+  const stampMatch = bundledMain.match(/schemaVersion:\s*\d+[\s\S]{0,500}?commit:\s*"([0-9a-f]{40})"/)
+  if (!stampMatch) {
+    die('The shipped electron-main.mjs carries no baked install stamp (schemaVersion/commit literal missing)')
   }
-  if (!stamp.commit || typeof stamp.commit !== 'string' || stamp.commit.length < 7) {
-    die(`install-stamp.json is missing a usable commit field: ${JSON.stringify(stamp)}`)
-  }
-  if (!stamp.branch || typeof stamp.branch !== 'string') {
-    die(`install-stamp.json is missing the branch field: ${JSON.stringify(stamp)}`)
+  const stamp = { commit: stampMatch[1] }
+  const branchMatch = bundledMain.match(/\bbranch:\s*"([^"]+)"/)
+  stamp.branch = branchMatch ? branchMatch[1] : null
+  if (!stamp.branch) {
+    die('The baked install stamp is missing the branch field')
   }
 
   // Positive assertion: node-pty native deps shipped

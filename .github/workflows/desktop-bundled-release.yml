@@ -3,13 +3,13 @@ name: Desktop Bundled Release
 # This workflow builds the fully self-contained desktop installers for each
 # (os, arch) target. The agent payloads are baked in: the repo snapshot at
 # the release tag (with the prebuilt TUI/dashboard JS), uv plus CPython, a
-# ready site-packages tree, and node. The design is in
-# .hermes/plans/2026-08-07_resources-resident-bundled-runtime.md: the app
-# runs the backend directly out of its own resources; nothing installs on
-# the user machine.
+# ready site-packages tree, and node.
+# The app runs the backend directly out of its own resources.
+# nothing installs on the user machine.
 #
-# Payload staging stays dormant unless a build sets HERMES_DESKTOP_BUNDLED=1.
-# This workflow is the only place that sets it.
+# Payload staging stays dormant unless a build sets
+# HERMES_DESKTOP_VARIANT=bundled. This workflow is the only place that
+# sets it.
 #
 # Triggers:
 #   * A push of a final release tag (vX.Y.Z). This is the normal release path.
@@ -86,7 +86,7 @@ jobs:
             runner: windows-11-arm
     env:
       # This is the one switch that turns on the whole bundled stack.
-      HERMES_DESKTOP_BUNDLED: '1'
+      HERMES_DESKTOP_VARIANT: 'bundled'
       HERMES_PAYLOAD_TAG: ${{ github.event.inputs.tag || github.ref_name }}
       HERMES_PAYLOAD_PYTHON: '3.11'
     steps:
@@ -109,6 +109,9 @@ jobs:
       # ── Node ──────────────────────────────────────────────────────────
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
+          # The build script embeds the EXACT host node version into the
+          # payload. 26 matches NODE_VERSION in scripts/install.sh, so an
+          # embedded install and a source install run the same node major.
           node-version: 26
           cache: npm
 
@@ -182,11 +185,12 @@ jobs:
           allow-no-subscriptions: true
 
       # ── Build + package through the shared script ──────────────────────
-      # scripts/build-bundled-desktop.mjs owns the whole sequence: the JS
-      # surface builds, the payload node dist, the bundled desktop build,
-      # and electron-builder. Run the same script locally to reproduce a
-      # CI build. The workflow adds only caching, signing, and upload.
-      # npm ci already ran above, so pass --no-install.
+      # scripts/build-bundled-desktop.mjs owns the whole sequence: the root
+      # npm ci, the JS surface builds, the payload node dist, the bundled
+      # desktop build, and electron-builder. Run the same script locally to
+      # reproduce a CI build. The workflow adds only caching, signing, and
+      # upload. (The npm ci above only warms the cache for the retry
+      # wrapper; the script's own npm ci is the one that counts.)
       - name: Build and package
         shell: bash
         env:
@@ -222,7 +226,7 @@ jobs:
               "-c.win.sign.publisherName=$AZURE_SIGN_PUBLISHER"
             )
           fi
-          node scripts/build-bundled-desktop.mjs --tag="$HERMES_BUNDLE_TAG" --no-install -- "${SIGN_ARGS[@]}"
+          node scripts/build-bundled-desktop.mjs --tag="$HERMES_BUNDLE_TAG" -- "${SIGN_ARGS[@]}"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

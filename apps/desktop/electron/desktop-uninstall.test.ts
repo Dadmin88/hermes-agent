@@ -36,14 +36,17 @@ test('uninstallArgsForMode throws on an unknown mode (no silent full wipe)', () 
 
 // --- resolveInstallKind / allowedUninstallModes / nativeRemovalInstructions ---
 
-test('resolveInstallKind reads the stamp: distribution nix wins, payload means bundled', () => {
+test('resolveInstallKind reads the stamp: distribution nix wins, payload kind means bundled', () => {
   assert.equal(resolveInstallKind({ distribution: 'nix' }), 'nix')
   assert.equal(resolveInstallKind({ source: 'nix' }), 'nix')
   // distribution beats payload: a nix stamp never becomes 'bundled'.
-  assert.equal(resolveInstallKind({ distribution: 'nix', payload: true }), 'nix')
-  assert.equal(resolveInstallKind({ distribution: 'desktop-app', payload: true }), 'bundled')
-  assert.equal(resolveInstallKind({ payload: true }), 'bundled')
-  // No stamp facts at all → the classic source/installer flow.
+  assert.equal(resolveInstallKind({ distribution: 'nix', payload: 'bundled' }), 'nix')
+  assert.equal(resolveInstallKind({ distribution: 'desktop-app', payload: 'bundled' }), 'bundled')
+  assert.equal(resolveInstallKind({ payload: 'bundled' }), 'bundled')
+  // light artifacts have no agent code either — same managed flow.
+  assert.equal(resolveInstallKind({ payload: 'light' }), 'bundled')
+  // bootstrap / no stamp facts at all → the classic source/installer flow.
+  assert.equal(resolveInstallKind({ payload: 'bootstrap' }), 'standard')
   assert.equal(resolveInstallKind({}), 'standard')
   assert.equal(resolveInstallKind(), 'standard')
 })

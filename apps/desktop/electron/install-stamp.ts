@@ -40,11 +40,7 @@ export interface InstallStamp {
   tag: string | null
 }
 
-// The define names the stamp object when the bundler bakes one. Dev
-// bundles never define the binding at all, so the type is plainly
-// InstallStamp; the typeof guard below is the runtime existence check
-// for the missing-binding case, which no type annotation can express.
-declare const __HERMES_INSTALL_STAMP__: InstallStamp
+declare const __HERMES_INSTALL_STAMP__: InstallStamp | undefined
 
 /** The baked stamp of this artifact, or null on dev bundles. */
 export const INSTALL_STAMP: Readonly<InstallStamp> | null =

@@ -19,18 +19,22 @@
  *
  * 1. the Electron dependency is an *exact* version (Electron Builder needs the
  *    installed binary to match ``electronVersion`` / ``electronDist``), and
- * 2. the dependency, ``build.electronVersion``, and the resolved lockfile entry
+ * 2. the dependency, the builder config's ``electronVersion``
+ *    (electron-builder.config.cjs — the whole builder config lives there,
+ *    package.json has no "build" field), and the resolved lockfile entry
  *    all agree — so ``npm ci`` installs exactly what the build packages.
  */
 
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import { createRequire } from 'node:module'
 import path from 'node:path'
 
 import { test } from 'vitest'
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..', '..')
 const DESKTOP_PKG = path.join(REPO_ROOT, 'apps', 'desktop', 'package.json')
+const BUILDER_CONFIG = path.join(REPO_ROOT, 'apps', 'desktop', 'electron-builder.config.cjs')
 const ROOT_LOCK = path.join(REPO_ROOT, 'package-lock.json')
 
 // An exact semver: digits.digits.digits with an optional prerelease/build tag,
@@ -67,16 +71,18 @@ test('electron dependency is exactly pinned', () => {
   )
 })
 
-test('electron dependency matches build.electronVersion', () => {
+test('electron dependency matches the builder config electronVersion', () => {
   const pkg = desktopPkg()
   const spec = electronSpec(pkg)
-  const build = (pkg.build ?? {}) as Record<string, unknown>
-  const builderVersion = build.electronVersion as string | undefined
-  assert.ok(builderVersion, 'build.electronVersion is missing')
+  // Load the real config module — the one --config hands to electron-builder.
+  const require = createRequire(__filename)
+  const config = require(BUILDER_CONFIG) as Record<string, unknown>
+  const builderVersion = config.electronVersion as string | undefined
+  assert.ok(builderVersion, 'electronVersion is missing from electron-builder.config.cjs')
   assert.equal(
     spec,
     builderVersion,
-    `electron dependency ("${spec}") must equal build.electronVersion ` +
+    `electron dependency ("${spec}") must equal the builder config's electronVersion ` +
       `("${builderVersion}"); otherwise electron-builder packages a different ` +
       'version than npm installs into electronDist.'
   )

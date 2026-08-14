@@ -146,6 +146,7 @@ import {
 } from './hardening'
 import { cursorPointInWindow } from './hud-cursor'
 import { buildHudWindowUrl } from './hud-url'
+import { INSTALL_STAMP } from './install-stamp'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
 import {
@@ -469,94 +470,20 @@ app.commandLine.appendSwitch('disable-renderer-backgrounding')
 const SOURCE_REPO_ROOT = path.resolve(APP_ROOT, '../..')
 
 // Build-time install stamp -- the git ref this .exe was built against.
-//
-// Written by scripts/write_install_stamp.py during `npm run build`
-// and bundled into packaged apps via electron-builder's extraResources entry,
-// so the runtime stamp ends up at process.resourcesPath/install-stamp.json
-// after install. The bootstrap runner (Phase 1D) reads it to know which
-// commit to clone when running install.ps1 stages at first launch.
-//
-// Returns null when the file is missing (dev runs from a checkout where
-// build hasn't been invoked, or schema mismatch). Callers must handle null.
-//
-// Schema:
-//   schema 1: { commit, branch, builtAt, dirty, source }
-//   schema 2 adds immutable-package provenance: baseVersion, displayVersion,
-//   distance, and distribution.
-const INSTALL_STAMP_SCHEMA_VERSION = 2
-
-function loadInstallStamp() {
-  // Try packaged location first (resources/install-stamp.json), then the
-  // dev/local build output (apps/desktop/build/install-stamp.json) so
-  // someone running `npm run start` after a local `npm run build` also
-  // sees a stamp without needing a packaged build.
-  const candidates = [
-    process.resourcesPath ? path.join(process.resourcesPath, 'install-stamp.json') : null,
-    path.join(APP_ROOT, 'build', 'install-stamp.json')
-  ].filter(Boolean)
-
-  for (const p of candidates) {
-    try {
-      const raw = fs.readFileSync(p, 'utf8')
-
-    try {
-      const parsed = JSON.parse(raw)
-
-      // A stamp without a usable commit is still a stamp: a dirty Nix build
-      // writes commit:null but the provenance fields (distribution, source)
-      // must survive — the uninstall flow branches on them. Consumers that
-      // need a pin (bootstrap) already handle a missing/invalid commit.
-      if (parsed && typeof parsed === 'object' && (typeof parsed.commit === 'string' ? parsed.commit.length >= 7 : parsed.commit == null)) {
-        if (parsed.schemaVersion !== 1 && parsed.schemaVersion !== INSTALL_STAMP_SCHEMA_VERSION) {
-          console.warn(
-            `[hermes] install-stamp.json schemaVersion ${parsed.schemaVersion} != expected ${INSTALL_STAMP_SCHEMA_VERSION}; ignoring`
-          )
-
-          continue
-        }
-
-        return Object.freeze({
-          schemaVersion: parsed.schemaVersion,
-          commit: typeof parsed.commit === 'string' ? parsed.commit : null,
-          branch: parsed.branch || null,
-          baseVersion: typeof parsed.baseVersion === 'string' ? parsed.baseVersion : null,
-          displayVersion: typeof parsed.displayVersion === 'string' ? parsed.displayVersion : null,
-          distance: typeof parsed.distance === 'number' && parsed.distance >= 0 ? parsed.distance : null,
-          distribution: typeof parsed.distribution === 'string' ? parsed.distribution : null,
-          builtAt: parsed.builtAt || null,
-          dirty: Boolean(parsed.dirty),
-          source: parsed.source || null,
-          // Bundled desktop builds: payload marks the artifact as carrying
-          // offline agent payloads, tag pins the release they came from.
-          // bundled-runtime.ts and the app updater key on these two.
-          payload: parsed.payload === true,
-          tag: typeof parsed.tag === 'string' && parsed.tag ? parsed.tag : null,
-          path: p
-        })
-      }
-    } catch (e) {
-      console.warn(`[hermes] install-stamp.json found at ${p} , but parsing failed with ${e}`)
-      // Either ENOENT or malformed JSON; try the next candidate
-    }
-  } catch(e) {
-    // no install stamp file at this path
-  }
-}
-
-  return null
-}
-
-const INSTALL_STAMP = loadInstallStamp()
+// Baked into the production bundle as an object literal by
+// bundle-electron-main.mjs; null on dev bundles (nothing baked).
+// Shape + trust model: install-stamp.ts.
 
 if (INSTALL_STAMP) {
   console.log(
     `[hermes] install stamp: ${INSTALL_STAMP.commit ? INSTALL_STAMP.commit.slice(0, 12) : 'no-commit'}${INSTALL_STAMP.branch ? ` (${INSTALL_STAMP.branch})` : ''}${INSTALL_STAMP.dirty ? ' [DIRTY]' : ''} from ${INSTALL_STAMP.source || 'unknown'}`
   )
 } else if (IS_PACKAGED) {
-  // Dev builds without a stamp are normal; packaged builds without one
-  // mean the bootstrap won't know what to clone. Surface clearly.
-  console.error(
-    '[hermes] WARNING: no install-stamp.json found in packaged build. First-launch bootstrap will not have a pinned ref to install.'
+  // Dev builds without a stamp are normal; a production bundle without one
+  // means the bake step was skipped (`electron .` against a --dev bundle,
+  // or a broken build).
+  throw new Error(
+    '[hermes] no baked install stamp in this bundle. First-launch bootstrap will not have a pinned ref to install.'
   )
 }
 
@@ -3957,10 +3884,8 @@ function embeddedPayload() {
  * whole app with a source-built external one.
  */
 function bundledUpdaterActive(): boolean {
-  const stamp = INSTALL_STAMP as any
-
   return shouldUseAppUpdater({
-    stampHasPayload: Boolean(stamp && stamp.payload),
+    stampPayload: INSTALL_STAMP?.payload ?? 'bootstrap',
     isPackaged: app.isPackaged
   })
 }
@@ -12432,11 +12357,16 @@ ipcMain.handle('hermes:version', () => ({
   nodeVersion: process.versions.node,
   platform: process.platform,
   hermesRoot: resolveUpdateRoot(),
-  // The two install axes (About renders them as Artifact / Runtime):
-  // what this build carries, and which tree the backend runs from.
-  artifact: INSTALL_STAMP?.payload === true ? 'embedded' : 'external',
-  payloadTag: INSTALL_STAMP?.payload === true ? (INSTALL_STAMP.tag ?? null) : null,
-  runtime: activeBackendInfo
+  // The install axis (About renders it as Artifact / Runtime): what this
+  // build carries, and where the backend runs from. Bundled artifacts
+  // always run their payload; light artifacts have no runtime at all and
+  // only connect to remote backends; bootstrap builds report the resolved
+  // runtime source only after the backend has been spawned.
+  hermesRuntime: INSTALL_STAMP?.payload === 'light'
+    ? { type: 'light' }
+    : INSTALL_STAMP?.payload === 'bundled'
+      ? { type: 'embedded' }
+      : { type: 'external', source: activeBackendInfo?.source ?? undefined }
 }))
 
 // ===========================================================================
@@ -12471,7 +12401,7 @@ function desktopInstallKind() {
   return resolveInstallKind({
     distribution: INSTALL_STAMP?.distribution ?? null,
     source: INSTALL_STAMP?.source ?? null,
-    payload: INSTALL_STAMP?.payload === true
+    payload: INSTALL_STAMP?.payload ?? 'bootstrap'
   })
 }
 

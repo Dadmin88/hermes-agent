@@ -174,16 +174,28 @@ def build_stamp(
     elif dirty and distance is None:
         display_version = f"{display_version}+?"
 
-    # Bundled desktop payloads. The desktop-bundled-release workflow sets
-    # HERMES_DESKTOP_BUNDLED=1 and pins the release tag. A bundled build
-    # without a tag is a hard error: electron-updater and the offline
-    # re-materialization both key on the tag, so a tagless bundled artifact
-    # cannot update itself.
-    payload = os.environ.get("HERMES_DESKTOP_BUNDLED") == "1"
-    tag = os.environ.get("HERMES_PAYLOAD_TAG") or None
-    if payload and not (tag and re.match(r"^v(0|[1-9]\d{0,2})\.\d+\.\d+$", tag)):
+    # The desktop artifact kind, from the one build-time selector
+    # HERMES_DESKTOP_VARIANT. Every stamp carries it:
+    #   bootstrap — no runtime in the artifact; first launch bootstraps a
+    #               local install. The default (variable unset/empty; also
+    #               the value for non-desktop stamps, where it is inert).
+    #   bundled   — the agent runtime ships inside the artifact resources.
+    #   light     — NO runtime at all, remote connections only. A Python
+    #               process must never read a light stamp: the artifact
+    #               contains no Python (version_info raises on it).
+    # bundled and light both pin a release tag: electron-updater keys on
+    # it, so a tagless artifact of either kind cannot update itself.
+    variant = os.environ.get("HERMES_DESKTOP_VARIANT", "").strip()
+    if variant not in ("", "bootstrap", "bundled", "light"):
         raise SystemExit(
-            "write_install_stamp: HERMES_DESKTOP_BUNDLED=1 requires "
+            f"write_install_stamp: unknown HERMES_DESKTOP_VARIANT {variant!r} "
+            "(expected unset, 'bootstrap', 'bundled', or 'light')"
+        )
+    payload = variant or "bootstrap"
+    tag = os.environ.get("HERMES_PAYLOAD_TAG") or None
+    if payload != "bootstrap" and not (tag and re.match(r"^v(0|[1-9]\d{0,2})\.\d+\.\d+$", tag)):
+        raise SystemExit(
+            f"write_install_stamp: HERMES_DESKTOP_VARIANT={payload} requires "
             f"HERMES_PAYLOAD_TAG=vX.Y.Z (got {tag!r})"
         )
 
@@ -200,7 +212,7 @@ def build_stamp(
         "displayVersion": display_version,
         "distance": distance,
         "payload": payload,
-        "tag": tag if payload else None,
+        "tag": tag if payload != "bootstrap" else None,
     }
 
 

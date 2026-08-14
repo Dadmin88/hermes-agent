@@ -28,6 +28,8 @@
 
 import path from 'node:path'
 
+import type { ArtifactKind } from './install-stamp'
+
 const UNINSTALL_MODES = ['gui', 'lite', 'full', 'data']
 
 // How this desktop app got onto the machine, read from the install stamp
@@ -52,13 +54,16 @@ const INSTALL_KINDS = ['nix', 'bundled', 'standard']
  * Classify the install from the stamp. Pure so it can be unit-tested:
  * callers pass the stamp fields (`distribution`, `source`, `payload`).
  * `distribution` is authoritative; `source` is the schema-1 fallback.
+ * The 'bundled' and 'light' artifact kinds both classify as the managed
+ * 'bundled' flow — neither has agent code the app may remove, and the OS
+ * owns app removal.
  */
-function resolveInstallKind({ distribution, source, payload = false }: {distribution?: string, source?: string, payload?: boolean} = {}) {
+function resolveInstallKind({ distribution, source, payload = 'bootstrap' }: {distribution?: string | null, source?: string | null, payload?: ArtifactKind} = {}) {
   if (distribution === 'nix' || source === 'nix') {
     return 'nix'
   }
 
-  if (payload === true) {
+  if (payload === 'bundled' || payload === 'light') {
     return 'bundled'
   }
 

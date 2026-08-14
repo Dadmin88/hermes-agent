@@ -7,15 +7,20 @@ import { describeFeedCheck, shouldUseAppUpdater } from './app-updater'
 // ── shouldUseAppUpdater ─────────────────────────────────────────────
 
 test('app updater runs for packaged embedded builds', () => {
-  assert.equal(shouldUseAppUpdater({ stampHasPayload: true, isPackaged: true }), true)
+  assert.equal(shouldUseAppUpdater({ stampPayload: 'bundled', isPackaged: true }), true)
 })
 
-test('an external build never uses the app updater', () => {
-  assert.equal(shouldUseAppUpdater({ stampHasPayload: false, isPackaged: true }), false)
+test('app updater runs for packaged light builds', () => {
+  assert.equal(shouldUseAppUpdater({ stampPayload: 'light', isPackaged: true }), true)
+})
+
+test('a bootstrap build never uses the app updater', () => {
+  assert.equal(shouldUseAppUpdater({ stampPayload: 'bootstrap', isPackaged: true }), false)
 })
 
 test('dev runs never use the app updater', () => {
-  assert.equal(shouldUseAppUpdater({ stampHasPayload: true, isPackaged: false }), false)
+  assert.equal(shouldUseAppUpdater({ stampPayload: 'bundled', isPackaged: false }), false)
+  assert.equal(shouldUseAppUpdater({ stampPayload: 'light', isPackaged: false }), false)
 })
 
 // ── describeFeedCheck ───────────────────────────────────────────────

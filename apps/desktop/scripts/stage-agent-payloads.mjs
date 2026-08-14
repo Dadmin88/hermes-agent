@@ -20,11 +20,11 @@
  *                          from here; nothing materializes at first launch.
  *   node/                  official node dist for this platform/arch
  *
- * Gating: the script does nothing unless HERMES_DESKTOP_BUNDLED=1. That
- * variable is an internal build-time env for CI wiring, not user config.
- * Thus dev builds and current CI keep producing external builds. There is
- * no per-item skip: an embedded payload is complete, or this script throws
- * and the build fails.
+ * Gating: the script does nothing unless HERMES_DESKTOP_VARIANT=bundled.
+ * That variable is an internal build-time env for CI wiring, not user
+ * config. Thus dev builds and current CI keep producing external builds.
+ * There is no per-item skip: an embedded payload is complete, or this
+ * script throws and the build fails.
  *
  * The heavy work shells out to git, uv, and tar. The decision logic
  * (target resolution, pip arg construction, manifest shape) is exported as
@@ -271,7 +271,9 @@ function stageRepo(tag, outDir) {
   const repoDir = path.join(outDir, "repo")
   fs.rmSync(repoDir, { recursive: true, force: true })
   fs.mkdirSync(repoDir, { recursive: true })
-  const commit = execSync(`git rev-parse ${tag}^{commit}`, { cwd: REPO_ROOT, encoding: "utf8" }).trim()
+  // rev-list, not `rev-parse <tag>^{commit}`: execSync on Windows runs
+  // through cmd.exe, where ^ is the escape character and eats the brace.
+  const commit = execSync(`git rev-list -n 1 ${tag}`, { cwd: REPO_ROOT, encoding: "utf8" }).trim()
   const commitDate = execSync(`git log -1 --format=%ct ${tag}`, { cwd: REPO_ROOT, encoding: "utf8" }).trim()
   // The payload repo is a PLAIN SOURCE TREE, deliberately without .git.
   // Bundled installs never run git against the checkout: updates replace
@@ -310,7 +312,12 @@ function stageRepo(tag, outDir) {
   // version_info ladder prefers this stamp over git probing, so bundled
   // installs report exact-release provenance (distance 0, the tag's
   // commit) with no .git present.
-  run("python3", [
+  // uv run, not bare python3: on Windows `python3` resolves to the
+  // Microsoft Store alias (exit 9009). uv is a hard prerequisite of this
+  // script anyway, and the desktop `build` npm script already runs this
+  // same stamp writer through it.
+  run("uv", [
+    "run", "--no-project", "--python", "3",
     path.join(repoDir, "scripts", "write_install_stamp.py"),
     "--output", path.join(repoDir, ".hermes_build_info.json"),
     "--commit", commit,
@@ -627,18 +634,18 @@ function stageNode(target, outDir) {
 }
 
 function main() {
-  if (process.env.HERMES_DESKTOP_BUNDLED !== "1") {
-    // Thin build: write a stub manifest anyway. Then the extraResources
-    // entry always has a real directory to copy. The behavior of
-    // electron-builder for a missing `from` changes between versions. The
-    // stub also lets runtime code read manifest.json uniformly and learn
-    // that there are no payloads.
+  if (process.env.HERMES_DESKTOP_VARIANT !== "bundled") {
+    // bootstrap and light artifacts carry no payload: write a stub
+    // manifest anyway. Then the extraResources entry always has a real
+    // directory to copy. The behavior of electron-builder for a missing
+    // `from` changes between versions. The stub also lets runtime code
+    // read manifest.json uniformly and learn that there are no payloads.
     fs.mkdirSync(OUT_DIR, { recursive: true })
     fs.writeFileSync(
       path.join(OUT_DIR, "manifest.json"),
       JSON.stringify({ schemaVersion: PAYLOAD_SCHEMA_VERSION, external: true }, null, 2) + "\n"
     )
-    console.log("[stage-agent-payloads] HERMES_DESKTOP_BUNDLED != 1 — wrote external stub manifest")
+    console.log("[stage-agent-payloads] HERMES_DESKTOP_VARIANT != bundled — wrote external stub manifest")
     return
   }
   const target = resolveTargets()

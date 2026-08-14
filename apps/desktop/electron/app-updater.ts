@@ -15,8 +15,10 @@
 
 import type { AppUpdater } from 'electron-updater'
 
+import type { ArtifactKind } from './install-stamp'
+
 export interface UpdaterGateFacts {
-  stampHasPayload: boolean
+  stampPayload: ArtifactKind
   isPackaged: boolean
 }
 
@@ -24,16 +26,17 @@ export interface UpdaterGateFacts {
  * True when this launch must use electron-updater for app updates.
  *
  * Both conditions are necessary:
- * - the build carries an embedded payload (an external build has no
- *   matching feed artifacts),
+ * - the artifact kind self-updates through the release feed: 'bundled'
+ *   and 'light' both do ('bootstrap' artifacts have no matching feed
+ *   artifacts and keep the git path),
  * - the app is packaged (dev runs have no app-update.yml).
  *
  * This is a constant of the artifact, not of machine state. An eject
- * replaces the whole app with a source-built external one (no embedded
- * stamp), so no "ejected embedded install" state exists to gate on.
+ * replaces the whole app with a source-built external one (payload
+ * 'bootstrap'), so no "ejected embedded install" state exists to gate on.
  */
 export function shouldUseAppUpdater(facts: UpdaterGateFacts): boolean {
-  return facts.stampHasPayload === true && facts.isPackaged === true
+  return (facts.stampPayload === 'bundled' || facts.stampPayload === 'light') && facts.isPackaged === true
 }
 
 /**

@@ -1,8 +1,14 @@
-// Resolve electronDist at runtime (#38673, #47917): electron-builder 26.8.x can
-// re-unpack a broken Electron.app; reusing the installed dist dodges that.
-// npm workspace hoisting is non-deterministic — require.resolve finds electron
-// wherever it landed. Dist present → -c.electronDist=<abs>/dist; absent → let
-// electron-builder fetch via @electron/get (electronVersion + ELECTRON_MIRROR).
+// Wraps the electron-builder CLI so config that cannot ride through cmd.exe
+// argument hops (Windows signing values with spaces) is composed here, in the
+// first spawn with no shell in between.
+//
+// electron-builder downloads and extracts Electron itself (via electronVersion
+// + ELECTRON_MIRROR). Earlier revisions passed -c.electronDist to reuse the
+// installed node_modules/electron/dist as a dodge for a 26.8.x bug that could
+// re-unpack a broken Electron.app (#38673, #47917) — but 27's copyDir of that
+// dist mangles the framework symlinks and codesign rejects the bundle, while
+// its archive extraction preserves them. The dodge now causes the class of
+// bug it prevented, so it is gone.
 
 import fs from "node:fs"
 import path from "node:path"
@@ -11,24 +17,6 @@ import { createRequire } from "node:module"
 
 const require = createRequire(import.meta.url)
 
-function electronDistDir() {
-  try {
-    return path.join(path.dirname(require.resolve("electron/package.json")), "dist")
-  } catch {
-    return null
-  }
-}
-
-function distBinary(dist) {
-  if (process.platform === "darwin") {
-    return path.join(dist, "Electron.app", "Contents", "MacOS", "Electron")
-  }
-  if (process.platform === "win32") {
-    return path.join(dist, "electron.exe")
-  }
-  return path.join(dist, "electron")
-}
-
 function electronBuilderCli() {
   const pkgJson = require.resolve("electron-builder/package.json")
   const bin = require(pkgJson).bin
@@ -36,7 +24,6 @@ function electronBuilderCli() {
   return path.join(path.dirname(pkgJson), rel)
 }
 
-const dist = electronDistDir()
 const args = []
 args.push(...process.argv.slice(2))
 

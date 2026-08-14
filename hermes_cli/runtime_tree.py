@@ -168,12 +168,26 @@ class Sealed:
 
 
 def read_build_info(project_root: Path) -> dict:
-    """The baked build stamp of ``project_root``, or ``{}``."""
+    """The baked build stamp of ``project_root``, or ``{}``.
+
+    Raises ``RuntimeError`` on a ``payload: light`` stamp: a light artifact
+    ships no Python runtime, so a Python process reading its own stamp as
+    light means the artifact was mispackaged. Failing loudly here beats
+    every consumer misclassifying the tree.
+    """
     try:
         data = json.loads((Path(project_root) / BUILD_INFO_NAME).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    if data.get("payload") == "light":
+        raise RuntimeError(
+            f"install-stamp.json at {project_root} marks this artifact as 'light' "
+            "(no agent runtime). No Python process can legitimately run from a "
+            "light artifact — this build is mispackaged."
+        )
+    return data
 
 
 def runtime_tree(project_root: Path) -> GitCheckout | Sealed:

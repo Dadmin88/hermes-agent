@@ -6521,9 +6521,7 @@ def _electron_dir(project_root: Path) -> Path:
     ``apps/desktop/node_modules`` instead of hoisting them to the repo root.
     Which layout you get depends on the npm version and what else is installed,
     so a build path that assumes one or the other breaks intermittently across
-    machines. ``apps/desktop/package.json`` points electron-builder's
-    ``electronDist`` at ``node_modules/electron/dist`` relative to the desktop
-    project, so prefer the workspace-local package and fall back to the root
+    machines. Prefer the workspace-local package and fall back to the root
     hoist when that's where npm landed it.
     """
     desktop_local = project_root / "apps" / "desktop" / "node_modules" / "electron"
@@ -6535,9 +6533,8 @@ def _electron_dir(project_root: Path) -> Path:
 def _electron_dist_binary(project_root: Path) -> Path:
     """Return the path to the Electron main binary inside the installed package.
 
-    electron-builder reads the binary from ``build.electronDist`` since #38673,
-    so this is the exact file whose absence makes a pack fail with "The
-    specified electronDist does not exist". The basename differs per OS (the
+    This is the file whose absence marks a blocked/partial electron postinstall
+    (`npm run dev` launches from this dist). The basename differs per OS (the
     platform Electron is named for the host the build runs on).
     """
     dist = _electron_dir(project_root) / "dist"

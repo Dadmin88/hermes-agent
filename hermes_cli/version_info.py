@@ -111,6 +111,16 @@ def _stamp_version_info() -> VersionInfo | None:
     if not isinstance(data, dict) or "commit" not in data:
         return None
 
+    # A light artifact ships no Python runtime. Reading a light stamp from
+    # a Python process means the artifact was mispackaged — same guard as
+    # runtime_tree.read_build_info().
+    if data.get("payload") == "light":
+        raise RuntimeError(
+            f"install-stamp.json at {stamp_file} marks this artifact as 'light' "
+            "(no agent runtime). No Python process can legitimately run from a "
+            "light artifact — this build is mispackaged."
+        )
+
     commit = data.get("commit") or None
     if not commit or set(commit) == {"0"}:
         # All-zero placeholder = fallback stamp, not real provenance.
