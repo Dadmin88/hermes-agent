@@ -1,0 +1,53 @@
+// The desktop product identity — THE single source for every name-shaped
+// value a variant owns. HERMES_DESKTOP_VARIANT=light builds "Hermes
+// Light", the remote-only client; everything else is full "Hermes".
+//
+// Consumed at build time by electron-builder.config.cjs (packaging
+// identity) and bundle-electron-main.mjs (which bakes this object into
+// the main bundle as the __HERMES_PRODUCT_IDENTITY__ define, the same
+// mechanism as the install stamp) so the packaged artifact and the
+// runtime code can never disagree about who they are.
+//
+// electron/product-identity.ts is the typed runtime accessor; its
+// ProductIdentity interface mirrors the object shape here.
+// @ts-check
+/// <reference types="node" />
+'use strict'
+
+const variants = {
+  '': { display: 'Hermes', kebab: 'hermes', pascal: 'Hermes' },
+  light: {
+    display: 'Hermes Light',
+    kebab: 'hermes-light',
+    pascal: 'HermesLight'
+  },
+  bundled: {
+    display: 'Hermes',
+    kebab: 'hermes-bundled',
+    pascal: 'HermesBundled'
+  }
+}
+
+const variant = process.env.HERMES_DESKTOP_VARIANT
+if (variant !== 'light' && variant !== 'bundled' && variant !== '' && variant !== undefined) {
+  throw new Error(`Unknown HERMES_DESKTOP_VARIANT ${variant}. expected one of (empty), light, bundled`)
+}
+
+const name = variants[variant ?? '']
+
+const light = process.env.HERMES_DESKTOP_VARIANT === 'light'
+
+/** @typedef {import("./product-identity.d.cts")} ProductIdentity */
+
+/** @type {ProductIdentity} */
+const identity = {
+  light,
+  displayName: name.display,
+  appId: `com.nousresearch.${name.kebab}`,
+  channel: light ? 'light' : 'latest',
+  protocolScheme: name.kebab,
+  appNamePascal: name.pascal,
+  msixAppIdWithOrg: `NousResearch.${name.pascal}`
+}
+
+module.exports = identity

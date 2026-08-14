@@ -10,9 +10,12 @@
 // `electron` and `node-pty` are external (provided by the runtime / staged
 // separately via stage-native-deps).
 import { build } from 'esbuild'
+import { createRequire } from 'node:module'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { mkdirSync, readFileSync } from 'node:fs'
+
+const require = createRequire(import.meta.url)
 
 const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, '..')
@@ -50,6 +53,11 @@ const define = isDev
   : {
       'process.env.HERMES_DESKTOP_IS_PACKAGED': JSON.stringify(true),
       '__HERMES_INSTALL_STAMP__': bakedInstallStamp(),
+      // The product identity (name object, appId, deep-link scheme) —
+      // baked from the SAME module electron-builder.config.cjs packages
+      // with, so runtime code and the artifact cannot disagree. The
+      // variant env var is read once, here, at build time.
+      '__HERMES_PRODUCT_IDENTITY__': JSON.stringify(require('../product-identity.cjs')),
     }
 
 // Bundle main.ts → dist/electron-main.mjs

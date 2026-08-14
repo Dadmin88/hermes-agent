@@ -184,7 +184,7 @@ if (tag !== `v${pyprojectVersion}`) {
   fail(`tag ${tag} does not match pyproject.toml version ${pyprojectVersion}`)
 }
 
-const targets = { linux: "--linux AppImage", darwin: "--mac dmg zip", win32: "--win nsis" }[process.platform]
+const targets = { linux: "--linux AppImage", darwin: "--mac dmg zip", win32: "--win nsis msix" }[process.platform]
 if (!targets) {
   fail(`unsupported platform: ${process.platform}`)
 }

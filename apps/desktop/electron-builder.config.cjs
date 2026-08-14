@@ -21,6 +21,17 @@
 "use strict"
 
 const fs = require("node:fs")
+const path = require("node:path")
+
+const {
+  light,
+  displayName,
+  appId,
+  appNamePascal,
+  channel,
+  protocolScheme,
+  msixAppIdWithOrg
+} = require('./product-identity.cjs')
 
 /** @typedef {import("app-builder-lib").Configuration} Configuration */
 /** @typedef {import("app-builder-lib").MsixOptions} MsixOptions */
@@ -305,4 +316,80 @@ module.exports = {
       },
     },
   },
+}
+
+
+// ── copilot key provider fragment ───────────────────────────────────────────
+
+// The uap3:AppExtension fragment that registers the app as a Windows
+// Copilot hardware key provider. MsixTarget reads customExtensionsPath
+// relative to the app dir and splices the file's content into the
+// generated <Extensions> block verbatim, AFTER macro substitution — a
+// path is the only interface it offers. So the fragment is produced here
+// from the variant's productName and written into the gitignored build/
+// dir at require time: electron-builder always requires this config
+// before packaging, so the file exists by the time the MSIX target reads
+// it, and one template serves both variants.
+//
+// Two content rules, both learned the hard way:
+//   * xmlns:uap3 must be declared ON the fragment's root element — the
+//     stock manifest template declares no uap3 prefix, and ${...} in this
+//     fragment would never expand (the splice is post-substitution).
+//   * children of uap3:Properties are UNPREFIXED (xs:any content, per the
+//     copilot-key-state sample): a uap3: prefix there fails manifest
+//     validation — makeappx 0x80080204.
+//
+// The press activates <scheme>://copilot-key/start; routing lives in
+// electron/deep-link-route.ts (start summons the quick-entry popup, stop
+// is ignored).
+function copilotKeyFragmentPath() {
+  const fragment = `<uap3:Extension
+    xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
+    Category="windows.appExtension">
+  <uap3:AppExtension
+      Name="com.microsoft.windows.copilotkeyprovider"
+      Id="${productName.replace(/\s/g, "")}CopilotKeyProvider"
+      DisplayName="${productName}"
+      Description="Launch ${productName} with the Copilot key"
+      PublicFolder="Public">
+    <uap3:Properties>
+      <SingleTap>${protocolScheme}://copilot-key/start?state=Tap</SingleTap>
+      <PressAndHoldStart>${protocolScheme}://copilot-key/start?state=Down</PressAndHoldStart>
+      <PressAndHoldStop>${protocolScheme}://copilot-key/stop?state=Up</PressAndHoldStop>
+    </uap3:Properties>
+  </uap3:AppExtension>
+</uap3:Extension>
+`
+  const rel = path.join("build", "msix-copilot-key-extensions.xml")
+  const abs = path.join(__dirname, rel)
+  fs.mkdirSync(path.dirname(abs), { recursive: true })
+  fs.writeFileSync(abs, fragment)
+  return rel
+}
+
+// ── windows signing ─────────────────────────────────────────────────────────
+
+// Azure Trusted Signing. Composed here, not as -c.win.sign.* CLI arguments:
+// the publisherName holds spaces and commas that do not survive cmd.exe
+// argument hops. This file loads inside the electron-builder process, so
+// the values pass from the environment verbatim.
+//
+// Do NOT put ExcludeCredentials in additionalMetadata: the v27 schema
+// types it Record<string,string> while the dlib deserializes it as
+// List<string> — no value satisfies both. The credential chain is
+// narrowed with the AZURE_TOKEN_CREDENTIALS env var instead (set in the
+// release workflow), which Azure.Identity reads directly.
+function windowsSigning() {
+  if (!process.env.AZURE_SIGN_ENDPOINT || !process.env.AZURE_CLIENT_ID) {
+    return {}
+  }
+  return {
+    sign: {
+      type: "azure",
+      endpoint: process.env.AZURE_SIGN_ENDPOINT,
+      codeSigningAccountName: process.env.AZURE_SIGN_ACCOUNT,
+      certificateProfileName: process.env.AZURE_SIGN_PROFILE,
+      publisherName: process.env.AZURE_SIGN_PUBLISHER,
+    },
+  }
 }

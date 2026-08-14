@@ -275,6 +275,11 @@ jobs:
           # two phases that were silent for 55 minutes before the darwin
           # timeouts: per-file codesign and the notarytool submission.
           DEBUG: 'electron-builder,electron-osx-sign*,electron-notarize*'
+          # TEMPORARY diagnostic (msix signing 0x800700C1): AppxSIP logs the
+          # exact inner PE with the malformed certificate to the console when
+          # this is set — signtool's failing output lands in the step log.
+          # Remove once the corrupt file is identified and fixed.
+          APPXSIP_LOG: '1'
           HERMES_BUNDLE_TAG: ${{ env.HERMES_PAYLOAD_TAG }}
           # macOS signing and notarization (electron-builder builtin).
           # APPLE_API_KEY is intentionally NOT set here: the write-key
@@ -320,6 +325,21 @@ jobs:
           fi
           node scripts/build-bundled-desktop.mjs --tag="$HERMES_BUNDLE_TAG"
 
+      # makeappx reports manifest problems as a bare 0x80080204 with no
+      # detail, and the manifest lives in a per-run stage dir — unreadable
+      # after the runner is gone. On failure, print the generated
+      # AppxManifest.xml (and the spliced extensions fragment) so the log
+      # carries the exact XML makeappx rejected.
+      - name: Dump MSIX manifest on failure
+        if: failure() && startsWith(matrix.target.label, 'win32-')
+        shell: bash
+        run: |
+          shopt -s nullglob
+          for f in apps/desktop/release/__msix-*/AppxManifest.xml apps/desktop/build/msix-copilot-key-extensions.xml; do
+            echo "===== $f ====="
+            cat "$f" || true
+          done
+
       # Every native binary in the unpacked app must match the target
       # arch. Wrong-arch binaries run FINE on the runners (Windows-on-ARM
       # and Rosetta emulate x64 silently) and ship broken or slow — an
@@ -358,6 +378,7 @@ jobs:
             apps/desktop/release/*.dmg
             apps/desktop/release/*.zip
             apps/desktop/release/*.exe
+            apps/desktop/release/*.msix
             apps/desktop/release/*.AppImage
             apps/desktop/release/*.blockmap
             apps/desktop/release/latest*.yml
