@@ -51,7 +51,6 @@ import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from 
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
 import { runBootstrap } from './bootstrap-runner'
 import { findEmbeddedPython, latestReleaseFromLsRemote, resolvePayload, updateChannelFromConfig } from './bundled-runtime'
-import { decideResidentRuntime, findResidentPython, latestReleaseFromLsRemote, resolveChannel, resolvePayload } from './bundled-runtime'
 import { applyConnectionChange, resolveTerminalConnection } from './connection-apply'
 import {
   authModeFromStatus,
@@ -138,12 +137,17 @@ import {
   DATA_URL_READ_DEFAULT_MAX_MB,
   dataUrlReadMaxBytesFromMb,
   DEFAULT_FETCH_TIMEOUT_MS,
+  enableBasicPasswordStoreEncryption,
   encryptDesktopSecret as encryptDesktopSecretStrict,
   readFileDataUrlForIpc,
+  resolvePersistedRemoteToken,
   resolveReadableFileForIpc,
   resolveRequestedPathForIpc,
   resolveTimeoutMs,
-  TEXT_PREVIEW_SOURCE_MAX_BYTES
+  SAFE_STORAGE_ENCODING,
+  TEXT_PREVIEW_SOURCE_MAX_BYTES,
+  tightenSecretFileMode,
+  writeSecretFileAtomic
 } from './hardening'
 import { cursorPointInWindow } from './hud-cursor'
 import { buildHudWindowUrl } from './hud-url'
@@ -2987,15 +2991,27 @@ async function applyUpdates(opts = {}) {
   }
 
   // Bundled installs: download the new app from the GitHub Releases feed,
-  // then quit and install. After the relaunch, the marker-tag mismatch
-  // triggers the offline agent rebuild — no git, no venv mutation while
-  // the app runs, and the Windows setup-binary handoff is unnecessary.
+  // then quit and install. The swapped-in app carries the new runtime in
+  // its own resources — no git, no venv mutation while the app runs, and
+  // the Windows setup-binary handoff is unnecessary. Before quitAndInstall,
+  // tear down the backend trees on Windows: a surviving backend grandchild
+  // (a pty shell, an MCP server) holds executables inside the install
+  // directory the installer is about to replace — the same lock class the
+  // git path handles in releaseBackendLockForUpdate.
   if (bundledUpdaterActive()) {
     updateInFlight = true
 
     try {
-      return await applyAppUpdate(percent =>
-        emitUpdateProgress({ stage: 'download', message: 'Downloading the app update…', percent })
+      return await applyAppUpdate(
+        percent => emitUpdateProgress({ stage: 'download', message: 'Downloading the app update…', percent }),
+        () => {
+          if (IS_WINDOWS) {
+            stopBackendTreesForUpdate(backendConnectionState.getProcess(), {
+              forceKillProcessTree,
+              stopAllPoolBackends
+            })
+          }
+        }
       )
     } finally {
       updateInFlight = false
@@ -3543,6 +3559,10 @@ function shellQuote(value) {
 // (`hermes desktop --build-only`), then atomically swap the running .app bundle
 // with the freshly built one and relaunch. Degrades to "backend updated,
 // restart to load the new GUI" if the swap can't be performed.
+// macOS/Linux in-app update: backend (`hermes update`) + OS-aware GUI rebuild
+// (`hermes desktop --build-only`), then atomically swap the running .app bundle
+// with the freshly built one and relaunch. Degrades to "backend updated,
+// restart to load the new GUI" if the swap can't be performed.
 async function applyUpdatesPosixInApp(opts: any) {
   const updateRoot = resolveUpdateRoot()
   const hermes = resolveHermesCliBinary(updateRoot)
@@ -3895,33 +3915,6 @@ function bundledUpdaterActive(): boolean {
   })
 }
 
-// ─── Embedded-runtime facts ─────────────────────────────────────────────────
-
-/**
- * The embedded payload of this artifact, or null on external builds.
- * Resolution re-reads cheap file facts on every call; the answer is a
- * constant of the artifact in practice (the payload ships inside the
- * sealed resources and never changes at runtime).
- */
-function embeddedPayload() {
-  return resolvePayload(process.resourcesPath)
-}
-
-/**
- * True when app updates go through electron-updater instead of git.
- * A constant of the artifact: embedded builds self-update, external
- * builds never do. No machine state has a say — an eject replaces the
- * whole app with a source-built external one.
- */
-function bundledUpdaterActive(): boolean {
-  const stamp = INSTALL_STAMP as any
-
-  return shouldUseAppUpdater({
-    stampHasPayload: Boolean(stamp && stamp.payload),
-    isPackaged: app.isPackaged
-  })
-}
-
 // Marker-independent: is the canonical install at ACTIVE_HERMES_ROOT actually
 // runnable right now? A complete CLI install (`install.sh --include-desktop`)
 // or a DMG launch over a prior CLI install satisfies this WITHOUT the desktop
@@ -3957,11 +3950,6 @@ function writeBootstrapMarker(payload) {
     schemaVersion: BOOTSTRAP_MARKER_SCHEMA_VERSION,
     pinnedCommit: payload.pinnedCommit || null,
     pinnedBranch: payload.pinnedBranch || null,
-    // Bundled builds: the payload tag that this bootstrap materialized. The
-    // value is null on thin and network bootstraps. At launch, a comparison
-    // against the stamp tag triggers offline re-materialization after an
-    // app update.
-    pinnedTag: payload.pinnedTag || null,
     completedAt: new Date().toISOString(),
     desktopVersion: app.getVersion()
   }
@@ -4158,6 +4146,7 @@ function createPythonBackend(root, label, backendArgs, options: any = {}) {
       venvRoot
     }),
     root,
+    source: options.source ?? null,
     bootstrap: Boolean(options.bootstrap),
     shell: false
   }
@@ -4182,6 +4171,10 @@ function createActiveBackend(backendArgs) {
       venvRoot: VENV_ROOT
     }),
     root: ACTIVE_HERMES_ROOT,
+    // `git` — a checkout at a managed install root — is the install method
+    // Python's runtime_tree reports for the canonical $HERMES_HOME/hermes-agent
+    // location. The desktop does not re-derive it.
+    source: { type: 'git', root: ACTIVE_HERMES_ROOT },
     bootstrap: true,
     shell: false
   }
@@ -4247,6 +4240,7 @@ function createEmbeddedBackend(backendArgs) {
     env,
     root: repoRoot,
     embedded: true,
+    source: { type: 'desktop-app', root: repoRoot },
     bootstrap: false,
     shell: false
   }
@@ -4287,7 +4281,7 @@ function resolveHermesBackend(backendArgs) {
   // 1. Explicit override -- HERMES_DESKTOP_HERMES_ROOT points at a developer
   //    checkout. Honor it as-is (no bootstrap; the user is driving).
   if (overrideRoot && isHermesSourceRoot(overrideRoot)) {
-    const backend = createPythonBackend(overrideRoot, `Hermes source at ${overrideRoot}`, backendArgs)
+    const backend = createPythonBackend(overrideRoot, `Hermes source at ${overrideRoot}`, backendArgs, { source: { type: 'hermes-root', root: overrideRoot } })
 
     if (backend) {
       return backend
@@ -4298,8 +4292,10 @@ function resolveHermesBackend(backendArgs) {
   //    cloned repo at SOURCE_REPO_ROOT takes precedence over ACTIVE and any
   //    installed `hermes` on PATH so local Python edits are actually exercised.
   //    (In dev with no checkout, SOURCE_REPO_ROOT won't pass isHermesSourceRoot.)
+  //    `source` — a git checkout outside a managed install root — is the
+  //    install method Python's runtime_tree reports for such a tree.
   if (!IS_PACKAGED && isHermesSourceRoot(SOURCE_REPO_ROOT)) {
-    const backend = createPythonBackend(SOURCE_REPO_ROOT, `Hermes source at ${SOURCE_REPO_ROOT}`, backendArgs)
+    const backend = createPythonBackend(SOURCE_REPO_ROOT, `Hermes source at ${SOURCE_REPO_ROOT}`, backendArgs, { source: { type: 'source', root: SOURCE_REPO_ROOT } })
 
     if (backend) {
       return backend
@@ -4393,6 +4389,7 @@ function resolveHermesBackend(backendArgs) {
           bootstrap: false,
           env: {},
           kind: 'command',
+          source: { type: 'path', command: hermesCommand },
           shell: shellForProbe
         }
       }
@@ -4425,6 +4422,7 @@ function resolveHermesBackend(backendArgs) {
         args: ['-m', 'hermes_cli.main', ...backendArgs],
         bootstrap: false,
         env: {},
+        source: { type: 'system-python', command: python },
         shell: false
       }
     }
@@ -4449,6 +4447,7 @@ function resolveHermesBackend(backendArgs) {
     args: backendArgs,
     bootstrap: true,
     env: {},
+    source: { type: 'bootstrap' },
     shell: false,
     // Hints for the bootstrap runner / UI layer:
     activeRoot: ACTIVE_HERMES_ROOT,
@@ -7393,6 +7392,23 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
   const remoteUrl = envOverride ? String(process.env.HERMES_DESKTOP_REMOTE_URL || '') : String(block.url || '')
   const mode = envOverride ? 'remote' : savedMode === 'ssh' ? 'ssh' : modeIsRemoteLike(savedMode) ? savedMode : 'local'
 
+  // Whether the OS keyring (safeStorage) can encrypt the saved token. When
+  // false the renderer knows to offer the plain-text opt-in in Settings →
+  // Gateway. safeStorage.isEncryptionAvailable can throw on some platforms, so
+  // treat any failure as "not available".
+  let secureTokenStorage = false
+
+  try {
+    secureTokenStorage = Boolean(safeStorage.isEncryptionAvailable())
+  } catch {
+    secureTokenStorage = false
+  }
+
+  // Whether the currently saved token is stored in plain text (the keyring-less
+  // opt-in path). The env override supplies its token from the environment, not
+  // the saved block, so it never reports as plain text here.
+  const remoteTokenPlainText = !envOverride && block.token?.encoding === 'plain'
+
   let remoteOauthConnected = false
 
   if (authMode === 'oauth' && remoteUrl) {
@@ -7421,6 +7437,11 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
     cloudOrg: mode === 'cloud' ? String(block.org || '') : '',
     remoteTokenPreview: tokenPreview(remoteToken),
     remoteTokenSet: Boolean(remoteToken),
+    // Whether the OS keyring can encrypt a token; drives the plain-text opt-in
+    // affordance in Settings → Gateway on keyring-less Linux.
+    secureTokenStorage,
+    // Whether the saved token is currently persisted in plain text.
+    remoteTokenPlainText,
     sshHost: (ssh || savedSsh)?.host || '',
     sshUser: (ssh || savedSsh)?.user || '',
     sshPort: (ssh || savedSsh)?.port || null,
@@ -7489,11 +7510,18 @@ function coerceDesktopConnectionConfig(input: any = {}, existing = readDesktopCo
   const cloudOrg = mode === 'cloud' ? String(input.cloudOrg ?? existingBlock.org ?? '').trim() : ''
   const incomingToken = typeof input.remoteToken === 'string' ? input.remoteToken.trim() : ''
 
-  const nextToken = incomingToken
-    ? persistToken
-      ? encryptDesktopSecret(incomingToken)
-      : { encoding: 'plain', value: incomingToken }
-    : existingBlock.token
+  // Persist decision lives in hardening.resolvePersistedRemoteToken so the
+  // IPC-propagation seam (allowPlainTextToken → encryptDesktopSecret opt-in) is
+  // covered by a focused regression test. Pass allowPlainText through RAW — the
+  // helper coerces with `=== true`, so a truthy-non-true value never enables
+  // plain-text storage, and that strictness is asserted in exactly one place.
+  const nextToken = resolvePersistedRemoteToken({
+    incomingToken,
+    persistToken,
+    existingToken: existingBlock.token,
+    allowPlainText: input.allowPlainTextToken,
+    encryptSecret: encryptDesktopSecret
+  })
 
   if (mode === 'ssh') {
     const sshBlock = buildSshBlock(input, savedProfileSsh(existing, key) || rawExistingBlock)
@@ -8887,12 +8915,12 @@ async function startHermes() {
 
     await advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
     rememberLog(`Starting Hermes backend via ${backend.label}`)
-    // About → version details reads this: which tree the backend actually
-    // runs from is an install-axis fact users need when reporting issues.
+    // About → version details reads this: where the backend actually runs
+    // from is an install-axis fact users need when reporting issues. The
+    // RuntimeSource is populated once the backend has been resolved, so
+    // external builds report it only after launch.
     activeBackendInfo = {
-      label: backend.label || null,
-      embedded: backend.embedded === true,
-      root: backend.root || null
+      source: backend.source || null
     }
 
     const hermesProcess = spawn(
@@ -9320,6 +9348,7 @@ const wakeIndicatorController = createWakeIndicatorWindowController({
   devServer: DEV_SERVER,
   isMac: IS_MAC,
   loadWindowUrl,
+  log: rememberLog,
   preloadPath: PRELOAD_PATH,
   rendererIndex: resolveRendererIndex,
   wireWindow: window => wireCommonWindowHandlers(window, zoomWiringForWindowKind('wakeIndicator'))
@@ -12858,6 +12887,15 @@ app.whenReady().then(() => {
   } else if (systemCa.error) {
     rememberLog(`[tls] could not load Windows system CA certificates: ${systemCa.error}`)
   }
+
+  // Keyring-less Linux `--password-store=basic` support. This must run before
+  // createWindow() and anything that could touch safeStorage; the narrow
+  // platform/switch/guard semantics live in the extracted helper.
+  enableBasicPasswordStoreEncryption({
+    platform: process.platform,
+    passwordStoreSwitch: app.commandLine.getSwitchValue('password-store'),
+    safeStorageApi: safeStorage
+  })
 
   if (IS_MAC) {
     Menu.setApplicationMenu(buildApplicationMenu())

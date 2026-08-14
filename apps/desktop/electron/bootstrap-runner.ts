@@ -999,12 +999,7 @@ async function runBootstrap(opts) {
 
     const markerPayload = {
       pinnedCommit,
-      pinnedBranch: installStamp ? installStamp.branch : null,
-      // Bundled builds: record the payload tag that this bootstrap
-      // materialized. At launch, main.ts compares this tag against the
-      // stamp tag, which can be newer. The comparison decides offline
-      // re-materialization after an app update.
-      pinnedTag: installStamp && (installStamp as any).payload === true ? (installStamp as any).tag || null : null
+      pinnedBranch: installStamp ? installStamp.branch : null
     }
 
     const marker = typeof writeMarker === 'function' ? writeMarker(markerPayload) : markerPayload

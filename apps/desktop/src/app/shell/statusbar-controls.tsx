@@ -64,7 +64,7 @@ export interface StatusbarItem {
   onSelect?: (modifiers: StatusbarSelectModifiers) => void
   /** Keybind action id — when set, the tooltip shows the label + keybind hint. */
   actionId?: string
-  title?: string
+  title?: ReactNode
   to?: string
   variant?: 'action' | 'link' | 'menu' | 'text'
   /** Plain-text name for the bar's right-click show/hide menu. An item without
@@ -231,7 +231,11 @@ const StatusbarItemView = memo(function StatusbarItemView({
     return <ContribRender render={item.render} />
   }
 
-  const tooltipLabel = item.actionId ? <TipKeybindLabel actionId={item.actionId} text={item.title} /> : item.title
+  const tooltipLabel = item.actionId ? (
+    <TipKeybindLabel actionId={item.actionId} text={typeof item.title === 'string' ? item.title : undefined} />
+  ) : (
+    item.title
+  )
 
   const content = (
     <>

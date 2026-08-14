@@ -87,6 +87,11 @@ let cachedUpdater: AppUpdater | null = null
  * the function so thin builds and tests never pay for the module load.
  * autoDownload stays off: the renderer asks the user before the download
  * starts (same consent model as the git path).
+ * autoInstallOnAppQuit stays off too: a quit-time install would skip the
+ * pre-install backend teardown in applyAppUpdate, and on Windows a
+ * surviving backend grandchild keeps files in the install directory
+ * locked while the installer replaces it. Installs happen only through
+ * applyAppUpdate.
  */
 export function getAutoUpdater(): AppUpdater {
   if (cachedUpdater) {
@@ -96,7 +101,7 @@ export function getAutoUpdater(): AppUpdater {
   const { autoUpdater } = require('electron-updater') as { autoUpdater: AppUpdater }
 
   autoUpdater.autoDownload = false
-  autoUpdater.autoInstallOnAppQuit = true
+  autoUpdater.autoInstallOnAppQuit = false
   cachedUpdater = autoUpdater
 
   return autoUpdater
@@ -112,11 +117,21 @@ export async function checkAppUpdate(currentVersion: string): Promise<ReturnType
 
 /**
  * Download the update, then quit and install. `onProgress` receives percent
- * values from electron-updater's download events. The returned promise
+ * values from electron-updater's download events. `beforeInstall` runs after
+ * the download completes and before quitAndInstall — the caller uses it for
+ * backend teardown that must happen while the process is still alive (on
+ * Windows a surviving backend grandchild keeps files in the install
+ * directory locked while the installer replaces it). The returned promise
  * resolves after the download; quitAndInstall exits the process.
+ *
+ * `updater` is injectable so vitest can assert the ordering contract
+ * (download → beforeInstall → quitAndInstall) without electron-updater.
  */
-export async function applyAppUpdate(onProgress?: (percent: number) => void): Promise<{ ok: true }> {
-  const updater = getAutoUpdater()
+export async function applyAppUpdate(
+  onProgress?: (percent: number) => void,
+  beforeInstall?: () => void | Promise<void>,
+  updater: AppUpdater = getAutoUpdater()
+): Promise<{ ok: true }> {
   const handler = onProgress ? (p: { percent: number }) => onProgress(p.percent) : null
 
   if (handler) {
@@ -132,6 +147,10 @@ export async function applyAppUpdate(onProgress?: (percent: number) => void): Pr
     if (handler) {
       updater.removeListener('download-progress', handler)
     }
+  }
+
+  if (beforeInstall) {
+    await beforeInstall()
   }
 
   updater.quitAndInstall()

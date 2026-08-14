@@ -524,13 +524,17 @@ def get_latest_release_tag(repo_dir: Optional[Path] = None) -> Optional[tuple]:
 def format_banner_version_label() -> str:
     """Return the version label shown in the startup banner title."""
     info = get_version_info()
-    parts = [f"Hermes Agent v{info.derived_version}"]
+    version_label = f"Hermes Agent v{info.derived_version}"
+    if info.dirty:
+        version_label += " (!)"
+    parts = [version_label]
     if info.branch:
         parts.append(info.branch)
     if info.commit:
-        parts.append(info.commit[:12])
-    if info.dirty:
-        parts.append("dirty")
+        commit_label = info.commit[:12]
+        if info.dirty:
+            commit_label += " (+ uncommitted changes)"
+        parts.append(commit_label)
     return " · ".join(parts)
 
 

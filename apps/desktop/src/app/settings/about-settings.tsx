@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react'
 import { BrandMark } from '@/components/brand-mark'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
+import { VersionDetails } from '@/components/version-details'
 import { type Translations, useI18n } from '@/i18n'
 import { CheckCircle2, ExternalLink, Loader2, RefreshCw } from '@/lib/icons'
 import { cn } from '@/lib/utils'
@@ -18,7 +19,7 @@ import {
   startActiveUpdate
 } from '@/store/updates'
 
-import { ListRow, SectionHeading, SettingsContent } from './primitives'
+import { SectionHeading, SettingsContent } from './primitives'
 import { UninstallSection } from './uninstall-section'
 
 const RELEASE_NOTES_URL = 'https://github.com/NousResearch/hermes-agent/releases'
@@ -73,14 +74,16 @@ export function AboutSettings() {
   }
 
   let statusLine: string
-  let statusTone: 'idle' | 'available' | 'error' = 'idle'
+  let statusTone: 'idle' | 'available' | 'error' | 'unsupported' = 'idle'
+  let statusError: string | undefined = undefined
 
   if (!supported) {
     statusLine = status?.message ?? a.cantUpdate
-    statusTone = 'error'
+    statusTone = 'unsupported'
   } else if (status?.error) {
     statusLine = a.cantReach
     statusTone = 'error'
+    statusError = status.message
   } else if (applying) {
     statusLine = a.installing
     statusTone = 'available'
@@ -113,25 +116,26 @@ export function AboutSettings() {
             'rounded-xl border px-4 py-3 text-sm',
             statusTone === 'available' && 'border-primary/30 bg-primary/5 text-foreground',
             statusTone === 'error' && 'border-destructive/35 bg-destructive/5 text-destructive',
-            statusTone === 'idle' && 'border-border/70 bg-muted/20 text-foreground'
+            (statusTone === 'idle' || statusTone === 'unsupported') && 'border-border/70 bg-muted/20 text-foreground',
           )}
         >
           <div className="flex items-start gap-2">
             {statusTone === 'available' ? (
               <Codicon className="mt-0.5 size-4 shrink-0 text-primary" name="cloud-download" size="1rem" />
-            ) : statusTone === 'error' ? null : (
+            ) : statusTone === 'error' ||statusTone === 'unsupported'? null :(
               <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
             )}
             <div className="min-w-0">
               <p className="font-medium">{statusLine}</p>
-              <p className="mt-1 text-xs text-muted-foreground">
+              {statusError && <p className="mt-1 text-xs text-muted-foreground">{statusError}</p>}
+              {statusTone !== 'unsupported' && <p className="mt-1 text-xs text-muted-foreground">
                 {a.lastChecked(relativeTime(status?.fetchedAt, a))}
                 {justChecked && !checking ? a.justNowSuffix : ''}
-              </p>
+              </p>}
             </div>
           </div>
 
-          <div className="mt-3 flex flex-wrap items-center gap-4">
+          {statusTone !== 'unsupported' && <div className="mt-3 flex flex-wrap items-center gap-4">
             <Button
               disabled={checking || applying || !supported}
               onClick={() => void handleCheck()}
@@ -167,14 +171,10 @@ export function AboutSettings() {
                 {a.releaseNotes}
               </a>
             </Button>
-          </div>
+          </div>}
         </div>
 
-        <ListRow
-          description={a.automaticUpdatesDesc}
-          hint={a.branchCommit(status?.branch ?? 'unknown', status?.currentSha?.slice(0, 7) ?? 'unknown')}
-          title={a.automaticUpdates}
-        />
+        {version && <VersionDetails version={version} />}
 
         <UninstallSection />
       </div>

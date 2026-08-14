@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { describeFeedCheck, shouldUseAppUpdater } from './app-updater'
+import { applyAppUpdate, describeFeedCheck, shouldUseAppUpdater } from './app-updater'
 
 // ── shouldUseAppUpdater ─────────────────────────────────────────────
 
@@ -50,4 +50,37 @@ test('feed check tolerates a missing update info payload', () => {
 
   assert.equal(out.updateAvailable, false)
   assert.equal(out.latestVersion, null)
+})
+
+// ── applyAppUpdate ──────────────────────────────────────────────────
+
+function fakeUpdater(calls: string[], failDownload = false) {
+  return {
+    on: () => void 0,
+    removeListener: () => void 0,
+    downloadUpdate: async () => {
+      calls.push('download')
+
+      if (failDownload) {
+        throw new Error('download failed')
+      }
+    },
+    quitAndInstall: () => void calls.push('install')
+  } as any
+}
+
+test('apply runs beforeInstall between the download and the install', async () => {
+  const calls: string[] = []
+
+  await applyAppUpdate(undefined, () => void calls.push('teardown'), fakeUpdater(calls))
+
+  assert.deepEqual(calls, ['download', 'teardown', 'install'])
+})
+
+test('a failed download installs nothing and skips beforeInstall', async () => {
+  const calls: string[] = []
+
+  await assert.rejects(applyAppUpdate(undefined, () => void calls.push('teardown'), fakeUpdater(calls, true)))
+
+  assert.deepEqual(calls, ['download'])
 })
