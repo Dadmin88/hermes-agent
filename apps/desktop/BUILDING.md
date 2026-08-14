@@ -75,14 +75,45 @@ AZURE_SIGN_PUBLISHER    CN=Nous Research Inc., ...
 AZURE_CLIENT_ID         (the OIDC app id)
 ```
 
-`scripts/run-electron-builder.mjs` reads these variables and composes the
-`win.azureSignOptions` configuration itself. Do not pass the values as `-c`
-arguments: the publisher name contains spaces, and spaces do not survive the
-cmd.exe hops between npm and the builder on Windows. Without the variables,
-the build produces unsigned artifacts. Forks and local builds work unsigned.
+`electron-builder.config.cjs` reads these variables and composes the
+`win.sign` configuration itself. Do not pass the values as `-c` arguments:
+the publisher name contains spaces, and spaces do not survive the cmd.exe
+hops between npm and the builder on Windows. Without the variables, the
+build produces unsigned artifacts. Forks and local builds work unsigned.
+
+The release workflow authenticates the signing dlib as a **workload
+identity**: it mints the job's GitHub OIDC token into a file (reminted
+every 4 minutes — the tokens live only minutes and signing runs for the
+better part of an hour) and points `AZURE_FEDERATED_TOKEN_FILE`,
+`AZURE_CLIENT_ID`, and `AZURE_TENANT_ID` at it, with
+`AZURE_TOKEN_CREDENTIALS=prod` restricting the chain to
+Environment → WorkloadIdentity → ManagedIdentity. EnvironmentCredential
+fails instantly (no secret), WorkloadIdentityCredential redeems the token
+file in-process, and ManagedIdentityCredential is never reached. The
+dev-tool credentials (AzureCli & co.) all spawn subprocesses, which wedged
+the x64-emulated signtool on the windows-11-arm runner for 35+ minutes;
+the managed-identity probe hangs on GitHub-hosted runners (they are Azure
+VMs whose IMDS endpoint answers but never grants a token).
+`win.sign.additionalMetadata.ExcludeCredentials` cannot express any of
+this: electron-builder's v27 schema types it as a string while the dlib
+requires a JSON list.
 
 Authentication uses the Azure credential chain: OIDC federated login in CI,
 or an `az login` session on a dev machine. There is no signing secret.
+
+## Code signing + notarization (macOS)
+
+electron-builder's builtin notarization runs when the `APPLE_API_KEY` /
+`APPLE_API_KEY_ID` / `APPLE_API_ISSUER` env vars are set and the app is
+signed with the Developer ID certificate from `CSC_LINK`. `APPLE_API_KEY`
+must be a **path to the `.p8`** App Store Connect key: the value travels
+verbatim from the env var into `notarytool --key`, which takes a file
+path (no decode, no temp file anywhere in the chain — raw PEM content
+dies with `Invalid option`, base64 content is a nonexistent path). The
+release workflow keeps the raw `.p8` content in the `APPLE_API_KEY_P8`
+secret and writes it to a runner-temp file whose path becomes
+`APPLE_API_KEY`. Without the variables, the build skips notarization
+(and stays unsigned without `CSC_LINK`), so forks and local builds work.
 
 ## Where builds run
 

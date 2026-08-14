@@ -1,6 +1,5 @@
-// Wraps the electron-builder CLI so config that cannot ride through cmd.exe
-// argument hops (Windows signing values with spaces) is composed here, in the
-// first spawn with no shell in between.
+// Wraps the electron-builder CLI so the arguments compose in one place, in
+// the first spawn with no shell in between.
 //
 // electron-builder downloads and extracts Electron itself (via electronVersion
 // + ELECTRON_MIRROR). Earlier revisions passed -c.electronDist to reuse the
@@ -18,10 +17,18 @@ import { createRequire } from "node:module"
 const require = createRequire(import.meta.url)
 
 function electronBuilderCli() {
-  const pkgJson = require.resolve("electron-builder/package.json")
-  const bin = require(pkgJson).bin
+  // 27 no longer exports ./package.json; resolve the entry module and walk
+  // up to the package root instead.
+  const entry = require.resolve("electron-builder")
+  let dir = path.dirname(entry)
+  while (!fs.existsSync(path.join(dir, "package.json"))) {
+    const parent = path.dirname(dir)
+    if (parent === dir) throw new Error("electron-builder package root not found")
+    dir = parent
+  }
+  const bin = require(path.join(dir, "package.json")).bin
   const rel = typeof bin === "string" ? bin : bin["electron-builder"]
-  return path.join(path.dirname(pkgJson), rel)
+  return path.join(dir, rel)
 }
 
 const args = []
@@ -34,6 +41,22 @@ args.push(...process.argv.slice(2))
 if (!args.some((a) => a === "--config" || a.startsWith("--config="))) {
   args.push("--config", "electron-builder.config.cjs")
 }
+
+// Never let electron-builder publish. On a CI tag build it auto-detects
+// GitHub and demands GH_TOKEN after the artifacts are already built.
+// The release workflow uploads artifacts in its own step.
+if (!args.includes("--publish") && !args.some((a) => a.startsWith("-p"))) {
+  args.push("--publish", "never")
+}
+
+// Windows signing config lives in electron-builder.config.cjs, composed from
+// the AZURE_SIGN_* variables. It cannot ride through -c arguments: the
+// publisherName contains spaces and commas that die in cmd.exe hops. This
+// block only announces the decision in the log.
+if (args.includes("--win") && process.env.AZURE_SIGN_ENDPOINT && process.env.AZURE_CLIENT_ID) {
+  console.log(`[run-electron-builder] Windows signing: Azure Trusted Signing at ${process.env.AZURE_SIGN_ENDPOINT}`)
+}
+args.push(...process.argv.slice(2))
 
 // Never let electron-builder publish. On a CI tag build it auto-detects
 // GitHub and demands GH_TOKEN after the artifacts are already built.
@@ -65,7 +88,6 @@ if (
     `-c.win.sign.publisherName=${process.env.AZURE_SIGN_PUBLISHER}`
   )
 }
-args.push(...process.argv.slice(2))
 
 const result = spawnSync(process.execPath, [electronBuilderCli(), ...args], {
   stdio: "inherit",
