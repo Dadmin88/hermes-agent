@@ -3402,6 +3402,7 @@ TERMINAL_CONFIG_ENV_MAP = {
     "docker_orphan_reaper": "TERMINAL_DOCKER_ORPHAN_REAPER",
     "sandbox_dir": "TERMINAL_SANDBOX_DIR",
     "persistent_shell": "TERMINAL_PERSISTENT_SHELL",
+    "force_foreground": "TERMINAL_FORCE_FOREGROUND",
 }
 
 

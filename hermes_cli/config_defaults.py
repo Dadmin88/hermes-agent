@@ -330,6 +330,10 @@ DEFAULT_CONFIG = {
         # it here without patching the built desktop app.
         "font_family": "",
         "timeout": 180,
+        # Automation profiles may opt into foreground-only terminal execution.
+        # Disabled by default so interactive Hermes sessions retain tracked
+        # background-process support.
+        "force_foreground": False,
         # Bounded grace period (seconds) between SIGTERM and an escalated
         # SIGKILL when terminating a host process tree (browser daemons, etc.).
         # A daemon that stalls in its SIGTERM handler is force-killed after this
