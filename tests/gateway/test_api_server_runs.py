@@ -351,6 +351,30 @@ class TestRunEvents:
                 assert "run.completed" in body
                 assert "Hello!" in body
 
+    @pytest.mark.asyncio
+    async def test_tool_completed_events_record_final_tool_evidence(self, adapter):
+        run_id = "run_tool_evidence"
+        adapter._run_streams[run_id] = asyncio.Queue()
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "running",
+            "tool_calls": 0,
+            "tool_errors": 0,
+            "last_tool_error": None,
+        }
+        callback = adapter._make_run_event_callback(
+            run_id, asyncio.get_running_loop()
+        )
+
+        callback("tool.completed", tool_name="terminal", duration=0.1, is_error=True)
+        callback("tool.completed", tool_name="terminal", duration=0.1, is_error=False)
+        await asyncio.sleep(0)
+
+        status = adapter._run_statuses[run_id]
+        assert status["tool_calls"] == 2
+        assert status["tool_errors"] == 1
+        assert status["last_tool_error"] is False
 
     @pytest.mark.asyncio
     async def test_approval_resolve_all_is_scoped_to_target_run(self, auth_adapter):
@@ -807,6 +831,9 @@ class TestFinalizeRun:
             "run_id": run_id,
             "status": "completed",
             "quiescent": False,
+            "tool_calls": 2,
+            "tool_errors": 1,
+            "last_tool_error": False,
         }
         adapter._run_profiles[run_id] = "fleet-execution"
 
@@ -826,6 +853,9 @@ class TestFinalizeRun:
             "quiescent": True,
             "session_db_released": True,
             "log_handlers_released": 2,
+            "tool_calls": 2,
+            "tool_errors": 1,
+            "last_tool_error": False,
         }
         assert adapter._run_statuses[run_id]["quiescent"] is True
         assert adapter._run_statuses[run_id]["last_event"] == "run.finalized"
