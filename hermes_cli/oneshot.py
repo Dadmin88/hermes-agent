@@ -26,7 +26,7 @@ import os
 import sys
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from gateway.session_context import declare_stateless_channel
 from hermes_cli.fallback_config import get_fallback_chain
@@ -173,6 +173,7 @@ def run_oneshot(
     provider: Optional[str] = None,
     toolsets: object = None,
     usage_file: Optional[str] = None,
+    resume: Optional[str] = None,
 ) -> int:
     """Execute a single prompt and print only the final content block.
 
@@ -187,6 +188,10 @@ def run_oneshot(
             cost, token counts, model, api_calls) is written there after the
             run — even when the run fails — so pipelines can account for
             spend per invocation.
+        resume: Optional existing session ID/title resolved by the CLI. When
+            set, the canonical persisted transcript is loaded and the new
+            turn is appended to that same session instead of creating a new
+            root session.
 
     Returns the exit code.  The caller owns process termination.
     """
@@ -248,6 +253,7 @@ def run_oneshot(
                     provider=provider,
                     toolsets=explicit_toolsets,
                     use_config_toolsets=use_config_toolsets,
+                    resume=resume,
                 )
             except BaseException as exc:  # noqa: BLE001
                 # Capture anything that escapes the agent (including OSError
@@ -319,12 +325,70 @@ def _create_session_db_for_oneshot():
         return None
 
 
+def _load_resume_state(
+    session_db: Any,
+    resume: Optional[str],
+) -> tuple[Optional[str], list[dict[str, Any]], Optional[dict[str, Any]]]:
+    """Load canonical persisted history for resumable one-shot mode.
+
+    ``main.py`` resolves ``latest`` / ``-c`` / titles before calling this
+    helper, but accepting a title here too keeps direct ``run_oneshot`` callers
+    robust. The returned history is the same model-facing projection used by
+    interactive resume and the existing session row is reopened for append.
+    """
+    requested = (resume or "").strip()
+    if not requested:
+        return None, [], None
+    if session_db is None:
+        raise RuntimeError("cannot resume: session database is unavailable")
+
+    session_id = requested
+    session_meta = session_db.get_session(session_id)
+    if not session_meta:
+        try:
+            resolved = session_db.resolve_session_by_title(requested)
+        except Exception:
+            resolved = None
+        if resolved:
+            session_id = resolved
+            session_meta = session_db.get_session(session_id)
+    if not session_meta:
+        raise RuntimeError(f"session not found: {requested}")
+
+    try:
+        resolved_id = session_db.resolve_resume_session_id(session_id)
+    except Exception:
+        resolved_id = session_id
+    if resolved_id:
+        session_id = resolved_id
+        resolved_meta = session_db.get_session(session_id)
+        if resolved_meta:
+            session_meta = resolved_meta
+
+    safety_check = getattr(session_db, "assert_resume_safe", None)
+    if callable(safety_check):
+        safety_check(session_id)
+
+    model_history, _display_history = session_db.get_resume_conversations(session_id)
+    history = [
+        message
+        for message in (model_history or [])
+        if isinstance(message, dict) and message.get("role") != "session_meta"
+    ]
+    try:
+        session_db.reopen_session(session_id)
+    except Exception:
+        pass
+    return session_id, history, session_meta
+
+
 def _run_agent(
     prompt: str,
     model: Optional[str] = None,
     provider: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
+    resume: Optional[str] = None,
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
     run a single conversation.  Returns ``(final_response, run_result)``."""
@@ -338,7 +402,31 @@ def _run_agent(
 
     cfg = load_config()
 
-    # Resolve effective model: explicit arg → env var → config.
+    resume_session_id: Optional[str] = None
+    resume_history: list[dict[str, Any]] = []
+    resume_meta: Optional[dict[str, Any]] = None
+    if resume:
+        resume_db = _create_session_db_for_oneshot()
+        try:
+            resume_session_id, resume_history, resume_meta = _load_resume_state(
+                resume_db, resume
+            )
+        finally:
+            if resume_db is not None:
+                try:
+                    resume_db.close()
+                except Exception:
+                    pass
+    resume_runtime: dict[str, Any] = {}
+    if resume_meta:
+        try:
+            from hermes_state import SessionDB as _SessionDB
+
+            resume_runtime = _SessionDB.session_gateway_runtime(resume_meta)
+        except Exception:
+            resume_runtime = {}
+
+    # Resolve effective model: explicit arg → env var → resumed session → config.
     model_cfg = cfg.get("model") or {}
     if isinstance(model_cfg, str):
         cfg_model = model_cfg
@@ -346,7 +434,8 @@ def _run_agent(
         cfg_model = model_cfg.get("default") or model_cfg.get("model") or ""
 
     env_model = os.getenv("HERMES_INFERENCE_MODEL", "").strip()
-    effective_model = (model or "").strip() or env_model or cfg_model
+    resumed_model = str((resume_meta or {}).get("model") or "").strip()
+    effective_model = (model or "").strip() or env_model or resumed_model or cfg_model
 
     # Resolve effective provider: explicit arg → (auto-detect from model if
     # model was explicit) → env / config (handled inside resolve_runtime_provider).
@@ -358,6 +447,13 @@ def _run_agent(
     # the caller just asked for.
     effective_provider = (provider or "").strip() or None
     explicit_base_url_from_alias: Optional[str] = None
+    if effective_provider is None and not (model or env_model) and resume_runtime:
+        stored_provider = str(resume_runtime.get("provider") or "").strip()
+        if stored_provider:
+            effective_provider = stored_provider
+        stored_base_url = str(resume_runtime.get("base_url") or "").strip()
+        if stored_base_url:
+            explicit_base_url_from_alias = stored_base_url.rstrip("/")
     if effective_provider is None and (model or env_model):
         # Only auto-detect when the model was explicitly requested via arg or
         # env var (not when it came from config — that's the "use my defaults"
@@ -396,6 +492,10 @@ def _run_agent(
         target_model=effective_model or None,
         explicit_base_url=explicit_base_url_from_alias,
     )
+    if not provider and not (model or env_model):
+        stored_api_mode = str(resume_runtime.get("api_mode") or "").strip()
+        if stored_api_mode:
+            runtime["api_mode"] = stored_api_mode
 
     # Pull in explicit toolsets when provided; otherwise use whatever the user
     # has enabled for "cli". sorted() gives stable ordering for config-derived
@@ -440,6 +540,7 @@ def _run_agent(
             enabled_toolsets=toolsets_list,
             quiet_mode=True,
             platform="cli",
+            session_id=resume_session_id,
             session_db=session_db,
             credential_pool=runtime.get("credential_pool"),
             fallback_model=_fb or None,
@@ -457,13 +558,25 @@ def _run_agent(
             clarify_callback=_oneshot_clarify_callback,
         )
 
+        if resume_session_id:
+            # The row and historical messages already exist in SQLite. Seed the
+            # persistence cursor so the resumed turn appends only new messages
+            # instead of duplicating the loaded transcript.
+            agent._session_db_created = True
+            agent._last_flushed_db_idx = len(resume_history)
+            agent._flushed_db_message_session_id = resume_session_id
+
         # Belt-and-braces: make sure AIAgent doesn't invoke any streaming
         # display callbacks that would bypass our stdout capture.
         agent.suppress_status_output = True
         agent.stream_delta_callback = None
         agent.tool_gen_callback = None
 
-        result = agent.run_conversation(prompt)
+        result = agent.run_conversation(
+            prompt,
+            conversation_history=resume_history or None,
+            task_id=resume_session_id,
+        )
         return (result.get("final_response") or "", result)
     finally:
         # Ordering deliberately mirrors gateway/run.py:_cleanup_agent_resources,

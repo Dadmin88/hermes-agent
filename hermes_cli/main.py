@@ -180,6 +180,7 @@ def _run_and_exit_oneshot(
     provider: object = None,
     toolsets: object = None,
     usage_file: object = None,
+    resume: object = None,
 ) -> None:
     try:
         from hermes_cli.oneshot import run_oneshot
@@ -190,6 +191,7 @@ def _run_and_exit_oneshot(
             provider=provider,
             toolsets=toolsets,
             usage_file=usage_file,
+            resume=str(resume).strip() if resume else None,
         )
     except KeyboardInterrupt:
         rc = 130
@@ -1522,6 +1524,43 @@ def _resolve_session_by_name_or_id(name_or_id: str) -> Optional[str]:
         return resolved_id
     except Exception:
         pass
+    return None
+
+
+def _resolve_oneshot_resume(args: object) -> Optional[str]:
+    """Resolve ``-z`` resume/continue flags using normal CLI semantics.
+
+    Top-level one-shot dispatch happens before ``cmd_chat``. Without this
+    helper, ``--resume`` and ``-c`` are parsed but silently ignored because
+    one-shot bypasses the interactive CLI entirely.
+    """
+    resume_val = getattr(args, "resume", None)
+    continue_val = getattr(args, "continue_last", None)
+
+    if isinstance(resume_val, str) and resume_val.strip().lower() == "latest":
+        resume_val = _resolve_last_session(source="cli")
+        if not resume_val:
+            print("No previous CLI session found to resume.", file=sys.stderr)
+            raise SystemExit(1)
+
+    if not resume_val and continue_val:
+        if isinstance(continue_val, str):
+            resume_val = _resolve_session_by_name_or_id(continue_val)
+            if not resume_val:
+                print(
+                    f"No session found matching '{continue_val}'.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
+        else:
+            resume_val = _resolve_last_session(source="cli")
+            if not resume_val:
+                print("No previous CLI session found to continue.", file=sys.stderr)
+                raise SystemExit(1)
+
+    if resume_val:
+        resolved = _resolve_session_by_name_or_id(str(resume_val))
+        return resolved or str(resume_val)
     return None
 
 
@@ -11195,6 +11234,7 @@ def _try_fast_chat_launch() -> bool:
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
+            resume=_resolve_oneshot_resume(args),
         )
 
     if (args.resume or args.continue_last) and args.command is None:
@@ -11251,6 +11291,7 @@ def _try_termux_fast_cli_launch() -> bool:
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
+            resume=_resolve_oneshot_resume(args),
         )
 
     if (args.resume or args.continue_last) and args.command is None:
@@ -12945,6 +12986,7 @@ def main():
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
+            resume=_resolve_oneshot_resume(args),
         )
 
     # Handle top-level --resume / --continue as shortcut to chat

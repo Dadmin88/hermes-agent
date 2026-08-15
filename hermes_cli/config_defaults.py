@@ -1821,6 +1821,20 @@ DEFAULT_CONFIG = {
     # Never saved to sessions, logs, or trajectories.
     "prefill_messages_file": "",
 
+    # Local supervisor — opt-in owner-local control of an interactive classic
+    # CLI session over an AF_UNIX socket. Disabled globally by default. The
+    # socket is mode 0600 and Linux peers are additionally checked with
+    # SO_PEERCRED. This surface only queues normal messages, steers the active
+    # turn, interrupts it, and returns bounded status/history; it never exposes
+    # arbitrary command execution.
+    "supervisor": {
+        "local_control": {
+            "enabled": False,
+            "max_message_chars": 32768,
+            "history_messages": 16,
+        },
+    },
+
     # Goals — persistent cross-turn goals (Ralph-style loop).
     # After every turn, a lightweight judge call asks the auxiliary model
     # whether the active /goal is satisfied by the assistant's last

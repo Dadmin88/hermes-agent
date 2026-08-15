@@ -4769,6 +4769,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # turn (which would make Ctrl+C feel like it did nothing).
         self._last_turn_interrupted = False
         self._should_exit = False
+        # Optional owner-local supervisor socket. The global default is off;
+        # profiles opt in via supervisor.local_control.enabled. The server is
+        # started later, only after process_loop is alive, so socket presence
+        # means the session is actually ready to accept remote input.
+        self._local_supervisor_server = None
         # /exit --delete: when True, the current session's SQLite history and
         # on-disk transcripts are deleted during shutdown. Set by
         # process_command() when the user runs /exit --delete or /quit --delete.
@@ -18258,6 +18263,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Start processing thread
         process_thread = threading.Thread(target=process_loop, daemon=True)
         process_thread.start()
+
+        # Start the optional owner-local supervisor only after the input loop is
+        # live. This prevents an external controller from observing a socket
+        # during startup and queueing work into a session that is not ready yet.
+        try:
+            from hermes_cli.local_supervisor import maybe_start_local_supervisor
+
+            self._local_supervisor_server = maybe_start_local_supervisor(self)
+        except Exception as exc:
+            logger.debug("Local supervisor socket unavailable: %s", exc)
 
         # Wake word ("Hey Hermes") — start the always-on hotword listener if
         # enabled. Off-thread so a first-run engine install never blocks the
