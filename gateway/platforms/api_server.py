@@ -3196,6 +3196,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_steer": True,
                 "run_finalize": True,
                 "run_approval_budget": True,
+                "run_tool_evidence": True,
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
@@ -6615,13 +6616,24 @@ class APIServerAdapter(BasePlatformAdapter):
                     "preview": preview,
                 })
             elif event_type == "tool.completed":
+                is_error = bool(kwargs.get("is_error", False))
+                current = self._run_statuses.get(run_id, {})
+                tool_calls = int(current.get("tool_calls", 0) or 0) + 1
+                tool_errors = int(current.get("tool_errors", 0) or 0) + int(is_error)
+                self._set_run_status(
+                    run_id,
+                    current.get("status", "running"),
+                    tool_calls=tool_calls,
+                    tool_errors=tool_errors,
+                    last_tool_error=is_error,
+                )
                 _push({
                     "event": "tool.completed",
                     "run_id": run_id,
                     "timestamp": ts,
                     "tool": tool_name,
                     "duration": round(kwargs.get("duration", 0), 3),
-                    "error": kwargs.get("is_error", False),
+                    "error": is_error,
                 })
             elif event_type == "reasoning.available":
                 _push({
@@ -6832,6 +6844,9 @@ class APIServerAdapter(BasePlatformAdapter):
             quiescent=False,
             approval_budget=approval_budget,
             approval_count=0 if approval_budget is not None else None,
+            tool_calls=0,
+            tool_errors=0,
+            last_tool_error=None,
         )
 
         # Background task outlives the HTTP response (and thus the middleware
@@ -7469,6 +7484,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     "quiescent": True,
                     "session_db_released": False,
                     "log_handlers_released": 0,
+                    "tool_calls": int(status.get("tool_calls", 0) or 0),
+                    "tool_errors": int(status.get("tool_errors", 0) or 0),
+                    "last_tool_error": status.get("last_tool_error"),
                 })
 
             task = self._active_run_tasks.get(run_id)
@@ -7536,6 +7554,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_id": run_id,
                 "status": current_state,
                 "quiescent": True,
+                "tool_calls": int(status.get("tool_calls", 0) or 0),
+                "tool_errors": int(status.get("tool_errors", 0) or 0),
+                "last_tool_error": status.get("last_tool_error"),
                 **released,
             })
 
