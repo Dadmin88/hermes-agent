@@ -1428,6 +1428,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
+        # Multiplex profile identity retained until terminal run finalization.
+        # External lifecycle owners (notably Fleet) reuse one profile path and
+        # must explicitly quiesce profile-owned persistence before deleting it.
+        self._run_profiles: Dict[str, Optional[str]] = {}
+        self._run_finalize_locks: Dict[str, "asyncio.Lock"] = {}
         # Stop is cooperative: the executor thread may outlive the HTTP request.
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
@@ -2096,6 +2101,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
             ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
+            ("POST", "/v1/runs/{run_id}/finalize", self._handle_finalize_run),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
         ]
         if _CRON_AVAILABLE:
@@ -2208,6 +2214,39 @@ class APIServerAdapter(BasePlatformAdapter):
                 db.close()
             except Exception:
                 logger.debug("Failed to close API-server SessionDB", exc_info=True)
+
+    def _close_cached_profile_session_db(self, home: Path) -> bool:
+        """Close and evict one cached multiplex-profile SessionDB.
+
+        ``SessionDB.close()`` is the persistence barrier: it drains queued token
+        accounting before closing SQLite. The explicit API-run finalization
+        contract calls this before an external lifecycle owner removes the
+        profile directory.
+        """
+        key = str(home)
+        with self._session_db_cache_lock:
+            db = self._session_dbs.pop(key, None)
+        if db is None:
+            return False
+        try:
+            db.close()
+        except Exception as exc:
+            logger.warning("Failed to close profile SessionDB %s: %s", key, exc)
+            raise
+        return True
+
+    def _release_profile_runtime(self, profile: str) -> dict[str, Any]:
+        """Synchronously quiesce cached state rooted under one multiplex profile."""
+        from hermes_cli.profiles import get_profile_dir
+        from hermes_logging import release_logging_home
+
+        home = Path(get_profile_dir(profile))
+        session_db_released = self._close_cached_profile_session_db(home)
+        log_handlers_released = release_logging_home(home)
+        return {
+            "session_db_released": session_db_released,
+            "log_handlers_released": int(log_handlers_released),
+        }
 
     def _ensure_session_db(self):
         """Lazily initialise and return the SessionDB for the active profile home.
@@ -3149,6 +3188,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events_sse": True,
                 "run_stop": True,
                 "run_steer": True,
+                "run_finalize": True,
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
@@ -3180,6 +3220,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_steer": {"method": "POST", "path": "/v1/runs/{run_id}/steer"},
+                "run_finalize": {"method": "POST", "path": "/v1/runs/{run_id}/finalize"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
@@ -6765,11 +6806,13 @@ class APIServerAdapter(BasePlatformAdapter):
             created_at=created_at,
             session_id=session_id,
             model=body.get("model", self._model_name),
+            quiescent=False,
         )
 
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
         request_profile = _api_request_profile.get()
+        self._run_profiles[run_id] = request_profile
 
         async def _run_and_close():
             try:
@@ -7264,6 +7307,146 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
         return web.json_response({"object": "hermes.run.steer", "run_id": run_id, "accepted": True})
 
+    async def _handle_finalize_run(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/finalize — prove profile runtime quiescence.
+
+        Terminal model output is not sufficient permission for an external
+        lifecycle owner to delete a multiplex profile.  Finalization closes the
+        profile's cached SessionDB (draining async token accounting) and drains
+        + detaches profile-specific file log handlers.  The endpoint is
+        intentionally idempotent so a control plane can safely retry after an
+        uncertain HTTP response.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        status = self._run_statuses.get(run_id)
+        if status is None:
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
+
+        terminal_states = {"completed", "failed", "cancelled"}
+        if status.get("status") not in terminal_states:
+            return web.json_response(
+                _openai_error(
+                    f"Run is not terminal: {run_id}", code="run_not_terminal"
+                ),
+                status=409,
+            )
+
+        run_profile = self._run_profiles.get(run_id)
+        request_profile = _api_request_profile.get()
+        if run_profile is None:
+            return web.json_response(
+                _openai_error(
+                    "Run finalization requires a multiplex profile",
+                    code="run_not_multiplexed",
+                ),
+                status=409,
+            )
+        if request_profile != run_profile:
+            return web.json_response(
+                _openai_error(
+                    "Run finalization profile does not match the run",
+                    code="run_profile_mismatch",
+                ),
+                status=409,
+            )
+
+        lock = self._run_finalize_locks.get(run_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._run_finalize_locks[run_id] = lock
+
+        async with lock:
+            status = self._run_statuses.get(run_id)
+            if status is None:
+                return web.json_response(
+                    _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                    status=404,
+                )
+            if status.get("quiescent") is True:
+                return web.json_response({
+                    "object": "hermes.run.finalization",
+                    "run_id": run_id,
+                    "status": status.get("status"),
+                    "quiescent": True,
+                    "session_db_released": False,
+                    "log_handlers_released": 0,
+                })
+
+            task = self._active_run_tasks.get(run_id)
+            if task is not None and not task.done():
+                return web.json_response(
+                    _openai_error(
+                        "Run terminal status is still finalizing",
+                        code="run_finalization_pending",
+                    ),
+                    status=409,
+                )
+
+            for other_id, other_profile in list(self._run_profiles.items()):
+                if other_id == run_id or other_profile != run_profile:
+                    continue
+                other_task = self._active_run_tasks.get(other_id)
+                if other_task is not None and not other_task.done():
+                    return web.json_response(
+                        _openai_error(
+                            "Another run is active for this profile",
+                            code="run_profile_busy",
+                        ),
+                        status=409,
+                    )
+
+            try:
+                released = await asyncio.to_thread(
+                    self._release_profile_runtime, run_profile
+                )
+            except Exception:
+                logger.exception(
+                    "[api_server] run %s profile finalization failed", run_id
+                )
+                return web.json_response(
+                    _openai_error(
+                        "Run profile finalization failed",
+                        err_type="server_error",
+                        code="run_finalization_failed",
+                    ),
+                    status=500,
+                )
+
+            finalized_at = time.time()
+            current_state = str(status.get("status") or "")
+            self._set_run_status(
+                run_id,
+                current_state,
+                quiescent=True,
+                finalized_at=finalized_at,
+                last_event="run.finalized",
+            )
+            q = self._run_streams.get(run_id)
+            if q is not None:
+                try:
+                    q.put_nowait({
+                        "event": "run.finalized",
+                        "run_id": run_id,
+                        "timestamp": finalized_at,
+                        "quiescent": True,
+                    })
+                except Exception:
+                    pass
+            return web.json_response({
+                "object": "hermes.run.finalization",
+                "run_id": run_id,
+                "status": current_state,
+                "quiescent": True,
+                **released,
+            })
+
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
         auth_err = self._check_auth(request)
@@ -7343,6 +7526,8 @@ class APIServerAdapter(BasePlatformAdapter):
         ]
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
+            self._run_profiles.pop(run_id, None)
+            self._run_finalize_locks.pop(run_id, None)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
