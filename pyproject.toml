@@ -424,6 +424,9 @@ hermes_cli = ["observability/schemas/*.json", "data/*.json"]
 # topic-setup image disappears. Loaded via Path(__file__).parent / "assets"
 # in gateway/status_phrases.py and gateway/run.py.
 gateway = ["assets/**/*"]
+# Bundled model-provider manifests and identity/policy assets. Keeping these
+# explicit makes sealed wheels independent of VCS package-data discovery.
+plugins = ["**/plugin.yaml", "**/plugin.yml", "**/README.md", "**/identity.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

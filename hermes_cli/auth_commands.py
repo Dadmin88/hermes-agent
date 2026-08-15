@@ -84,6 +84,14 @@ def _normalize_provider(provider: str) -> str:
     custom_key = _resolve_custom_provider_input(normalized)
     if custom_key:
         return custom_key
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(normalized)
+        if profile is not None:
+            return profile.name
+    except Exception:
+        pass
     return normalized
 
 
@@ -163,6 +171,27 @@ def _format_exhausted_status(entry) -> str:
 
 def auth_add_command(args) -> None:
     provider = _normalize_provider(getattr(args, "provider", ""))
+
+    # Composed providers never own duplicate credentials. Redirect auth setup
+    # to the terminal backing provider while keeping the user's config/model
+    # selection independent.
+    try:
+        from providers import get_provider_profile, provider_runtime_provider
+
+        profile = get_provider_profile(provider)
+    except Exception:
+        profile = None
+    if profile is not None and str(profile.backing_provider or "").strip():
+        backing = provider_runtime_provider(profile.name)
+        print(
+            f"{profile.display_name or profile.name} delegates authentication to "
+            f"{backing}; adding credentials to the backing provider instead."
+        )
+        redirected = SimpleNamespace(**vars(args))
+        redirected.provider = backing
+        auth_add_command(redirected)
+        return
+
     if provider not in PROVIDER_REGISTRY and provider != "openrouter" and not provider.startswith(CUSTOM_POOL_PREFIX):
         raise SystemExit(f"Unknown provider: {provider}")
 

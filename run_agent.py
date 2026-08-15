@@ -5385,7 +5385,14 @@ class AIAgent:
         return run_codex_create_stream_fallback(self, api_kwargs, client)
 
     def _try_refresh_codex_client_credentials(self, *, force: bool = True) -> bool:
-        if self.api_mode != "codex_responses" or self.provider not in {"openai-codex", "xai-oauth"}:
+        credential_provider = self.provider
+        try:
+            from providers import provider_runtime_provider
+
+            credential_provider = provider_runtime_provider(self.provider)
+        except Exception:
+            pass
+        if self.api_mode != "codex_responses" or credential_provider not in {"openai-codex", "xai-oauth"}:
             return False
 
         # Guard against silent account swap.
@@ -5401,7 +5408,7 @@ class AIAgent:
         # singleton-only fallback used when the pool can't recover, and
         # MUST only fire when the agent really is on singleton tokens.
         try:
-            if self.provider == "openai-codex":
+            if credential_provider == "openai-codex":
                 from hermes_cli.auth import resolve_codex_runtime_credentials
 
                 singleton_now = resolve_codex_runtime_credentials(
@@ -5429,7 +5436,7 @@ class AIAgent:
             return False
 
         try:
-            if self.provider == "openai-codex":
+            if credential_provider == "openai-codex":
                 from hermes_cli.auth import resolve_codex_runtime_credentials
 
                 old_key = str(self.api_key or "").strip()

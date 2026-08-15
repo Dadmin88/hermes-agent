@@ -1826,6 +1826,46 @@ def resolve_runtime_provider(
                 runtime["requested_provider"] = requested_provider
                 return runtime
 
+    # Composed providers retain their visible provider identity while borrowing
+    # transport/auth from a backing provider. Resolve this before the ordinary
+    # auth registry because delegated providers intentionally own no credential
+    # record of their own.
+    try:
+        from providers import (
+            get_provider_profile,
+            provider_backing_chain,
+            provider_model_catalog_provider,
+            provider_runtime_provider,
+        )
+
+        composed_profile = get_provider_profile(requested_provider)
+    except Exception:
+        composed_profile = None
+    if composed_profile is not None and str(composed_profile.backing_provider or "").strip():
+        # Validate cycles/depth before recursion. The first chain element is the
+        # visible provider; the second is the immediate runtime delegate.
+        chain = provider_backing_chain(composed_profile.name)
+        backing_provider = chain[1]
+        backing_runtime = resolve_runtime_provider(
+            requested=backing_provider,
+            explicit_api_key=explicit_api_key,
+            explicit_base_url=explicit_base_url,
+            target_model=target_model,
+        )
+        wrapped = dict(backing_runtime)
+        wrapped["provider"] = composed_profile.name
+        wrapped["backing_provider"] = backing_provider
+        wrapped["credential_provider"] = backing_runtime.get(
+            "credential_provider"
+        ) or provider_runtime_provider(backing_provider)
+        wrapped["model_provider"] = provider_model_catalog_provider(composed_profile.name)
+        wrapped["requested_provider"] = requested_provider
+        wrapped["source"] = (
+            f"composed:{composed_profile.name}->"
+            f"{backing_runtime.get('source', backing_provider)}"
+        )
+        return wrapped
+
     provider = resolve_provider(
         requested_provider,
         explicit_api_key=explicit_api_key,

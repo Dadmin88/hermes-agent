@@ -59,6 +59,32 @@ layer reads from it:
 See `plugins/model-providers/README.md` — drop a new directory there (or
 under `$HERMES_HOME/plugins/model-providers/` for a private plugin).
 
+### Composed / delegated providers
+
+A provider can keep its own Hermes-visible identity while delegating runtime
+and credentials to another provider:
+
+```python
+ProviderProfile(
+    name="company-gpt",
+    auth_type="delegated",
+    backing_provider="openai-codex",
+    model_catalog_provider="openai-codex",
+    default_model="gpt-5.6-sol",
+)
+```
+
+`backing_provider` supplies transport and credentials. `model_catalog_provider`
+supplies model discovery (and defaults to the backing provider when omitted).
+`default_model` lets the composed identity prefer a model without copying the
+backing provider's catalog. The provider registry validates backing chains,
+rejects cycles, and exposes helpers such as `provider_runtime_provider()` and
+`provider_model_catalog_provider()`.
+
+Delegated providers must not create duplicate credential stores. Authentication
+belongs to the terminal backing provider; the composed provider remains the
+provider recorded in config/session/status.
+
 ---
 
 ## Hooks you can override on `ProviderProfile`

@@ -287,6 +287,32 @@ class TestDelegateTask(unittest.TestCase):
             self.assertEqual(kwargs["provider"], parent.provider)
             self.assertEqual(kwargs["api_mode"], parent.api_mode)
 
+    def test_katana_child_inherits_visible_provider_and_codex_runtime(self):
+        parent = _make_mock_parent(depth=0)
+        parent.base_url = "https://chatgpt.com/backend-api/codex"
+        parent.api_key = "***"
+        parent.model = "gpt-5.6-sol"
+        parent.provider = "katana-gpt"
+        parent.api_mode = "codex_responses"
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Test Katana runtime inheritance", parent_agent=parent)
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["provider"], "katana-gpt")
+            self.assertEqual(kwargs["model"], "gpt-5.6-sol")
+            self.assertEqual(kwargs["base_url"], parent.base_url)
+            self.assertEqual(kwargs["api_key"], parent.api_key)
+            self.assertEqual(kwargs["api_mode"], "codex_responses")
+
     def test_nous_child_rederives_api_mode_from_model(self):
         """Portal is dual-wire — same provider + different model prefix must
         not inherit the parent's Messages/chat_completions mode verbatim."""

@@ -4710,11 +4710,20 @@ def run_conversation(
                 )
 
                 _provider = getattr(agent, "provider", "unknown")
+                _backing_provider = _provider
+                try:
+                    from providers import provider_runtime_provider
+
+                    _backing_provider = provider_runtime_provider(_provider)
+                except Exception:
+                    pass
                 _base = getattr(agent, "base_url", "unknown")
                 _model = getattr(agent, "model", "unknown")
                 _status_code_str = f" [HTTP {status_code}]" if status_code else ""
                 agent._buffer_vprint(f"⚠️  API call failed (attempt {retry_count}/{max_retries}): {error_type}{_status_code_str}")
                 agent._buffer_vprint(f"   🔌 Provider: {_provider}  Model: {_model}")
+                if _backing_provider != _provider:
+                    agent._buffer_vprint(f"   ↳ Backing provider: {_backing_provider}")
                 agent._buffer_vprint(f"   🌐 Endpoint: {_base}")
                 agent._buffer_vprint(f"   📝 Error: {_error_summary}")
                 if status_code and status_code < 500:
@@ -5668,29 +5677,31 @@ def run_conversation(
                         )
                     agent._vprint(f"{agent.log_prefix}❌ Non-retryable client error (HTTP {status_code}). Aborting.", force=True)
                     agent._vprint(f"{agent.log_prefix}   🔌 Provider: {_provider}  Model: {_model}", force=True)
+                    if _backing_provider != _provider:
+                        agent._vprint(f"{agent.log_prefix}   ↳ Backing provider: {_backing_provider}", force=True)
                     agent._vprint(f"{agent.log_prefix}   🌐 Endpoint: {_base}", force=True)
                     # Actionable guidance for common auth errors
                     if classified.is_auth or classified.reason == FailoverReason.billing:
                         if classified.reason == FailoverReason.billing and _print_billing_or_entitlement_guidance(
                             agent,
                             capability="model access",
-                            provider=_provider,
+                            provider=_backing_provider,
                             base_url=str(_base),
                             model=_model,
                         ):
                             pass
-                        elif _provider == "nous" and _print_nous_entitlement_guidance(
+                        elif _backing_provider == "nous" and _print_nous_entitlement_guidance(
                             agent,
                             "Nous model access",
                         ):
                             pass
-                        elif _provider in {"openai-codex", "xai-oauth", "nous"} and status_code == 401:
-                            if _provider == "openai-codex":
+                        elif _backing_provider in {"openai-codex", "xai-oauth", "nous"} and status_code == 401:
+                            if _backing_provider == "openai-codex":
                                 agent._vprint(f"{agent.log_prefix}   💡 Codex OAuth token was rejected (HTTP 401). Your token may have been", force=True)
                                 agent._vprint(f"{agent.log_prefix}      refreshed by another client (Codex CLI, VS Code). To fix:", force=True)
                                 agent._vprint(f"{agent.log_prefix}      1. Run `codex` in your terminal to generate fresh tokens.", force=True)
                                 agent._vprint(f"{agent.log_prefix}      2. Then run `hermes auth` to re-authenticate.", force=True)
-                            elif _provider == "xai-oauth":
+                            elif _backing_provider == "xai-oauth":
                                 agent._vprint(f"{agent.log_prefix}   💡 xAI OAuth token was rejected (HTTP 401). To fix:", force=True)
                                 agent._vprint(f"{agent.log_prefix}      re-authenticate with xAI Grok OAuth (SuperGrok / Premium+) from `hermes model`.", force=True)
                             else:  # nous

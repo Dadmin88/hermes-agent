@@ -525,6 +525,33 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
             source="hermes",
         )
 
+    # Provider-profile plugins are a third built-in source. For composed
+    # providers, inherit wire/auth endpoint metadata from the terminal backing
+    # provider while preserving the visible provider's identity.
+    try:
+        from providers import get_provider_profile, provider_runtime_provider
+
+        profile = get_provider_profile(canonical)
+        if profile is not None:
+            backing = provider_runtime_provider(profile.name)
+            if backing != profile.name:
+                backing_def = get_provider(backing)
+                if backing_def is not None:
+                    return ProviderDef(
+                        id=profile.name,
+                        name=profile.display_name or profile.name,
+                        transport=backing_def.transport,
+                        api_key_env_vars=backing_def.api_key_env_vars,
+                        base_url=backing_def.base_url,
+                        base_url_env_var=backing_def.base_url_env_var,
+                        is_aggregator=backing_def.is_aggregator,
+                        auth_type=profile.auth_type,
+                        doc=backing_def.doc,
+                        source="provider-profile",
+                    )
+    except Exception:
+        pass
+
     return None
 
 
@@ -536,10 +563,21 @@ def get_label(provider_id: str) -> str:
     if canonical in _LABEL_OVERRIDES:
         return _LABEL_OVERRIDES[canonical]
 
-    # Try models.dev
+    # Try models.dev / Hermes overlays
     pdef = get_provider(canonical)
     if pdef:
         return pdef.name
+
+    # Finally consult model-provider plugins so composed/local provider
+    # identities receive their declared display name everywhere.
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(canonical)
+        if profile is not None and profile.display_name:
+            return profile.display_name
+    except Exception:
+        pass
 
     return canonical
 

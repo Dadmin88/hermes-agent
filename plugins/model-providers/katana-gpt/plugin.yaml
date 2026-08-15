@@ -1,0 +1,5 @@
+name: katana-gpt-provider
+kind: model-provider
+version: 1.0.0
+description: Katana-GPT identity backed by OpenAI Codex OAuth and GPT-5.6
+author: Kyle French

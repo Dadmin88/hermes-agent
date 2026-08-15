@@ -68,3 +68,10 @@ quirks — see `plugins/model-providers/openrouter/__init__.py` for
 `build_extra_body` and `build_api_kwargs_extras` examples, and
 `plugins/model-providers/gemini/__init__.py` for `thinking_config`
 translation.
+
+A provider may also be *composed*: give it `auth_type="delegated"` plus a
+`backing_provider`. Hermes keeps the composed provider's visible identity while
+using the backing provider's runtime and credential pool. Set
+`model_catalog_provider` when model discovery should come from a different
+provider and `default_model` when the composed identity has a preferred model.
+See `katana-gpt/` for a complete example.

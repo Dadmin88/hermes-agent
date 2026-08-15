@@ -6532,7 +6532,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 pass
             return changed
 
-        if resolved_provider != "openai-codex":
+        try:
+            from providers import provider_model_catalog_provider
+
+            model_provider = provider_model_catalog_provider(resolved_provider)
+        except Exception:
+            model_provider = resolved_provider
+        if model_provider != "openai-codex":
             return changed
 
         # 1. Strip provider prefix ("openai/gpt-5.4" → "gpt-5.4")
@@ -6547,19 +6553,29 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             current_model = slug
             changed = True
 
-        # 2. Replace untouched default with a Codex model
+        # 2. Replace untouched default with the visible provider's preferred
+        # Codex-backed model, falling back to the live Codex catalog.
         if self._model_is_default:
             fallback_model = "gpt-5.3-codex"
             try:
-                from hermes_cli.codex_models import get_codex_model_ids
+                from hermes_cli.models import get_default_model_for_provider
 
-                available = get_codex_model_ids(
-                    access_token=self.api_key if self.api_key else None,
-                )
-                if available:
-                    fallback_model = available[0]
+                preferred = get_default_model_for_provider(resolved_provider)
+                if preferred:
+                    fallback_model = preferred
             except Exception:
                 pass
+            if fallback_model == "gpt-5.3-codex":
+                try:
+                    from hermes_cli.codex_models import get_codex_model_ids
+
+                    available = get_codex_model_ids(
+                        access_token=self.api_key if self.api_key else None,
+                    )
+                    if available:
+                        fallback_model = available[0]
+                except Exception:
+                    pass
 
             if current_model != fallback_model:
                 self.model = fallback_model

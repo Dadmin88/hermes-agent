@@ -787,6 +787,7 @@ from hermes_cli.model_setup_flows import (
     _model_flow_openrouter,
     _model_flow_nous,
     _model_flow_openai_codex,
+    _model_flow_delegated_provider,
     _model_flow_xai_oauth,
     _model_flow_qwen_oauth,
     _model_flow_minimax_oauth,
@@ -3103,6 +3104,21 @@ def _is_profile_api_key_provider(provider_id: str) -> bool:
         return False
 
 
+def _is_profile_delegated_provider(provider_id: str) -> bool:
+    """Return True for composed providers that delegate runtime/auth."""
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(provider_id)
+        return bool(
+            profile is not None
+            and str(profile.backing_provider or "").strip()
+            and profile.auth_type == "delegated"
+        )
+    except Exception:
+        return False
+
+
 def select_provider_and_model(args=None):
     """Core provider selection + model picking logic.
 
@@ -3490,6 +3506,8 @@ def select_provider_and_model(args=None):
         _model_flow_copilot_acp(config, current_model)
     elif selected_provider == "copilot":
         _model_flow_copilot(config, current_model)
+    elif _is_profile_delegated_provider(selected_provider):
+        _model_flow_delegated_provider(config, selected_provider, current_model)
     elif selected_provider == "custom":
         _model_flow_custom(config)
     elif (

@@ -97,6 +97,91 @@ def list_providers() -> list[ProviderProfile]:
     return list(result)
 
 
+def canonical_provider_name(name: str) -> str:
+    """Return a registered provider's canonical name, preserving unknown slugs."""
+    normalized = str(name or "").strip().lower()
+    if not normalized:
+        return normalized
+    profile = get_provider_profile(normalized)
+    profile_name = getattr(profile, "name", None) if profile is not None else None
+    return profile_name.strip() if isinstance(profile_name, str) and profile_name.strip() else normalized
+
+
+def provider_backing_chain(name: str, *, max_depth: int = 8) -> tuple[str, ...]:
+    """Return ``name`` followed by each composed backing provider.
+
+    Composition is deliberately bounded and cycle-safe so a malformed user
+    provider cannot recurse forever during auth/runtime resolution.
+    """
+    current = canonical_provider_name(name)
+    if not current:
+        return ()
+    chain: list[str] = []
+    seen: set[str] = set()
+    for _ in range(max_depth):
+        if current in seen:
+            cycle = " -> ".join([*chain, current])
+            raise ValueError(f"Provider backing cycle detected: {cycle}")
+        seen.add(current)
+        chain.append(current)
+        profile = get_provider_profile(current)
+        if profile is None:
+            return tuple(chain)
+        backing = getattr(profile, "backing_provider", "")
+        if not isinstance(backing, str) or not backing.strip():
+            return tuple(chain)
+        current = canonical_provider_name(backing)
+    raise ValueError(
+        f"Provider backing chain exceeds maximum depth ({max_depth}): "
+        + " -> ".join(chain)
+    )
+
+
+def provider_runtime_provider(name: str) -> str:
+    """Return the terminal provider that supplies runtime/credentials."""
+    chain = provider_backing_chain(name)
+    return chain[-1] if chain else str(name or "").strip().lower()
+
+
+def provider_model_catalog_provider(name: str, *, max_depth: int = 8) -> str:
+    """Return the terminal provider whose model catalog should be exposed.
+
+    A composed profile may explicitly delegate its catalog, or implicitly use
+    its backing provider. Follow either form transitively with the same bounded,
+    cycle-safe semantics as runtime delegation.
+    """
+    current = canonical_provider_name(name)
+    if not current:
+        return current
+    chain: list[str] = []
+    seen: set[str] = set()
+    for _ in range(max_depth):
+        if current in seen:
+            cycle = " -> ".join([*chain, current])
+            raise ValueError(f"Provider model-catalog cycle detected: {cycle}")
+        seen.add(current)
+        chain.append(current)
+        profile = get_provider_profile(current)
+        if profile is None:
+            return current
+        catalog = getattr(profile, "model_catalog_provider", "")
+        backing = getattr(profile, "backing_provider", "")
+        target = catalog if isinstance(catalog, str) and catalog.strip() else backing
+        if not isinstance(target, str) or not target.strip():
+            return current
+        current = canonical_provider_name(target)
+    raise ValueError(
+        f"Provider model-catalog chain exceeds maximum depth ({max_depth}): "
+        + " -> ".join(chain)
+    )
+
+
+def provider_uses_runtime(name: str, target: str) -> bool:
+    """Return True when ``target`` appears in ``name``'s runtime chain."""
+    wanted = canonical_provider_name(target)
+    return wanted in provider_backing_chain(name)
+
+
 def _user_plugins_dir() -> Path | None:
     """Return ``$HERMES_HOME/plugins/model-providers/`` if it exists."""
     try:

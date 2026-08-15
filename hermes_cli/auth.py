@@ -2118,6 +2118,17 @@ def resolve_provider(
         return "custom"
     if normalized in PROVIDER_REGISTRY:
         return normalized
+    # Composed/delegated provider profiles intentionally do not own an auth
+    # record. They remain valid visible providers and runtime resolution will
+    # borrow credentials/transport from their backing provider.
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(normalized)
+        if profile is not None and str(profile.backing_provider or "").strip():
+            return profile.name
+    except Exception:
+        pass
     if normalized != "auto":
         # Check for common config.yaml issues that cause this error
         _config_hint = _get_config_hint_for_unknown_provider(normalized)
@@ -7344,10 +7355,22 @@ def _update_config_for_provider(
     mismatched model/provider (e.g. ``anthropic/claude-opus-4.6`` sent to
     MiniMax's API).
     """
-    # Set active_provider in auth.json so auto-resolution picks this provider
+    # ``auth.json`` tracks the provider that actually owns credentials. A
+    # composed provider remains visible in config.yaml, but its backing provider
+    # stays active in the auth store so token refresh/auto-resolution continue
+    # to use the existing credential record.
+    auth_provider_id = provider_id
+    try:
+        from providers import get_provider_profile, provider_runtime_provider
+
+        profile = get_provider_profile(provider_id)
+        if profile is not None and str(profile.backing_provider or "").strip():
+            auth_provider_id = provider_runtime_provider(profile.name)
+    except Exception:
+        pass
     with _auth_store_lock():
         auth_store = _load_auth_store()
-        auth_store["active_provider"] = provider_id
+        auth_store["active_provider"] = auth_provider_id
         _save_auth_store(auth_store)
 
     # Update config.yaml model section

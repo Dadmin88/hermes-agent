@@ -53,8 +53,16 @@ class ProviderProfile:
     env_vars: tuple = ()
     base_url: str = ""
     models_url: str = ""  # explicit models endpoint; falls back to {base_url}/models
-    auth_type: str = "api_key"   # api_key|oauth_device_code|oauth_external|copilot|aws_sdk
+    auth_type: str = "api_key"   # api_key|oauth_device_code|oauth_external|delegated|copilot|aws_sdk
     supports_health_check: bool = True  # False → doctor skips /models probe for this provider
+
+    # ── Provider composition ──────────────────────────────────
+    # A composed provider keeps its own visible identity while delegating
+    # lower-level capabilities to another provider. Empty fields preserve the
+    # historical one-provider-does-everything behavior.
+    backing_provider: str = ""       # runtime/transport + credential source
+    model_catalog_provider: str = "" # model list source; falls back to backing_provider
+    default_model: str = ""          # preferred default for this visible provider
 
     # ── Vision support ────────────────────────────────────────
     # True when the provider's API accepts image content inside

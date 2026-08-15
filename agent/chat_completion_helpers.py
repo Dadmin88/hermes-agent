@@ -1390,6 +1390,17 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         )
         is_xai_responses = agent.provider in {"xai", "xai-oauth"} or agent._base_url_hostname == "api.x.ai"
         _msgs_for_codex = agent._prepare_messages_for_non_vision_model(api_messages)
+        # The chat-completions transport already runs ProviderProfile message
+        # hooks. Mirror that behavior for Responses so composed identities such
+        # as Katana-GPT can transform the real outbound system instructions.
+        try:
+            from providers import get_provider_profile
+
+            _response_profile = get_provider_profile(agent.provider)
+        except Exception:
+            _response_profile = None
+        if _response_profile is not None:
+            _msgs_for_codex = _response_profile.prepare_messages(_msgs_for_codex)
 
         # Native server-side compaction (gpt-5.6 on direct OpenAI API /
         # ChatGPT Codex routes only) — None on every other route/model, in

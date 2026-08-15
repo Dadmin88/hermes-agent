@@ -620,8 +620,14 @@ def _model_flow_nous(config, current_model="", args=None):
     else:
         print("No change.")
 
-def _model_flow_openai_codex(config, current_model=""):
-    """OpenAI Codex provider: ensure logged in, then pick model."""
+def _model_flow_openai_codex(
+    config,
+    current_model="",
+    *,
+    visible_provider: str = "openai-codex",
+    visible_label: str = "OpenAI Codex",
+):
+    """Use OpenAI Codex OAuth/catalog for a visible provider selection."""
     from hermes_cli.auth import (
         get_codex_auth_status,
         _prompt_model_selection,
@@ -631,13 +637,18 @@ def _model_flow_openai_codex(config, current_model=""):
         PROVIDER_REGISTRY,
         DEFAULT_CODEX_BASE_URL,
     )
-    from hermes_cli.codex_models import get_codex_model_ids
+    from hermes_cli.models import provider_model_ids
 
     status = get_codex_auth_status()
     if status.get("logged_in"):
-        print("  OpenAI Codex credentials: ✓")
+        credential_label = (
+            "OpenAI Codex"
+            if visible_provider == "openai-codex"
+            else f"{visible_label} backing OpenAI Codex"
+        )
+        print(f"  {credential_label} credentials: ✓")
         print()
-        choice = _prompt_auth_credentials_choice("OpenAI Codex credentials:")
+        choice = _prompt_auth_credentials_choice(f"{credential_label} credentials:")
 
         if choice == "reauth":
             print("Starting a fresh OpenAI Codex login...")
@@ -692,21 +703,47 @@ def _model_flow_openai_codex(config, current_model=""):
         except Exception:
             pass
 
-    codex_models = get_codex_model_ids(access_token=_codex_token)
+    codex_models = provider_model_ids(visible_provider, force_refresh=True)
 
     selected = _prompt_model_selection(
         codex_models,
         current_model=current_model,
-        confirm_provider="openai-codex",
+        confirm_provider=visible_provider,
         confirm_base_url=DEFAULT_CODEX_BASE_URL,
         confirm_api_key=_codex_token or "",
     )
     if selected:
         _save_model_choice(selected)
-        _update_config_for_provider("openai-codex", DEFAULT_CODEX_BASE_URL)
-        print(f"Default model set to: {selected} (via OpenAI Codex)")
+        _update_config_for_provider(visible_provider, DEFAULT_CODEX_BASE_URL)
+        print(f"Default model set to: {selected} (via {visible_label})")
     else:
         print("No change.")
+
+
+def _model_flow_delegated_provider(config, provider_id: str, current_model=""):
+    """Select a composed provider while reusing its backing provider's auth flow."""
+    from providers import get_provider_profile, provider_runtime_provider
+
+    profile = get_provider_profile(provider_id)
+    if profile is None or not str(profile.backing_provider or "").strip():
+        print(f"Provider '{provider_id}' is not a composed provider. No change.")
+        return
+
+    backing = provider_runtime_provider(profile.name)
+    if backing == "openai-codex":
+        _model_flow_openai_codex(
+            config,
+            current_model,
+            visible_provider=profile.name,
+            visible_label=profile.display_name or profile.name,
+        )
+        return
+
+    print(
+        f"Provider '{profile.name}' delegates to unsupported picker backing provider "
+        f"'{backing}'. No change."
+    )
+
 
 def _model_flow_xai_oauth(_config, current_model="", *, args=None):
     """xAI Grok OAuth (SuperGrok / Premium+) provider: ensure logged in, then pick model."""

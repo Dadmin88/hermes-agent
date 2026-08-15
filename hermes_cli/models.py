@@ -1445,20 +1445,21 @@ def get_default_model_for_provider(provider: str) -> str:
     """Return a cost-safe default model for a provider, or "" if unknown.
 
     Used as a NON-INTERACTIVE fallback when a provider is configured but no
-    model was ever selected (e.g. ``hermes auth add openai-codex`` without
-    ``hermes model``, or a profile that sets ``provider`` with no ``model``).
-
-    For most providers this is the first entry in ``_PROVIDER_MODELS`` — the
-    same model the ``hermes model`` picker offers first. For metered aggregators
-    whose curated list is ordered most-capable-first, that entry is also the
-    most EXPENSIVE one, so silently defaulting to it is a billing footgun.
-    Those providers (``_SILENT_DEFAULT_PROVIDERS``) resolve through the
-    catalog-labeled default instead; a missing model must never auto-escalate
-    to the flagship.
+    model was ever selected. Composed providers may declare a provider-specific
+    preferred default while reusing another provider's catalog. Otherwise the
+    backing/catalog provider's normal cost-safety rules remain authoritative.
     """
-    models = _PROVIDER_MODELS.get(provider, [])
-    if provider in _SILENT_DEFAULT_PROVIDERS:
-        preferred = get_preferred_silent_default_model(provider)
+    normalized = normalize_provider(provider)
+    from providers import get_provider_profile, provider_model_catalog_provider
+
+    profile = get_provider_profile(normalized)
+    if profile is not None and str(profile.default_model or "").strip():
+        return str(profile.default_model).strip()
+
+    catalog_provider = provider_model_catalog_provider(normalized)
+    models = _PROVIDER_MODELS.get(catalog_provider, [])
+    if catalog_provider in _SILENT_DEFAULT_PROVIDERS:
+        preferred = get_preferred_silent_default_model(catalog_provider)
         # Trust the preferred default even when the provider has no static
         # catalog (OpenRouter's picker list is fetched live; its curated
         # snapshot carries the default).
@@ -2807,7 +2808,17 @@ def normalize_provider(provider: Optional[str]) -> str:
     provider based on credentials and environment.
     """
     normalized = (provider or "openrouter").strip().lower()
-    return _PROVIDER_ALIASES.get(normalized, normalized)
+    normalized = _PROVIDER_ALIASES.get(normalized, normalized)
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(normalized)
+        profile_name = getattr(profile, "name", None) if profile is not None else None
+        if isinstance(profile_name, str) and profile_name.strip():
+            return profile_name.strip()
+    except Exception:
+        pass
+    return normalized
 
 
 def provider_label(provider: Optional[str]) -> str:
@@ -3093,12 +3104,22 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
     """Return the best known model catalog for a provider.
 
     Tries live API endpoints for providers that support them (Codex, Nous),
-    falling back to static lists. For providers in ``_MODELS_DEV_PREFERRED``
-    (opencode-go/zen, xiaomi, deepseek, smaller inference providers, etc.),
-    models.dev entries are merged on top of curated so new models released
-    on the platform appear in ``/model`` without a Hermes release.
+    falling back to static lists. Composed providers delegate model discovery
+    to their declared catalog provider while retaining their own preferred
+    default ordering.
     """
     normalized = normalize_provider(provider)
+    from providers import provider_model_catalog_provider
+
+    catalog_provider = provider_model_catalog_provider(normalized)
+    if catalog_provider != normalized:
+        delegated = provider_model_ids(catalog_provider, force_refresh=force_refresh)
+        preferred = get_default_model_for_provider(normalized)
+        if preferred and preferred in delegated:
+            return [preferred, *[model_id for model_id in delegated if model_id != preferred]]
+        if preferred:
+            return [preferred, *delegated]
+        return delegated
     if normalized == "openrouter":
         return model_ids(force_refresh=force_refresh)
     if normalized == "openai-codex":

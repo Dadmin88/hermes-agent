@@ -2590,24 +2590,43 @@ def list_authenticated_providers(
         if _cp.slug.lower() in _excluded:
             continue
 
-        # Check credentials via PROVIDER_REGISTRY (auth.py)
+        # Check credentials via PROVIDER_REGISTRY (auth.py). Composed providers
+        # own no credentials, so probe the terminal backing provider too.
         _cp_config = _auth_registry.get(_cp.slug)
         _cp_has_creds = False
+        _cp_backing_slug = ""
+        try:
+            from providers import get_provider_profile, provider_runtime_provider
+
+            _cp_profile = get_provider_profile(_cp.slug)
+            if _cp_profile is not None and str(_cp_profile.backing_provider or "").strip():
+                _cp_backing_slug = provider_runtime_provider(_cp_profile.name)
+        except Exception:
+            _cp_backing_slug = ""
         if _cp_config and _cp_config.api_key_env_vars:
             _cp_has_creds = any(os.environ.get(ev) for ev in _cp_config.api_key_env_vars)
-        # Also check auth store and credential pool
+        if not _cp_has_creds and _cp_backing_slug:
+            _cp_backing_config = _auth_registry.get(_cp_backing_slug)
+            if _cp_backing_config and _cp_backing_config.api_key_env_vars:
+                _cp_has_creds = any(
+                    os.environ.get(ev) for ev in _cp_backing_config.api_key_env_vars
+                )
+        # Also check auth store and credential pool.
         if not _cp_has_creds:
             try:
                 from hermes_cli.auth import _load_auth_store
                 _cp_store = _load_auth_store()
                 _cp_providers_store = _cp_store.get("providers", {})
-                if _cp_store and _cp.slug in _cp_providers_store:
+                if _cp_store and (
+                    _cp.slug in _cp_providers_store
+                    or (_cp_backing_slug and _cp_backing_slug in _cp_providers_store)
+                ):
                     _cp_has_creds = True
             except Exception:
                 pass
         if not _cp_has_creds:
             try:
-                if _credential_pool_is_usable(_cp.slug):
+                if _credential_pool_is_usable(_cp_backing_slug or _cp.slug):
                     _cp_has_creds = True
             except Exception:
                 pass

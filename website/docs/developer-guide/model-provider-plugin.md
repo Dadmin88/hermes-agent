@@ -98,7 +98,10 @@ Full definition in `providers/base.py`. The most useful ones:
 | `env_vars` | `tuple[str, ...]` | API-key env vars in priority order; a final `*_BASE_URL` entry is used as the user base-URL override |
 | `base_url` | str | Default inference endpoint |
 | `models_url` | str | Explicit catalog URL (falls back to `{base_url}/models`) |
-| `auth_type` | str | `api_key` \| `oauth_device_code` \| `oauth_external` \| `copilot` \| `aws_sdk` \| `external_process` |
+| `auth_type` | str | `api_key` \| `oauth_device_code` \| `oauth_external` \| `delegated` \| `copilot` \| `aws_sdk` \| `external_process` |
+| `backing_provider` | str | For composed providers, provider that owns runtime transport and credentials |
+| `model_catalog_provider` | str | Provider whose model catalog is reused; falls back to `backing_provider` |
+| `default_model` | str | Preferred default model for this visible provider identity |
 | `fallback_models` | `tuple[str, ...]` | Curated list shown when live catalog fetch fails |
 | `default_headers` | `dict[str, str]` | Sent on every request (e.g. Copilot's `Editor-Version`) |
 | `fixed_temperature` | Any | `None` = use caller's value; `OMIT_TEMPERATURE` sentinel = don't send temperature at all (Kimi) |
@@ -189,6 +192,30 @@ Four values are recognized. Hermes picks one based on:
 
 Set `profile.api_mode` to match the default your provider ships — it acts as a hint. User URL overrides still win.
 
+## Composed providers
+
+A composed provider keeps its own Hermes-visible identity while delegating lower-level runtime concerns to another provider. This is useful for branded/persona providers, organization policy layers, or orchestration identities that should reuse an existing credential family and transport.
+
+```python
+from providers import register_provider
+from providers.base import ProviderProfile
+
+register_provider(ProviderProfile(
+    name="company-gpt",
+    display_name="Company GPT",
+    auth_type="delegated",
+    backing_provider="openai-codex",
+    model_catalog_provider="openai-codex",
+    default_model="gpt-5.6-sol",
+))
+```
+
+Hermes keeps `provider=company-gpt` in config, sessions, status, and routing, but resolves credentials and transport through `openai-codex`. Model discovery comes from `model_catalog_provider`, and the composed provider can promote its own `default_model` without copying the backing catalog.
+
+Backing and model-catalog chains are bounded and cycle-checked. A composed provider must not create a duplicate credential store: authentication belongs to the terminal backing provider. Provider `prepare_messages()` hooks also run on the Codex Responses path, so an identity/policy layer can augment the actual Responses `instructions` without replacing Hermes runtime policy.
+
+Use `provider_runtime_provider()`, `provider_model_catalog_provider()`, and `provider_uses_runtime()` from `providers` when code needs backing semantics. Do not scatter provider-specific aliases through transports or auth logic.
+
 ## Auth types
 
 | `auth_type` | Meaning | Who uses it |
@@ -196,6 +223,7 @@ Set `profile.api_mode` to match the default your provider ships — it acts as a
 | `api_key` | Single env var carries a static API key | Most providers |
 | `oauth_device_code` | Device-code OAuth flow | — |
 | `oauth_external` | User signs in elsewhere, tokens land in `auth.json` | Anthropic OAuth, MiniMax OAuth, Qwen Portal, Nous Portal |
+| `delegated` | Visible provider reuses another provider's auth/runtime; owns no credentials | Composed providers such as Katana-GPT |
 | `copilot` | GitHub Copilot token refresh cycle | `copilot` plugin only |
 | `aws_sdk` | AWS SDK credential chain (IAM role, profile, env) | `bedrock` plugin only |
 | `external_process` | Auth handled by a subprocess the agent spawns | `copilot-acp` plugin only |
