@@ -1961,6 +1961,28 @@ def _current_max_iterations() -> int:
         return 500
 
 
+def _max_iterations_from_config(user_config: object) -> int:
+    """Return the request/profile-scoped iteration budget when available.
+
+    Multiplexed gateway turns already load ``user_config`` inside the selected
+    profile runtime scope. Reading the process-global HERMES_MAX_ITERATIONS at
+    that point can therefore pick up another/default profile's budget. Prefer
+    the resolved request config and retain the historical env-backed resolver
+    only as a compatibility fallback for callers without a usable config.
+    """
+    if isinstance(user_config, dict):
+        agent_config = user_config.get("agent")
+        if isinstance(agent_config, dict):
+            max_turns = agent_config.get("max_turns")
+            if (
+                isinstance(max_turns, int)
+                and not isinstance(max_turns, bool)
+                and max_turns > 0
+            ):
+                return max_turns
+    return _current_max_iterations()
+
+
 from contextlib import contextmanager as _contextmanager
 
 
@@ -4969,7 +4991,7 @@ class TurnRunner:
         if cfg_channel_prompt:
             combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
 
-        max_iterations = _current_max_iterations()
+        max_iterations = _max_iterations_from_config(ctx.user_config)
 
         try:
             model, runtime_kwargs = self._runner._resolve_session_agent_runtime(
@@ -21129,7 +21151,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
             pr = self._provider_routing
-            max_iterations = _current_max_iterations()
+            max_iterations = _max_iterations_from_config(user_config)
             reasoning_config = self._resolve_session_reasoning_config(
                 source=source, model=model
             )
