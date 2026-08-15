@@ -377,6 +377,106 @@ class TestRunEvents:
         assert status["last_tool_error"] is False
 
     @pytest.mark.asyncio
+    async def test_foreground_terminal_records_actual_command_exit(self, adapter):
+        run_id = "run_command_foreground"
+        adapter._run_streams[run_id] = asyncio.Queue()
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "running",
+            "tool_calls": 0,
+            "tool_errors": 0,
+            "last_tool_error": None,
+            "command_calls": 0,
+            "command_errors": 0,
+            "last_command_error": None,
+            "pending_processes": 0,
+            "command_evidence_invalid": False,
+        }
+        adapter._run_pending_processes[run_id] = set()
+        callback = adapter._make_run_event_callback(
+            run_id, asyncio.get_running_loop()
+        )
+
+        callback(
+            "tool.completed",
+            "terminal",
+            None,
+            {"command": "false", "background": False},
+            duration=0.1,
+            is_error=False,
+            result=json.dumps({"output": "", "exit_code": 1, "error": None}),
+        )
+        await asyncio.sleep(0)
+
+        status = adapter._run_statuses[run_id]
+        assert status["command_calls"] == 1
+        assert status["command_errors"] == 1
+        assert status["last_command_error"] is True
+        assert status["pending_processes"] == 0
+        assert status["command_evidence_invalid"] is False
+
+    @pytest.mark.asyncio
+    async def test_background_terminal_requires_process_exit_evidence(self, adapter):
+        run_id = "run_command_background"
+        adapter._run_streams[run_id] = asyncio.Queue()
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "running",
+            "tool_calls": 0,
+            "tool_errors": 0,
+            "last_tool_error": None,
+            "command_calls": 0,
+            "command_errors": 0,
+            "last_command_error": None,
+            "pending_processes": 0,
+            "command_evidence_invalid": False,
+        }
+        adapter._run_pending_processes[run_id] = set()
+        callback = adapter._make_run_event_callback(
+            run_id, asyncio.get_running_loop()
+        )
+
+        callback(
+            "tool.completed",
+            "terminal",
+            None,
+            {"command": "false", "background": True},
+            duration=0.01,
+            is_error=False,
+            result=json.dumps(
+                {
+                    "output": "Background process started",
+                    "session_id": "proc-1",
+                    "exit_code": 0,
+                    "error": None,
+                }
+            ),
+        )
+        status = adapter._run_statuses[run_id]
+        assert status["command_calls"] == 0
+        assert status["pending_processes"] == 1
+
+        callback(
+            "tool.completed",
+            "process",
+            None,
+            {"action": "wait", "session_id": "proc-1"},
+            duration=0.01,
+            is_error=False,
+            result=json.dumps({"status": "exited", "exit_code": 1}),
+        )
+        await asyncio.sleep(0)
+
+        status = adapter._run_statuses[run_id]
+        assert status["command_calls"] == 1
+        assert status["command_errors"] == 1
+        assert status["last_command_error"] is True
+        assert status["pending_processes"] == 0
+        assert status["command_evidence_invalid"] is False
+
+    @pytest.mark.asyncio
     async def test_approval_resolve_all_is_scoped_to_target_run(self, auth_adapter):
         """Same client session_id must not let one run approve another run's queue."""
         app = _create_runs_app(auth_adapter)
@@ -856,10 +956,63 @@ class TestFinalizeRun:
             "tool_calls": 2,
             "tool_errors": 1,
             "last_tool_error": False,
+            "command_calls": 0,
+            "command_errors": 0,
+            "last_command_error": None,
+            "pending_processes": 0,
+            "command_evidence_invalid": False,
         }
         assert adapter._run_statuses[run_id]["quiescent"] is True
         assert adapter._run_statuses[run_id]["last_event"] == "run.finalized"
         release.assert_called_once_with("fleet-execution")
+
+    @pytest.mark.asyncio
+    async def test_finalize_resolves_unawaited_background_process(self, adapter):
+        from tools.process_registry import process_registry
+
+        run_id = "run_final_background"
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "completed",
+            "quiescent": False,
+            "tool_calls": 1,
+            "tool_errors": 0,
+            "last_tool_error": False,
+            "command_calls": 0,
+            "command_errors": 0,
+            "last_command_error": None,
+            "pending_processes": 1,
+            "command_evidence_invalid": False,
+        }
+        adapter._run_profiles[run_id] = "fleet-execution"
+        adapter._run_pending_processes[run_id] = {"proc-auto"}
+
+        with (
+            patch.object(
+                process_registry,
+                "poll",
+                return_value={"status": "exited", "exit_code": 1},
+            ) as poll,
+            patch.object(
+                adapter,
+                "_release_profile_runtime",
+                return_value={
+                    "session_db_released": True,
+                    "log_handlers_released": 0,
+                },
+            ),
+        ):
+            response = await self._finalize(adapter, run_id)
+
+        assert response.status == 200
+        payload = json.loads(response.text)
+        assert payload["command_calls"] == 1
+        assert payload["command_errors"] == 1
+        assert payload["last_command_error"] is True
+        assert payload["pending_processes"] == 0
+        assert payload["command_evidence_invalid"] is False
+        poll.assert_called_once_with("proc-auto")
 
     @pytest.mark.asyncio
     async def test_finalize_is_idempotent(self, adapter):
