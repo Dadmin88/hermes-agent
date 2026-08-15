@@ -10,6 +10,7 @@ Covers:
 """
 
 import asyncio
+import json
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -21,6 +22,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
+    _api_request_profile,
     _approval_event_choices,
     cors_middleware,
     security_headers_middleware,
@@ -71,6 +73,7 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
     app.router.add_post("/v1/runs/{run_id}/steer", adapter._handle_steer_run)
+    app.router.add_post("/v1/runs/{run_id}/finalize", adapter._handle_finalize_run)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
     return app
 
@@ -636,6 +639,131 @@ class TestRunLifecycleSweep:
 # ---------------------------------------------------------------------------
 # POST /v1/runs/{run_id}/stop — interrupt a running agent
 # ---------------------------------------------------------------------------
+
+
+class TestFinalizeRun:
+    @staticmethod
+    def _request(run_id: str):
+        request = MagicMock()
+        request.match_info = {"run_id": run_id}
+        return request
+
+    async def _finalize(self, adapter, run_id: str, profile: str = "fleet-execution"):
+        token = _api_request_profile.set(profile)
+        try:
+            with patch.object(adapter, "_check_auth", return_value=None):
+                return await adapter._handle_finalize_run(self._request(run_id))
+        finally:
+            _api_request_profile.reset(token)
+
+    @pytest.mark.asyncio
+    async def test_terminal_multiplex_run_finalizes_profile_runtime(self, adapter):
+        run_id = "run_final"
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "completed",
+            "quiescent": False,
+        }
+        adapter._run_profiles[run_id] = "fleet-execution"
+
+        with patch.object(
+            adapter,
+            "_release_profile_runtime",
+            return_value={"session_db_released": True, "log_handlers_released": 2},
+        ) as release:
+            response = await self._finalize(adapter, run_id)
+
+        assert response.status == 200
+        payload = json.loads(response.text)
+        assert payload == {
+            "object": "hermes.run.finalization",
+            "run_id": run_id,
+            "status": "completed",
+            "quiescent": True,
+            "session_db_released": True,
+            "log_handlers_released": 2,
+        }
+        assert adapter._run_statuses[run_id]["quiescent"] is True
+        assert adapter._run_statuses[run_id]["last_event"] == "run.finalized"
+        release.assert_called_once_with("fleet-execution")
+
+    @pytest.mark.asyncio
+    async def test_finalize_is_idempotent(self, adapter):
+        run_id = "run_final_idempotent"
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "completed",
+            "quiescent": False,
+        }
+        adapter._run_profiles[run_id] = "fleet-execution"
+        with patch.object(
+            adapter,
+            "_release_profile_runtime",
+            return_value={"session_db_released": True, "log_handlers_released": 2},
+        ) as release:
+            first = await self._finalize(adapter, run_id)
+            second = await self._finalize(adapter, run_id)
+
+        assert first.status == second.status == 200
+        assert json.loads(second.text)["quiescent"] is True
+        release.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_finalize_rejects_unknown_and_nonterminal_runs(self, adapter):
+        unknown = await self._finalize(adapter, "run_missing")
+        assert unknown.status == 404
+
+        run_id = "run_active"
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "running",
+            "quiescent": False,
+        }
+        adapter._run_profiles[run_id] = "fleet-execution"
+        nonterminal = await self._finalize(adapter, run_id)
+        assert nonterminal.status == 409
+        assert json.loads(nonterminal.text)["error"]["code"] == "run_not_terminal"
+
+    @pytest.mark.asyncio
+    async def test_finalize_rejects_wrong_profile(self, adapter):
+        run_id = "run_wrong_profile"
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "completed",
+            "quiescent": False,
+        }
+        adapter._run_profiles[run_id] = "fleet-execution"
+        response = await self._finalize(adapter, run_id, profile="other-profile")
+        assert response.status == 409
+        assert json.loads(response.text)["error"]["code"] == "run_profile_mismatch"
+
+    @pytest.mark.asyncio
+    async def test_finalize_rejects_while_same_profile_run_is_active(self, adapter):
+        run_id = "run_done"
+        other_id = "run_other"
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "completed",
+            "quiescent": False,
+        }
+        adapter._run_profiles[run_id] = "fleet-execution"
+        adapter._run_profiles[other_id] = "fleet-execution"
+        other_task = asyncio.create_task(asyncio.sleep(10))
+        adapter._active_run_tasks[other_id] = other_task
+        try:
+            response = await self._finalize(adapter, run_id)
+        finally:
+            other_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await other_task
+
+        assert response.status == 409
+        assert json.loads(response.text)["error"]["code"] == "run_profile_busy"
 
 
 class TestStopRun:
