@@ -36,6 +36,33 @@ class TestHermesApiServerToolset:
 
 class TestApiServerPlatformConfig:
 
+    def test_fleet_terminal_toolset_contains_terminal_without_process(self):
+        from model_tools import get_tool_definitions
+        from tools.registry import discover_builtin_tools
+
+        discover_builtin_tools()
+        assert set(resolve_toolset("fleet-terminal")) == {"terminal"}
+
+        definitions = get_tool_definitions(
+            enabled_toolsets=["fleet-terminal"],
+            quiet_mode=True,
+        )
+        names = {item["function"]["name"] for item in definitions}
+        assert "terminal" in names
+        assert "process" not in names
+
+    def test_api_server_preserves_explicit_fleet_terminal_toolset(self):
+        from hermes_cli.tools_config import _get_platform_tools
+
+        config = {"platform_toolsets": {"api_server": ["fleet-terminal"]}}
+        enabled = _get_platform_tools(
+            config,
+            "api_server",
+            include_default_mcp_servers=False,
+        )
+
+        assert "fleet-terminal" in enabled
+
     def test_default_api_server_includes_terminal_toolset(self):
         """Regression #49622: desktop-only read_terminal is registered into the
         'terminal' toolset (ships in-repo), so resolve_toolset('terminal') grows
