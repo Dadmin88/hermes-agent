@@ -151,6 +151,21 @@ class TestStartRun:
                 assert status["object"] == "hermes.run"
 
     @pytest.mark.asyncio
+    async def test_start_rejects_invalid_approval_budget(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/runs",
+                json={"input": "hello", "approval_budget": 0},
+            )
+            data = await resp.json()
+
+        assert resp.status == 400
+        assert data["error"]["code"] == "invalid_approval_budget"
+        assert adapter._run_streams == {}
+        assert adapter._run_approval_budgets == {}
+
+    @pytest.mark.asyncio
     async def test_start_binds_chat_id_for_delegation_wake_target(self, adapter):
         """/v1/runs must bind the raw session id as the api_server chat_id
         (like every other agent-entry route does via _run_agent): the async
@@ -406,6 +421,134 @@ class TestRunEvents:
                     approval_mod._gateway_queues.pop(victim_run, None)
                 victim_interrupted.set()
                 attacker_interrupted.set()
+
+
+@pytest.mark.asyncio
+async def test_bounded_run_rejects_persistent_and_bulk_approval(auth_adapter):
+    app = _create_runs_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        with patch.object(auth_adapter, "_create_agent") as mock_create:
+            agent, ready, interrupted = _make_slow_agent()
+            mock_create.return_value = agent
+            resp = await cli.post(
+                "/v1/runs",
+                json={"input": "bounded", "approval_budget": 1},
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert resp.status == 202
+            run_id = (await resp.json())["run_id"]
+            ready.wait(timeout=3.0)
+
+            entry = approval_mod._ApprovalEntry({
+                "command": "bash -c bounded-danger",
+                "description": "bounded approval",
+                "pattern_keys": ["shell-c"],
+            })
+            with approval_mod._lock:
+                approval_mod._gateway_queues[run_id] = [entry]
+
+            persistent = await cli.post(
+                f"/v1/runs/{run_id}/approval",
+                json={"choice": "session"},
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert persistent.status == 400
+            assert (await persistent.json())["error"]["code"] == (
+                "bounded_approval_choice_required"
+            )
+
+            bulk = await cli.post(
+                f"/v1/runs/{run_id}/approval",
+                json={"choice": "once", "resolve_all": True},
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert bulk.status == 400
+            assert (await bulk.json())["error"]["code"] == (
+                "bounded_approval_bulk_forbidden"
+            )
+            assert entry.result is None
+            assert not entry.event.is_set()
+
+            with approval_mod._lock:
+                approval_mod._gateway_queues.pop(run_id, None)
+            interrupted.set()
+
+
+@pytest.mark.asyncio
+async def test_approval_budget_auto_denies_request_over_limit(adapter):
+    app = _create_runs_app(adapter)
+    decisions = []
+
+    def _approval_run(user_message=None, conversation_history=None, task_id=None):
+        del user_message, conversation_history
+        with approval_mod._lock:
+            notify = approval_mod._gateway_notify_cbs[task_id]
+        for index in (1, 2):
+            decision = approval_mod._await_gateway_decision(
+                task_id,
+                notify,
+                {
+                    "command": f"bash -c bounded-{index}",
+                    "description": f"bounded approval {index}",
+                    "pattern_key": "shell-c",
+                    "pattern_keys": ["shell-c"],
+                    "allow_permanent": True,
+                    "allow_session": True,
+                },
+            )
+            decisions.append(decision)
+        return {"final_response": "bounded done"}
+
+    async with TestClient(TestServer(app)) as cli:
+        with patch.object(adapter, "_create_agent") as mock_create:
+            agent = MagicMock()
+            agent.run_conversation.side_effect = _approval_run
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            mock_create.return_value = agent
+
+            resp = await cli.post(
+                "/v1/runs",
+                json={"input": "bounded", "approval_budget": 1},
+            )
+            assert resp.status == 202
+            run_id = (await resp.json())["run_id"]
+
+            for _ in range(100):
+                status_resp = await cli.get(f"/v1/runs/{run_id}")
+                status = await status_resp.json()
+                if status["status"] == "waiting_for_approval":
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("first bounded approval did not become pending")
+
+            assert status["approval_budget"] == 1
+            assert status["approval_count"] == 1
+            approval = await cli.post(
+                f"/v1/runs/{run_id}/approval",
+                json={"choice": "once"},
+            )
+            assert approval.status == 200
+
+            for _ in range(100):
+                status_resp = await cli.get(f"/v1/runs/{run_id}")
+                status = await status_resp.json()
+                if status["status"] == "completed":
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("bounded run did not complete")
+
+    assert decisions[0]["choice"] == "once"
+    assert decisions[0]["resolved"] is True
+    assert decisions[1]["choice"] == "deny"
+    assert decisions[1]["resolved"] is True
+    assert decisions[1]["reason"] == "Run approval budget exhausted"
+    assert status["approval_budget"] == 1
+    assert status["approval_count"] == 2
+    assert status["approval_budget_exhausted"] is True
 
 
 # ---------------------------------------------------------------------------

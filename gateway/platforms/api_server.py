@@ -1441,6 +1441,12 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        # Optional run-scoped approval budgets. Fleet supplies a finite ceiling
+        # so a looping model cannot turn repeated `once` approvals into
+        # effectively unbounded authority until the wall-clock deadline.
+        self._run_approval_budgets: Dict[str, int] = {}
+        self._run_approval_counts: Dict[str, int] = {}
+        self._run_approval_budget_lock = threading.Lock()
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         # Last-known-good resolved model per session (keyed by gateway_session_key
         # ONLY — never session_id, which rotates/is ephemeral for one-off API
@@ -3170,6 +3176,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": True,
                 "run_steer": True,
                 "run_finalize": True,
+                "run_approval_budget": True,
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
@@ -6619,6 +6626,18 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
 
+        approval_budget = body.get("approval_budget")
+        if approval_budget is not None and (
+            type(approval_budget) is not int or not 1 <= approval_budget <= 32
+        ):
+            return web.json_response(
+                _openai_error(
+                    "'approval_budget' must be an integer between 1 and 32",
+                    code="invalid_approval_budget",
+                ),
+                status=400,
+            )
+
         raw_input = body.get("input")
         if not raw_input:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
@@ -6702,6 +6721,10 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_streams[run_id] = q
         self._run_streams_created[run_id] = created_at
         self._run_approval_sessions[run_id] = approval_session_key
+        if approval_budget is not None:
+            with self._run_approval_budget_lock:
+                self._run_approval_budgets[run_id] = approval_budget
+                self._run_approval_counts[run_id] = 0
 
         event_cb = self._make_run_event_callback(run_id, loop)
 
@@ -6733,6 +6756,8 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id=session_id,
             model=body.get("model", self._model_name),
             quiescent=False,
+            approval_budget=approval_budget,
+            approval_count=0 if approval_budget is not None else None,
         )
 
         # Background task outlives the HTTP response (and thus the middleware
@@ -6779,19 +6804,65 @@ class APIServerAdapter(BasePlatformAdapter):
                         from gateway.run import _redact_approval_command
 
                         event["command"] = _redact_approval_command(event.get("command"))
+                    with self._run_approval_budget_lock:
+                        budget = self._run_approval_budgets.get(run_id)
+                        approval_count = self._run_approval_counts.get(run_id, 0) + 1
+                        if budget is not None:
+                            self._run_approval_counts[run_id] = approval_count
+
+                    if budget is not None and approval_count > budget:
+                        from tools.approval import resolve_gateway_approval
+
+                        resolved = resolve_gateway_approval(
+                            approval_session_key,
+                            "deny",
+                            reason="Run approval budget exhausted",
+                        )
+                        denied_event = {
+                            **event,
+                            "event": "approval.denied",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "reason": "approval_budget_exhausted",
+                            "approval_budget": budget,
+                            "approval_count": approval_count,
+                            "resolved": resolved,
+                        }
+                        self._set_run_status(
+                            run_id,
+                            "running",
+                            last_event="approval.denied",
+                            approval_budget=budget,
+                            approval_count=approval_count,
+                            approval_budget_exhausted=True,
+                        )
+                        try:
+                            loop.call_soon_threadsafe(q.put_nowait, denied_event)
+                        except Exception:
+                            pass
+                        return
+
                     event.update({
                         "event": "approval.request",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                        "choices": _approval_event_choices(
-                            smart_denied=bool(event.get("smart_denied")),
-                            allow_permanent=event.get("allow_permanent") is not False,
+                        "choices": (
+                            ["once", "deny"]
+                            if budget is not None
+                            else _approval_event_choices(
+                                smart_denied=bool(event.get("smart_denied")),
+                                allow_permanent=event.get("allow_permanent") is not False,
+                            )
                         ),
+                        "approval_budget": budget,
+                        "approval_count": approval_count if budget is not None else None,
                     })
                     self._set_run_status(
                         run_id,
                         "waiting_for_approval",
                         last_event="approval.request",
+                        approval_budget=budget,
+                        approval_count=approval_count if budget is not None else None,
                     )
                     try:
                         loop.call_soon_threadsafe(q.put_nowait, event)
@@ -6997,6 +7068,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
+                with self._run_approval_budget_lock:
+                    self._run_approval_budgets.pop(run_id, None)
+                    self._run_approval_counts.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
 
         self._activate_admitted_request()
@@ -7116,6 +7190,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 status=400,
             )
+        with self._run_approval_budget_lock:
+            approval_budget = self._run_approval_budgets.get(run_id)
+        if approval_budget is not None and choice not in {"once", "deny"}:
+            return web.json_response(
+                _openai_error(
+                    "Run-scoped approval budgets permit only once or deny",
+                    code="bounded_approval_choice_required",
+                ),
+                status=400,
+            )
 
         approval_session_key = self._run_approval_sessions.get(run_id)
         if not approval_session_key:
@@ -7131,6 +7215,14 @@ class APIServerAdapter(BasePlatformAdapter):
             _coerce_request_bool(body.get("all"), default=False)
             or _coerce_request_bool(body.get("resolve_all"), default=False)
         )
+        if approval_budget is not None and resolve_all:
+            return web.json_response(
+                _openai_error(
+                    "Run-scoped approval budgets do not permit bulk approval",
+                    code="bounded_approval_bulk_forbidden",
+                ),
+                status=400,
+            )
         try:
             from tools.approval import resolve_gateway_approval
 
@@ -7442,6 +7534,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
+                with self._run_approval_budget_lock:
+                    self._run_approval_budgets.pop(run_id, None)
+                    self._run_approval_counts.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
 
         stale_statuses = [
