@@ -54,6 +54,42 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 logger = logging.getLogger(__name__)
 
 
+def _tool_progress_result_metadata(function_name: str, result: Any) -> dict[str, Any]:
+    """Return non-secret execution semantics for progress observers.
+
+    Tool output can contain credentials, file content, or arbitrary model-visible
+    text. Progress consumers that make lifecycle decisions need only a tiny
+    bounded subset: command/process exit state and tracked background identity.
+    """
+    if function_name not in {"terminal", "process"}:
+        return {}
+    document: Any = result
+    if type(document) is str and 0 < len(document) <= 131_072:
+        try:
+            document = json.loads(document)
+        except (ValueError, TypeError, RecursionError):
+            return {}
+    if type(document) is not dict:
+        return {}
+    metadata: dict[str, Any] = {}
+    exit_code = document.get("exit_code")
+    if type(exit_code) is int:
+        metadata["exit_code"] = exit_code
+    session_id = document.get("session_id")
+    if type(session_id) is str and 0 < len(session_id) <= 512:
+        metadata["session_id"] = session_id
+    status = document.get("status")
+    if type(status) is str and status in {
+        "running",
+        "exited",
+        "timeout",
+        "interrupted",
+        "not_found",
+    }:
+        metadata["status"] = status
+    return metadata
+
+
 def _ensure_file_checkpoint(
     agent,
     function_name: str,
@@ -1572,6 +1608,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         blocked = False
         is_error = True
         progress_function_name = name
+        progress_result_metadata: dict[str, Any] = {}
         # A worker can finish and write results[i] in the window between the
         # deadline snapshot (timed_out_indices, taken from not_done) and this
         # loop. Prefer that real result over a fabricated timeout message — the
@@ -1628,6 +1665,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             tool_duration = 0.0
         else:
             function_name, function_args, function_result, tool_duration, is_error, blocked, middleware_trace = r
+            progress_result_metadata = _tool_progress_result_metadata(
+                function_name, function_result
+            )
             name = function_name
             args = function_args
             progress_function_name = function_name
@@ -1726,10 +1766,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # resume can reconstruct the tool result that was already visible.
         if not blocked and agent.tool_progress_callback:
             try:
+                display_args = (
+                    _redact_tool_args_for_display(name, args) or args
+                )
                 agent.tool_progress_callback(
-                    "tool.completed", progress_function_name, None, None,
+                    "tool.completed", progress_function_name, None, display_args,
                     duration=tool_duration, is_error=is_error,
                     result=display_function_result,
+                    result_metadata=progress_result_metadata,
                 )
             except Exception as cb_err:
                 logging.debug("Tool progress callback error: %s", cb_err)
@@ -2434,6 +2478,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Log tool errors to the persistent error log so [error] tags
         # in the UI always have a corresponding detailed entry on disk.
         _is_error_result, _ = _detect_tool_failure(function_name, function_result)
+        progress_result_metadata = _tool_progress_result_metadata(
+            function_name, function_result
+        )
         # The agent-runtime tools above (todo, session_search, memory,
         # context-engine, memory-manager, clarify, delegate_task) are
         # dispatched inline — they never reach handle_function_call, so the
@@ -2531,10 +2578,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # row, never a competing in-memory authority.
         if not _execution_blocked and agent.tool_progress_callback:
             try:
+                display_args = (
+                    _redact_tool_args_for_display(function_name, function_args)
+                    or function_args
+                )
                 agent.tool_progress_callback(
-                    "tool.completed", function_name, None, None,
+                    "tool.completed", function_name, None, display_args,
                     duration=tool_duration, is_error=_is_error_result,
                     result=display_function_result,
+                    result_metadata=progress_result_metadata,
                 )
             except Exception as cb_err:
                 logging.debug("Tool progress callback error: %s", cb_err)

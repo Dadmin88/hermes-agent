@@ -1447,6 +1447,11 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_approval_budgets: Dict[str, int] = {}
         self._run_approval_counts: Dict[str, int] = {}
         self._run_approval_budget_lock = threading.Lock()
+        # Command evidence is stronger than generic tool completion. Foreground
+        # terminal calls contribute their actual exit code; background terminal
+        # calls remain pending until process status proves their exit outcome.
+        self._run_pending_processes: Dict[str, set[str]] = {}
+        self._run_command_evidence_lock = threading.Lock()
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         self._session_dbs: Dict[str, Any] = {}
         self._session_db_cache_lock = threading.Lock()
@@ -3197,6 +3202,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_finalize": True,
                 "run_approval_budget": True,
                 "run_tool_evidence": True,
+                "run_command_evidence": True,
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
@@ -6589,6 +6595,112 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_statuses[run_id] = current
         return current
 
+    @staticmethod
+    def _tool_result_document(value: Any) -> Optional[Dict[str, Any]]:
+        """Parse one bounded JSON tool result without trusting model-visible text."""
+        if type(value) is dict:
+            return value
+        if type(value) is not str or not 0 < len(value) <= 131_072:
+            return None
+        try:
+            decoded = json.loads(value)
+        except (ValueError, TypeError, RecursionError):
+            return None
+        return decoded if type(decoded) is dict else None
+
+    def _track_background_process(self, run_id: str, session_id: str) -> None:
+        if type(session_id) is not str or not session_id or len(session_id) > 512:
+            self._mark_command_evidence_invalid(run_id)
+            return
+        with self._run_command_evidence_lock:
+            pending = self._run_pending_processes.setdefault(run_id, set())
+            pending.add(session_id)
+            current = self._run_statuses.get(run_id, {})
+            self._set_run_status(
+                run_id,
+                current.get("status", "running"),
+                pending_processes=len(pending),
+            )
+
+    def _record_command_exit(
+        self,
+        run_id: str,
+        exit_code: int,
+        *,
+        session_id: Optional[str] = None,
+    ) -> None:
+        if type(exit_code) is not int:
+            self._mark_command_evidence_invalid(run_id, session_id=session_id)
+            return
+        with self._run_command_evidence_lock:
+            pending = self._run_pending_processes.setdefault(run_id, set())
+            if session_id is not None:
+                if session_id not in pending:
+                    return
+                pending.remove(session_id)
+            current = self._run_statuses.get(run_id, {})
+            command_calls = int(current.get("command_calls", 0) or 0) + 1
+            command_errors = int(current.get("command_errors", 0) or 0) + int(
+                exit_code != 0
+            )
+            self._set_run_status(
+                run_id,
+                current.get("status", "running"),
+                command_calls=command_calls,
+                command_errors=command_errors,
+                last_command_error=exit_code != 0,
+                pending_processes=len(pending),
+            )
+
+    def _mark_command_evidence_invalid(
+        self, run_id: str, *, session_id: Optional[str] = None
+    ) -> None:
+        with self._run_command_evidence_lock:
+            pending = self._run_pending_processes.setdefault(run_id, set())
+            if session_id is not None:
+                pending.discard(session_id)
+            current = self._run_statuses.get(run_id, {})
+            self._set_run_status(
+                run_id,
+                current.get("status", "running"),
+                command_evidence_invalid=True,
+                pending_processes=len(pending),
+            )
+
+    def _refresh_pending_process_evidence(self, run_id: str) -> None:
+        """Resolve exited background commands independently of model behavior."""
+        with self._run_command_evidence_lock:
+            pending = tuple(self._run_pending_processes.get(run_id, set()))
+        if not pending:
+            return
+        try:
+            from tools.process_registry import process_registry
+        except Exception:
+            self._mark_command_evidence_invalid(run_id)
+            return
+        for session_id in pending:
+            try:
+                result = process_registry.poll(session_id)
+            except Exception:
+                self._mark_command_evidence_invalid(run_id, session_id=session_id)
+                continue
+            if type(result) is not dict:
+                self._mark_command_evidence_invalid(run_id, session_id=session_id)
+                continue
+            status = result.get("status")
+            if status == "exited":
+                exit_code = result.get("exit_code")
+                if type(exit_code) is int:
+                    self._record_command_exit(
+                        run_id, exit_code, session_id=session_id
+                    )
+                else:
+                    self._mark_command_evidence_invalid(
+                        run_id, session_id=session_id
+                    )
+            elif status == "not_found":
+                self._mark_command_evidence_invalid(run_id, session_id=session_id)
+
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
         def _push(event: Dict[str, Any]) -> None:
@@ -6627,6 +6739,56 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_errors=tool_errors,
                     last_tool_error=is_error,
                 )
+
+                result_document = kwargs.get("result_metadata")
+                if type(result_document) is not dict or not result_document:
+                    result_document = self._tool_result_document(kwargs.get("result"))
+                if tool_name == "terminal":
+                    if result_document is None:
+                        if is_error:
+                            self._record_command_exit(run_id, -1)
+                        else:
+                            self._mark_command_evidence_invalid(run_id)
+                    else:
+                        process_session = result_document.get("session_id")
+                        if type(process_session) is str and process_session:
+                            self._track_background_process(run_id, process_session)
+                        else:
+                            exit_code = result_document.get("exit_code")
+                            if type(exit_code) is int:
+                                self._record_command_exit(run_id, exit_code)
+                            elif is_error:
+                                self._record_command_exit(run_id, -1)
+                            else:
+                                self._mark_command_evidence_invalid(run_id)
+                elif tool_name == "process" and type(args) is dict:
+                    action = args.get("action")
+                    process_session = args.get("session_id")
+                    if (
+                        action in {"poll", "wait"}
+                        and type(process_session) is str
+                        and process_session
+                        and result_document is not None
+                    ):
+                        process_status = result_document.get("status")
+                        exit_code = result_document.get("exit_code")
+                        if process_status == "exited" and type(exit_code) is int:
+                            self._record_command_exit(
+                                run_id, exit_code, session_id=process_session
+                            )
+                        elif process_status == "not_found":
+                            self._mark_command_evidence_invalid(
+                                run_id, session_id=process_session
+                            )
+                    elif (
+                        action in {"kill", "close"}
+                        and type(process_session) is str
+                        and process_session
+                    ):
+                        self._record_command_exit(
+                            run_id, -1, session_id=process_session
+                        )
+
                 _push({
                     "event": "tool.completed",
                     "run_id": run_id,
@@ -6811,6 +6973,8 @@ class APIServerAdapter(BasePlatformAdapter):
             with self._run_approval_budget_lock:
                 self._run_approval_budgets[run_id] = approval_budget
                 self._run_approval_counts[run_id] = 0
+        with self._run_command_evidence_lock:
+            self._run_pending_processes[run_id] = set()
 
         event_cb = self._make_run_event_callback(run_id, loop)
 
@@ -6847,6 +7011,11 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_calls=0,
             tool_errors=0,
             last_tool_error=None,
+            command_calls=0,
+            command_errors=0,
+            last_command_error=None,
+            pending_processes=0,
+            command_evidence_invalid=False,
         )
 
         # Background task outlives the HTTP response (and thus the middleware
@@ -7487,6 +7656,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     "tool_calls": int(status.get("tool_calls", 0) or 0),
                     "tool_errors": int(status.get("tool_errors", 0) or 0),
                     "last_tool_error": status.get("last_tool_error"),
+                    "command_calls": int(status.get("command_calls", 0) or 0),
+                    "command_errors": int(status.get("command_errors", 0) or 0),
+                    "last_command_error": status.get("last_command_error"),
+                    "pending_processes": int(status.get("pending_processes", 0) or 0),
+                    "command_evidence_invalid": bool(
+                        status.get("command_evidence_invalid", False)
+                    ),
                 })
 
             task = self._active_run_tasks.get(run_id)
@@ -7511,6 +7687,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         ),
                         status=409,
                     )
+
+            await asyncio.to_thread(self._refresh_pending_process_evidence, run_id)
+            status = self._run_statuses.get(run_id) or status
 
             try:
                 released = await asyncio.to_thread(
@@ -7557,6 +7736,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 "tool_calls": int(status.get("tool_calls", 0) or 0),
                 "tool_errors": int(status.get("tool_errors", 0) or 0),
                 "last_tool_error": status.get("last_tool_error"),
+                "command_calls": int(status.get("command_calls", 0) or 0),
+                "command_errors": int(status.get("command_errors", 0) or 0),
+                "last_command_error": status.get("last_command_error"),
+                "pending_processes": int(status.get("pending_processes", 0) or 0),
+                "command_evidence_invalid": bool(
+                    status.get("command_evidence_invalid", False)
+                ),
                 **released,
             })
 
@@ -7644,6 +7830,8 @@ class APIServerAdapter(BasePlatformAdapter):
             self._run_statuses.pop(run_id, None)
             self._run_profiles.pop(run_id, None)
             self._run_finalize_locks.pop(run_id, None)
+            with self._run_command_evidence_lock:
+                self._run_pending_processes.pop(run_id, None)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
