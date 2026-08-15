@@ -195,6 +195,12 @@ TOOLSETS = {
         "tools": ["terminal", "process"],
         "includes": []
     },
+
+    "fleet-terminal": {
+        "description": "Foreground-only terminal execution for bounded Fleet automation",
+        "tools": ["terminal"],
+        "includes": []
+    },
     
     "skills": {
         "description": "Access, create, edit, and manage skill documents with specialized instructions and knowledge",
