@@ -23,6 +23,7 @@ def _reset_bridge_state(monkeypatch):
         "TERMINAL_CWD",
         "TERMINAL_DOCKER_IMAGE",
         "TERMINAL_SSH_HOST",
+        "TERMINAL_FORCE_FOREGROUND",
     ):
         monkeypatch.delenv(name, raising=False)
     yield
@@ -46,6 +47,16 @@ def test_unset_terminal_env_backfills_backend_from_config():
     assert config["env_type"] == "docker"
     assert config["docker_image"] == "custom/image:1"
     assert os.environ["TERMINAL_ENV"] == "docker"
+
+
+def test_force_foreground_config_bridges_to_terminal_policy(monkeypatch):
+    _write_config("terminal:\n  force_foreground: true\n")
+    monkeypatch.setenv("TERMINAL_FORCE_FOREGROUND", "false")
+
+    config = terminal_tool._get_env_config()
+
+    assert config["force_foreground"] is True
+    assert os.environ["TERMINAL_FORCE_FOREGROUND"] == "True"
 
 
 def test_explicit_config_backend_overrides_stale_env(monkeypatch):

@@ -1670,6 +1670,10 @@ def _get_env_config() -> Dict[str, Any]:
             os.getenv("TERMINAL_PERSISTENT_SHELL", "true"),
         ).lower() in {"true", "1", "yes"},
         "local_persistent": os.getenv("TERMINAL_LOCAL_PERSISTENT", "false").lower() in {"true", "1", "yes"},
+        "force_foreground": os.getenv(
+            "TERMINAL_FORCE_FOREGROUND", "false"
+        ).lower()
+        in {"true", "1", "yes"},
         # Container resource config (applies to docker, singularity, modal,
         # daytona, and vercel_sandbox -- ignored for local/ssh)
         "container_cpu": container_cpu,
@@ -2588,6 +2592,13 @@ def terminal_tool(
 
         # Get configuration
         config = _get_env_config()
+        if background and config.get("force_foreground") is True:
+            logger.info(
+                "Terminal background execution coerced to foreground by profile policy"
+            )
+            background = False
+            notify_on_complete = False
+            watch_patterns = None
         env_type = config["env_type"]
 
         # Use task_id for environment isolation. By default all subagent
