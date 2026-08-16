@@ -1429,8 +1429,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
         # Multiplex profile identity retained until terminal run finalization.
-        # External lifecycle owners (notably Fleet) reuse one profile path and
-        # must explicitly quiesce profile-owned persistence before deleting it.
+        # External lifecycle owners may require an explicit quiescence barrier
+        # before changing execution-bound state associated with the profile.
         self._run_profiles: Dict[str, Optional[str]] = {}
         self._run_finalize_locks: Dict[str, "asyncio.Lock"] = {}
         # Stop is cooperative: the executor thread may outlive the HTTP request.
@@ -2231,8 +2231,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         ``SessionDB.close()`` is the persistence barrier: it drains queued token
         accounting before closing SQLite. The explicit API-run finalization
-        contract calls this before an external lifecycle owner removes the
-        profile directory.
+        contract uses this to prove profile-owned persistence is quiescent.
         """
         key = str(home)
         with self._session_db_cache_lock:
@@ -7586,10 +7585,10 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_finalize_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/finalize — prove profile runtime quiescence.
 
-        Terminal model output is not sufficient permission for an external
-        lifecycle owner to delete a multiplex profile.  Finalization closes the
-        profile's cached SessionDB (draining async token accounting) and drains
-        + detaches profile-specific file log handlers.  The endpoint is
+        Terminal model output is not sufficient proof that profile-owned
+        persistence is quiescent. Finalization closes the profile's cached
+        SessionDB (draining async token accounting) and drains + detaches
+        profile-specific file log handlers. The endpoint is
         intentionally idempotent so a control plane can safely retry after an
         uncertain HTTP response.
         """

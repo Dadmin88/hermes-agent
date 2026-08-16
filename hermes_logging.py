@@ -703,10 +703,9 @@ def rotating_file_handlers() -> list:
 def release_logging_home(hermes_home: Path) -> int:
     """Drain and detach file handlers rooted under one Hermes profile home.
 
-    Multiplex profiles may be ephemeral.  A long-lived gateway must not retain
-    a rotating handler whose ``baseFilename`` points into a profile directory
-    that an external lifecycle owner is about to delete.  This helper drains
-    the shared queue first, removes only handlers below ``<home>/logs``, closes
+    A long-lived gateway must not retain a rotating handler after a profile's
+    runtime state is explicitly finalized. This helper drains the shared queue
+    first, removes only handlers below ``<home>/logs``, closes
     them, and restarts the listener for every other profile's handlers.
 
     Returns the number of handlers released.  The operation is idempotent.
