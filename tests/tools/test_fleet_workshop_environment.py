@@ -14,6 +14,11 @@ from tools.environments.docker import (
 CONTAINER_ID = "a" * 64
 PLAN = "sha256:" + "b" * 64
 DEADLINE_MS = 2_000_000_000_000
+NETWORK_NAME = "hermes-fleet-egress-" + "c" * 24
+NETWORK_POLICY = "sha256:" + "d" * 64
+NETWORK_AUTHORITY = "sha256:" + "e" * 64
+GATEWAY_ID = "f" * 64
+GATEWAY_IP = "172.25.0.2"
 
 
 def workshop_document() -> dict:
@@ -62,6 +67,34 @@ def workshop_document() -> dict:
     }
 
 
+def direct_workshop_document() -> dict:
+    document = workshop_document()
+    proxy = f"http://{GATEWAY_IP}:8080"
+    document["Config"]["Labels"].update(
+        {
+            "dev.hermes.fleet.network_mode": "project-allowlist",
+            "dev.hermes.fleet.network_policy": NETWORK_POLICY,
+            "dev.hermes.fleet.network_authority": NETWORK_AUTHORITY,
+            "dev.hermes.fleet.network_gateway": GATEWAY_ID,
+            "hermes-egress": "proxy",
+        }
+    )
+    document["Config"]["Env"] = [
+        f"HTTP_PROXY={proxy}",
+        f"HTTPS_PROXY={proxy}",
+        f"http_proxy={proxy}",
+        f"https_proxy={proxy}",
+        "NO_PROXY=",
+        "no_proxy=",
+    ]
+    document["HostConfig"]["NetworkMode"] = NETWORK_NAME
+    document["HostConfig"]["Dns"] = ["127.0.0.1"]
+    document["NetworkSettings"] = {
+        "Networks": {NETWORK_NAME: {"IPAddress": "172.25.0.3"}}
+    }
+    return document
+
+
 def test_fleet_workshop_verifier_accepts_exact_hardened_container() -> None:
     verify_fleet_workshop_document(
         workshop_document(),
@@ -69,6 +102,98 @@ def test_fleet_workshop_verifier_accepts_exact_hardened_container() -> None:
         plan_fingerprint=PLAN,
         now_ms=DEADLINE_MS - 1,
     )
+
+
+def test_fleet_workshop_verifier_accepts_exact_mediated_network_binding() -> None:
+    verify_fleet_workshop_document(
+        direct_workshop_document(),
+        container_id=CONTAINER_ID,
+        plan_fingerprint=PLAN,
+        now_ms=DEADLINE_MS - 1,
+        expected_network_mode="project-allowlist",
+        expected_network_name=NETWORK_NAME,
+        expected_network_policy=NETWORK_POLICY,
+        expected_network_authority=NETWORK_AUTHORITY,
+        expected_gateway_id=GATEWAY_ID,
+        expected_gateway_ip=GATEWAY_IP,
+    )
+
+
+def test_fleet_workshop_verifier_accepts_provider_only_as_offline_container() -> None:
+    document = workshop_document()
+    document["Config"]["Labels"].update(
+        {
+            "dev.hermes.fleet.network_mode": "provider-only",
+            "dev.hermes.fleet.network_policy": NETWORK_POLICY,
+            "dev.hermes.fleet.network_authority": NETWORK_AUTHORITY,
+        }
+    )
+    verify_fleet_workshop_document(
+        document,
+        container_id=CONTAINER_ID,
+        plan_fingerprint=PLAN,
+        now_ms=DEADLINE_MS - 1,
+        expected_network_mode="provider-only",
+        expected_network_policy=NETWORK_POLICY,
+        expected_network_authority=NETWORK_AUTHORITY,
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutator", "match"),
+    [
+        (
+            lambda value: value["Config"]["Labels"].__setitem__(
+                "dev.hermes.fleet.network_policy", "sha256:" + "1" * 64
+            ),
+            "network policy",
+        ),
+        (
+            lambda value: value["Config"]["Labels"].__setitem__(
+                "dev.hermes.fleet.network_gateway", "1" * 64
+            ),
+            "network gateway",
+        ),
+        (
+            lambda value: value["HostConfig"].__setitem__("NetworkMode", "bridge"),
+            "network isolation",
+        ),
+        (
+            lambda value: value["HostConfig"].__setitem__("Dns", ["8.8.8.8"]),
+            "direct DNS",
+        ),
+        (
+            lambda value: value["NetworkSettings"]["Networks"].__setitem__(
+                "bridge", {"IPAddress": "172.17.0.3"}
+            ),
+            "network membership",
+        ),
+        (
+            lambda value: value["Config"]["Env"].append(
+                "ALL_PROXY=http://1.2.3.4:1080"
+            ),
+            "proxy binding",
+        ),
+    ],
+)
+def test_fleet_workshop_verifier_rejects_mediated_network_drift(
+    mutator, match
+) -> None:
+    document = direct_workshop_document()
+    mutator(document)
+    with pytest.raises(RuntimeError, match=match):
+        verify_fleet_workshop_document(
+            document,
+            container_id=CONTAINER_ID,
+            plan_fingerprint=PLAN,
+            now_ms=DEADLINE_MS - 1,
+            expected_network_mode="project-allowlist",
+            expected_network_name=NETWORK_NAME,
+            expected_network_policy=NETWORK_POLICY,
+            expected_network_authority=NETWORK_AUTHORITY,
+            expected_gateway_id=GATEWAY_ID,
+            expected_gateway_ip=GATEWAY_IP,
+        )
 
 
 @pytest.mark.parametrize(

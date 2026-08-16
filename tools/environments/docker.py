@@ -6,6 +6,7 @@ persistence via bind mounts.
 """
 
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -50,7 +51,22 @@ _FLEET_BACKEND_LABEL = "dev.hermes.fleet.backend"
 _FLEET_PLAN_LABEL = "dev.hermes.fleet.plan"
 _FLEET_ROLE_LABEL = "dev.hermes.fleet.role"
 _FLEET_DEADLINE_LABEL = "dev.hermes.fleet.deadline_ms"
+_FLEET_NETWORK_MODE_LABEL = "dev.hermes.fleet.network_mode"
+_FLEET_NETWORK_POLICY_LABEL = "dev.hermes.fleet.network_policy"
+_FLEET_NETWORK_AUTHORITY_LABEL = "dev.hermes.fleet.network_authority"
+_FLEET_NETWORK_GATEWAY_LABEL = "dev.hermes.fleet.network_gateway"
 _FLEET_BACKEND_KIND = "fleet.dev/docker-oci"
+_FLEET_NETWORK_NAME_RE = re.compile(r"^hermes-fleet-egress-[0-9a-f]{24}$")
+_FLEET_NETWORK_MODES = {
+    "none",
+    "provider-only",
+    "project-allowlist",
+    "explicitly-approved-internet",
+}
+_FLEET_DIRECT_NETWORK_MODES = {
+    "project-allowlist",
+    "explicitly-approved-internet",
+}
 _FLEET_RUN_UID = 65532
 _FLEET_RUN_GID = 65532
 _FLEET_INPUT_UID = 65533
@@ -867,12 +883,59 @@ def verify_fleet_workshop_document(
     container_id: str,
     plan_fingerprint: str,
     now_ms: int | None = None,
+    expected_network_mode: str = "none",
+    expected_network_name: str | None = None,
+    expected_network_policy: str | None = None,
+    expected_network_authority: str | None = None,
+    expected_gateway_id: str | None = None,
+    expected_gateway_ip: str | None = None,
 ) -> None:
     """Fail closed unless Docker proves one exact Fleet workshop realization."""
     if _FLEET_CONTAINER_ID_RE.fullmatch(container_id) is None:
         raise RuntimeError("Fleet-managed Docker container ID is invalid")
     if _FLEET_PLAN_FINGERPRINT_RE.fullmatch(plan_fingerprint) is None:
         raise RuntimeError("Fleet-managed Docker plan fingerprint is invalid")
+    if expected_network_mode not in _FLEET_NETWORK_MODES:
+        raise RuntimeError("Fleet-managed Docker network mode is invalid")
+    if expected_network_mode == "provider-only":
+        if (
+            expected_network_name is not None
+            or expected_gateway_id is not None
+            or expected_gateway_ip is not None
+            or expected_network_policy is None
+            or _FLEET_PLAN_FINGERPRINT_RE.fullmatch(expected_network_policy) is None
+            or expected_network_authority is None
+            or _FLEET_PLAN_FINGERPRINT_RE.fullmatch(expected_network_authority) is None
+        ):
+            raise RuntimeError("Fleet-managed Docker provider network binding is invalid")
+    elif expected_network_mode in _FLEET_DIRECT_NETWORK_MODES:
+        try:
+            gateway_ip = ipaddress.ip_address(expected_gateway_ip or "")
+        except ValueError as exc:
+            raise RuntimeError("Fleet-managed Docker gateway IP is invalid") from exc
+        if (
+            expected_network_name is None
+            or _FLEET_NETWORK_NAME_RE.fullmatch(expected_network_name) is None
+            or expected_network_policy is None
+            or _FLEET_PLAN_FINGERPRINT_RE.fullmatch(expected_network_policy) is None
+            or expected_network_authority is None
+            or _FLEET_PLAN_FINGERPRINT_RE.fullmatch(expected_network_authority) is None
+            or expected_gateway_id is None
+            or _FLEET_CONTAINER_ID_RE.fullmatch(expected_gateway_id) is None
+            or gateway_ip.version != 4
+            or not gateway_ip.is_private
+            or gateway_ip.is_loopback
+        ):
+            raise RuntimeError("Fleet-managed Docker direct network binding is invalid")
+    elif any(
+        value is not None
+        for value in (
+            expected_network_name,
+            expected_gateway_id,
+            expected_gateway_ip,
+        )
+    ):
+        raise RuntimeError("Fleet-managed Docker offline network binding is invalid")
     if not isinstance(document, dict) or document.get("Id") != container_id:
         raise RuntimeError("Fleet-managed Docker container identity changed")
 
@@ -882,15 +945,33 @@ def verify_fleet_workshop_document(
     if not isinstance(config, dict) or not isinstance(host, dict) or not isinstance(state, dict):
         raise RuntimeError("Fleet-managed Docker inspection is incomplete")
     labels = config.get("Labels")
+    expected_egress = (
+        "proxy" if expected_network_mode in _FLEET_DIRECT_NETWORK_MODES else "off"
+    )
     if (
         not isinstance(labels, dict)
         or labels.get(_FLEET_BACKEND_LABEL) != _FLEET_BACKEND_KIND
         or labels.get(_FLEET_PLAN_LABEL) != plan_fingerprint
         or labels.get(_FLEET_ROLE_LABEL) != "workshop"
         or labels.get("hermes-agent") != "1"
-        or labels.get(_EGRESS_LABEL_KEY) != "off"
+        or labels.get(_EGRESS_LABEL_KEY) != expected_egress
     ):
         raise RuntimeError("Fleet-managed Docker ownership proof failed")
+    observed_network_mode = labels.get(_FLEET_NETWORK_MODE_LABEL)
+    if expected_network_mode == "none":
+        if observed_network_mode not in (None, "none"):
+            raise RuntimeError("Fleet-managed Docker network mode changed")
+    elif observed_network_mode != expected_network_mode:
+        raise RuntimeError("Fleet-managed Docker network mode changed")
+    if expected_network_policy is not None:
+        if labels.get(_FLEET_NETWORK_POLICY_LABEL) != expected_network_policy:
+            raise RuntimeError("Fleet-managed Docker network policy changed")
+    if expected_network_authority is not None:
+        if labels.get(_FLEET_NETWORK_AUTHORITY_LABEL) != expected_network_authority:
+            raise RuntimeError("Fleet-managed Docker network authority changed")
+    if expected_network_mode in _FLEET_DIRECT_NETWORK_MODES:
+        if labels.get(_FLEET_NETWORK_GATEWAY_LABEL) != expected_gateway_id:
+            raise RuntimeError("Fleet-managed Docker network gateway changed")
     deadline_text = labels.get(_FLEET_DEADLINE_LABEL)
     try:
         deadline_ms = int(deadline_text)
@@ -902,7 +983,51 @@ def verify_fleet_workshop_document(
 
     if state.get("Status") != "running":
         raise RuntimeError("Fleet-managed Docker container is not running")
-    if host.get("NetworkMode") != "none":
+    if expected_network_mode in _FLEET_DIRECT_NETWORK_MODES:
+        if host.get("NetworkMode") != expected_network_name:
+            raise RuntimeError("Fleet-managed Docker network isolation is invalid")
+        if host.get("Dns") != ["127.0.0.1"]:
+            raise RuntimeError("Fleet-managed Docker direct DNS is not disabled")
+        network_settings = document.get("NetworkSettings")
+        networks = (
+            network_settings.get("Networks")
+            if isinstance(network_settings, dict)
+            else None
+        )
+        if not isinstance(networks, dict) or set(networks) != {expected_network_name}:
+            raise RuntimeError("Fleet-managed Docker network membership changed")
+        environment = config.get("Env")
+        if not isinstance(environment, list):
+            raise RuntimeError("Fleet-managed Docker environment is invalid")
+        relevant_proxy_names = {
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "NO_PROXY",
+            "no_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        }
+        observed_proxy: dict[str, str] = {}
+        for item in environment:
+            if not isinstance(item, str) or "=" not in item:
+                continue
+            key, value = item.split("=", 1)
+            if key in relevant_proxy_names:
+                observed_proxy[key] = value
+        proxy = f"http://{expected_gateway_ip}:8080"
+        expected_proxy = {
+            "HTTP_PROXY": proxy,
+            "HTTPS_PROXY": proxy,
+            "http_proxy": proxy,
+            "https_proxy": proxy,
+            "NO_PROXY": "",
+            "no_proxy": "",
+        }
+        if observed_proxy != expected_proxy:
+            raise RuntimeError("Fleet-managed Docker proxy binding changed")
+    elif host.get("NetworkMode") != "none":
         raise RuntimeError("Fleet-managed Docker network isolation is invalid")
     if host.get("ReadonlyRootfs") is not True:
         raise RuntimeError("Fleet-managed Docker root filesystem is not read-only")
@@ -987,6 +1112,12 @@ class FleetWorkshopEnvironment(BaseEnvironment):
         container_id: str,
         plan_fingerprint: str,
         timeout: int = 60,
+        expected_network_mode: str = "none",
+        expected_network_name: str | None = None,
+        expected_network_policy: str | None = None,
+        expected_network_authority: str | None = None,
+        expected_gateway_id: str | None = None,
+        expected_gateway_ip: str | None = None,
     ) -> None:
         if _FLEET_CONTAINER_ID_RE.fullmatch(container_id) is None:
             raise ValueError("Fleet-managed Docker container ID is invalid")
@@ -998,6 +1129,14 @@ class FleetWorkshopEnvironment(BaseEnvironment):
         self._docker_exe = docker
         self._container_id = container_id
         self._fleet_plan_fingerprint = plan_fingerprint
+        self._fleet_network_expectation = {
+            "expected_network_mode": expected_network_mode,
+            "expected_network_name": expected_network_name,
+            "expected_network_policy": expected_network_policy,
+            "expected_network_authority": expected_network_authority,
+            "expected_gateway_id": expected_gateway_id,
+            "expected_gateway_ip": expected_gateway_ip,
+        }
         super().__init__(cwd="/workspace", timeout=timeout)
         self._verify_exact_workshop()
         self.init_session()
@@ -1033,6 +1172,7 @@ class FleetWorkshopEnvironment(BaseEnvironment):
             self._inspect_exact_workshop(),
             container_id=self._container_id,
             plan_fingerprint=self._fleet_plan_fingerprint,
+            **self._fleet_network_expectation,
         )
 
     def _before_execute(self) -> None:
