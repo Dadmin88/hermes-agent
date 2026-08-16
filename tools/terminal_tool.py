@@ -1778,6 +1778,19 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     Returns:
         Environment instance with execute() method
     """
+    from agent.fleet_runtime_scope import get_fleet_runtime
+
+    fleet_runtime = get_fleet_runtime()
+    if fleet_runtime is not None:
+        from tools.environments.docker import FleetWorkshopEnvironment
+
+        return FleetWorkshopEnvironment(
+            container_id=fleet_runtime.container_id,
+            plan_fingerprint=fleet_runtime.plan_fingerprint,
+            timeout=timeout,
+            expected_image=fleet_runtime.image,
+        )
+
     cc = container_config or {}
     cpu = cc.get("container_cpu", 1)
     memory = cc.get("container_memory", 5120)
