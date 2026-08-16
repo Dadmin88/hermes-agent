@@ -14,6 +14,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -43,6 +44,13 @@ _DOCKER_SEARCH_PATHS = [
 _docker_executable: Optional[str] = None  # resolved once, cached
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EGRESS_LABEL_KEY = "hermes-egress"
+_FLEET_CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+_FLEET_PLAN_FINGERPRINT_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_FLEET_BACKEND_LABEL = "dev.hermes.fleet.backend"
+_FLEET_PLAN_LABEL = "dev.hermes.fleet.plan"
+_FLEET_ROLE_LABEL = "dev.hermes.fleet.role"
+_FLEET_DEADLINE_LABEL = "dev.hermes.fleet.deadline_ms"
+_FLEET_BACKEND_KIND = "fleet.dev/docker-oci"
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -847,6 +855,191 @@ def _ensure_docker_available() -> None:
                     "permission (docker group). Fix and retry."
                 ),
             )
+
+
+def verify_fleet_workshop_document(
+    document: object,
+    *,
+    container_id: str,
+    plan_fingerprint: str,
+    now_ms: int | None = None,
+) -> None:
+    """Fail closed unless Docker proves one exact Fleet workshop realization."""
+    if _FLEET_CONTAINER_ID_RE.fullmatch(container_id) is None:
+        raise RuntimeError("Fleet-managed Docker container ID is invalid")
+    if _FLEET_PLAN_FINGERPRINT_RE.fullmatch(plan_fingerprint) is None:
+        raise RuntimeError("Fleet-managed Docker plan fingerprint is invalid")
+    if not isinstance(document, dict) or document.get("Id") != container_id:
+        raise RuntimeError("Fleet-managed Docker container identity changed")
+
+    config = document.get("Config")
+    host = document.get("HostConfig")
+    state = document.get("State")
+    if not isinstance(config, dict) or not isinstance(host, dict) or not isinstance(state, dict):
+        raise RuntimeError("Fleet-managed Docker inspection is incomplete")
+    labels = config.get("Labels")
+    if (
+        not isinstance(labels, dict)
+        or labels.get(_FLEET_BACKEND_LABEL) != _FLEET_BACKEND_KIND
+        or labels.get(_FLEET_PLAN_LABEL) != plan_fingerprint
+        or labels.get(_FLEET_ROLE_LABEL) != "workshop"
+        or labels.get("hermes-agent") != "1"
+        or labels.get(_EGRESS_LABEL_KEY) != "off"
+    ):
+        raise RuntimeError("Fleet-managed Docker ownership proof failed")
+    deadline_text = labels.get(_FLEET_DEADLINE_LABEL)
+    try:
+        deadline_ms = int(deadline_text)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Fleet-managed Docker deadline is invalid") from exc
+    observed_now = int(time.time() * 1_000) if now_ms is None else now_ms
+    if type(observed_now) is not int or observed_now < 0 or deadline_ms <= observed_now:
+        raise RuntimeError("Fleet-managed Docker deadline has expired")
+
+    if state.get("Status") != "running":
+        raise RuntimeError("Fleet-managed Docker container is not running")
+    if host.get("NetworkMode") != "none":
+        raise RuntimeError("Fleet-managed Docker network isolation is invalid")
+    if host.get("ReadonlyRootfs") is not True:
+        raise RuntimeError("Fleet-managed Docker root filesystem is not read-only")
+    if host.get("Privileged") is not False:
+        raise RuntimeError("Fleet-managed Docker privilege state is invalid")
+
+    cap_drop = host.get("CapDrop")
+    cap_add = host.get("CapAdd")
+    if not isinstance(cap_drop, list) or "ALL" not in {str(item).upper() for item in cap_drop}:
+        raise RuntimeError("Fleet-managed Docker capabilities are not dropped")
+    if cap_add not in (None, []):
+        raise RuntimeError("Fleet-managed Docker adds Linux capabilities")
+    security_options = host.get("SecurityOpt")
+    if not isinstance(security_options, list):
+        raise RuntimeError("Fleet-managed Docker security options are invalid")
+    normalized_security = {str(item).lower() for item in security_options}
+    if not any(item.startswith("no-new-privileges") for item in normalized_security):
+        raise RuntimeError("Fleet-managed Docker no-new-privileges is missing")
+    if any("unconfined" in item for item in normalized_security):
+        raise RuntimeError("Fleet-managed Docker security confinement is disabled")
+
+    for key, label in (("PidsLimit", "PID"), ("Memory", "memory"), ("NanoCpus", "CPU")):
+        value = host.get(key)
+        if type(value) is not int or value <= 0:
+            raise RuntimeError(f"Fleet-managed Docker {label} limit is invalid")
+    user = str(config.get("User") or "").split(":", 1)[0].strip().lower()
+    if user in {"", "0", "root"}:
+        raise RuntimeError("Fleet-managed Docker container must run as non-root")
+    if config.get("WorkingDir") != "/workspace":
+        raise RuntimeError("Fleet-managed Docker working directory is invalid")
+
+    binds = host.get("Binds")
+    mounts = document.get("Mounts")
+    if binds not in (None, []):
+        raise RuntimeError("Fleet-managed Docker bind mounts are not permitted")
+    if not isinstance(mounts, list) or any(
+        isinstance(item, dict) and item.get("Type") in {"bind", "volume"}
+        for item in mounts
+    ):
+        raise RuntimeError("Fleet-managed Docker persistent mounts are not permitted")
+    for key in ("Devices", "DeviceRequests"):
+        if host.get(key) not in (None, []):
+            raise RuntimeError("Fleet-managed Docker host devices are not permitted")
+
+    tmpfs = host.get("Tmpfs")
+    workspace_options = tmpfs.get("/workspace") if isinstance(tmpfs, dict) else None
+    if not isinstance(workspace_options, str):
+        raise RuntimeError("Fleet-managed Docker writable workspace is missing")
+    workspace_flags = {item.strip().lower() for item in workspace_options.split(",")}
+    if "rw" not in workspace_flags or "ro" in workspace_flags:
+        raise RuntimeError("Fleet-managed Docker workspace is not writable tmpfs")
+
+
+class FleetWorkshopEnvironment(BaseEnvironment):
+    """Attach-only Hermes terminal environment for one Fleet-owned workshop.
+
+    Fleet owns create/start/stop/delete. Hermes performs an independent Docker
+    inspection before attachment and before every command, then uses only
+    ``docker exec`` against the exact container ID supplied by Fleet.
+    """
+
+    def __init__(
+        self,
+        *,
+        container_id: str,
+        plan_fingerprint: str,
+        timeout: int = 60,
+    ) -> None:
+        if _FLEET_CONTAINER_ID_RE.fullmatch(container_id) is None:
+            raise ValueError("Fleet-managed Docker container ID is invalid")
+        if _FLEET_PLAN_FINGERPRINT_RE.fullmatch(plan_fingerprint) is None:
+            raise ValueError("Fleet-managed Docker plan fingerprint is invalid")
+        docker = find_docker()
+        if not docker:
+            raise EnvironmentConnectionError("Docker runtime is unavailable")
+        self._docker_exe = docker
+        self._container_id = container_id
+        self._fleet_plan_fingerprint = plan_fingerprint
+        super().__init__(cwd="/workspace", timeout=timeout)
+        self._verify_exact_workshop()
+        self.init_session()
+
+    def _inspect_exact_workshop(self) -> dict:
+        try:
+            result = subprocess.run(
+                [self._docker_exe, "inspect", self._container_id],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise EnvironmentConnectionError(
+                "Fleet-managed Docker inspection failed"
+            ) from exc
+        if result.returncode != 0:
+            raise RuntimeError("Fleet-managed Docker container is unavailable")
+        try:
+            payload = json.loads(result.stdout)
+        except (json.JSONDecodeError, UnicodeError) as exc:
+            raise RuntimeError("Fleet-managed Docker inspection is invalid") from exc
+        if not isinstance(payload, list) or len(payload) != 1 or not isinstance(payload[0], dict):
+            raise RuntimeError("Fleet-managed Docker inspection is invalid")
+        return payload[0]
+
+    def _verify_exact_workshop(self) -> None:
+        verify_fleet_workshop_document(
+            self._inspect_exact_workshop(),
+            container_id=self._container_id,
+            plan_fingerprint=self._fleet_plan_fingerprint,
+        )
+
+    def _before_execute(self) -> None:
+        self._verify_exact_workshop()
+
+    def _run_bash(
+        self,
+        cmd_string: str,
+        *,
+        login: bool = False,
+        timeout: int = 120,
+        stdin_data: str | None = None,
+    ):
+        del timeout
+        cmd = [self._docker_exe, "exec"]
+        if stdin_data is not None:
+            cmd.append("-i")
+        cmd.append(self._container_id)
+        cmd.extend(["bash", "-l" if login else "-c"])
+        if login:
+            cmd.extend(["-c", cmd_string])
+        else:
+            cmd.append(cmd_string)
+        return _popen_bash(cmd, stdin_data)
+
+    def cleanup(self):
+        """Release no container lifecycle state; Fleet remains the sole owner."""
+        return None
 
 
 class DockerEnvironment(BaseEnvironment):
