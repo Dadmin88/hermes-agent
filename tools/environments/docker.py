@@ -47,6 +47,9 @@ _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EGRESS_LABEL_KEY = "hermes-egress"
 _FLEET_CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _FLEET_PLAN_FINGERPRINT_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_FLEET_IMAGE_RE = re.compile(
+    r"^(?:sha256:[0-9a-f]{64}|[a-z0-9][a-z0-9./_-]{0,254}@sha256:[0-9a-f]{64})$"
+)
 _FLEET_BACKEND_LABEL = "dev.hermes.fleet.backend"
 _FLEET_PLAN_LABEL = "dev.hermes.fleet.plan"
 _FLEET_ROLE_LABEL = "dev.hermes.fleet.role"
@@ -889,12 +892,18 @@ def verify_fleet_workshop_document(
     expected_network_authority: str | None = None,
     expected_gateway_id: str | None = None,
     expected_gateway_ip: str | None = None,
+    expected_image: str | None = None,
 ) -> None:
     """Fail closed unless Docker proves one exact Fleet workshop realization."""
     if _FLEET_CONTAINER_ID_RE.fullmatch(container_id) is None:
         raise RuntimeError("Fleet-managed Docker container ID is invalid")
     if _FLEET_PLAN_FINGERPRINT_RE.fullmatch(plan_fingerprint) is None:
         raise RuntimeError("Fleet-managed Docker plan fingerprint is invalid")
+    if expected_image is not None and (
+        type(expected_image) is not str
+        or _FLEET_IMAGE_RE.fullmatch(expected_image) is None
+    ):
+        raise RuntimeError("Fleet-managed Docker image binding is invalid")
     if expected_network_mode not in _FLEET_NETWORK_MODES:
         raise RuntimeError("Fleet-managed Docker network mode is invalid")
     if expected_network_mode == "provider-only":
@@ -944,6 +953,8 @@ def verify_fleet_workshop_document(
     state = document.get("State")
     if not isinstance(config, dict) or not isinstance(host, dict) or not isinstance(state, dict):
         raise RuntimeError("Fleet-managed Docker inspection is incomplete")
+    if expected_image is not None and config.get("Image") != expected_image:
+        raise RuntimeError("Fleet-managed Docker image binding changed")
     labels = config.get("Labels")
     expected_egress = (
         "proxy" if expected_network_mode in _FLEET_DIRECT_NETWORK_MODES else "off"
@@ -1118,6 +1129,7 @@ class FleetWorkshopEnvironment(BaseEnvironment):
         expected_network_authority: str | None = None,
         expected_gateway_id: str | None = None,
         expected_gateway_ip: str | None = None,
+        expected_image: str | None = None,
     ) -> None:
         if _FLEET_CONTAINER_ID_RE.fullmatch(container_id) is None:
             raise ValueError("Fleet-managed Docker container ID is invalid")
@@ -1136,6 +1148,7 @@ class FleetWorkshopEnvironment(BaseEnvironment):
             "expected_network_authority": expected_network_authority,
             "expected_gateway_id": expected_gateway_id,
             "expected_gateway_ip": expected_gateway_ip,
+            "expected_image": expected_image,
         }
         super().__init__(cwd="/workspace", timeout=timeout)
         self._verify_exact_workshop()
