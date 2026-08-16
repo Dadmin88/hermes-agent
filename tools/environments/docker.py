@@ -51,6 +51,10 @@ _FLEET_PLAN_LABEL = "dev.hermes.fleet.plan"
 _FLEET_ROLE_LABEL = "dev.hermes.fleet.role"
 _FLEET_DEADLINE_LABEL = "dev.hermes.fleet.deadline_ms"
 _FLEET_BACKEND_KIND = "fleet.dev/docker-oci"
+_FLEET_RUN_UID = 65532
+_FLEET_RUN_GID = 65532
+_FLEET_INPUT_UID = 65533
+_FLEET_INPUT_GID = 65533
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -924,9 +928,8 @@ def verify_fleet_workshop_document(
         value = host.get(key)
         if type(value) is not int or value <= 0:
             raise RuntimeError(f"Fleet-managed Docker {label} limit is invalid")
-    user = str(config.get("User") or "").split(":", 1)[0].strip().lower()
-    if user in {"", "0", "root"}:
-        raise RuntimeError("Fleet-managed Docker container must run as non-root")
+    if config.get("User") != f"{_FLEET_RUN_UID}:{_FLEET_RUN_GID}":
+        raise RuntimeError("Fleet-managed Docker Agent identity is invalid")
     if config.get("WorkingDir") != "/workspace":
         raise RuntimeError("Fleet-managed Docker working directory is invalid")
 
@@ -944,12 +947,30 @@ def verify_fleet_workshop_document(
             raise RuntimeError("Fleet-managed Docker host devices are not permitted")
 
     tmpfs = host.get("Tmpfs")
-    workspace_options = tmpfs.get("/workspace") if isinstance(tmpfs, dict) else None
-    if not isinstance(workspace_options, str):
-        raise RuntimeError("Fleet-managed Docker writable workspace is missing")
+    if not isinstance(tmpfs, dict):
+        raise RuntimeError("Fleet-managed Docker tmpfs layout is missing")
+    workspace_options = tmpfs.get("/workspace")
+    input_options = tmpfs.get("/workspace/inputs")
+    if not isinstance(workspace_options, str) or not isinstance(input_options, str):
+        raise RuntimeError("Fleet-managed Docker workspace isolation is incomplete")
     workspace_flags = {item.strip().lower() for item in workspace_options.split(",")}
-    if "rw" not in workspace_flags or "ro" in workspace_flags:
-        raise RuntimeError("Fleet-managed Docker workspace is not writable tmpfs")
+    required_workspace = {
+        "rw",
+        f"uid={_FLEET_RUN_UID}",
+        f"gid={_FLEET_RUN_GID}",
+        "mode=0711",
+    }
+    if not required_workspace.issubset(workspace_flags) or "ro" in workspace_flags:
+        raise RuntimeError("Fleet-managed Docker workspace ownership is invalid")
+    input_flags = {item.strip().lower() for item in input_options.split(",")}
+    required_inputs = {
+        "rw",
+        f"uid={_FLEET_INPUT_UID}",
+        f"gid={_FLEET_INPUT_GID}",
+        "mode=0755",
+    }
+    if not required_inputs.issubset(input_flags) or "ro" in input_flags:
+        raise RuntimeError("Fleet-managed Docker input staging ownership is invalid")
 
 
 class FleetWorkshopEnvironment(BaseEnvironment):
