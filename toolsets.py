@@ -199,7 +199,11 @@ TOOLSETS = {
     "fleet-terminal": {
         "description": "Foreground-only terminal execution for bounded Fleet automation",
         "tools": ["terminal"],
-        "includes": []
+        "includes": [],
+        # Fleet selects this for one bounded automation run. It is not a
+        # user-configurable capability bundle, and disabling it must never
+        # subtract the shared core terminal tool from ordinary Hermes sessions.
+        "posture": True,
     },
     
     "skills": {
