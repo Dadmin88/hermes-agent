@@ -8,10 +8,12 @@ import pytest
 from tools.environments import docker as docker_mod
 from tools.environments.docker import (
     FleetWorkshopEnvironment,
+    verify_fleet_network_document,
     verify_fleet_workshop_document,
 )
 
 CONTAINER_ID = "a" * 64
+EXECUTION_ID = "phase4-agent-proof"
 PLAN = "sha256:" + "b" * 64
 DEADLINE_MS = 2_000_000_000_000
 NETWORK_NAME = "hermes-fleet-egress-" + "c" * 24
@@ -27,6 +29,7 @@ def workshop_document() -> dict:
         "Config": {
             "Labels": {
                 "dev.hermes.fleet.backend": "fleet.dev/docker-oci",
+                "dev.hermes.fleet.execution": EXECUTION_ID,
                 "dev.hermes.fleet.plan": PLAN,
                 "dev.hermes.fleet.role": "workshop",
                 "dev.hermes.fleet.deadline_ms": str(DEADLINE_MS),
@@ -91,6 +94,8 @@ def direct_workshop_document() -> dict:
         }
     )
     document["Config"]["Env"] = [
+        "HOME=/home/fleet",
+        "TMPDIR=/tmp",
         f"HTTP_PROXY={proxy}",
         f"HTTPS_PROXY={proxy}",
         f"http_proxy={proxy}",
@@ -104,6 +109,79 @@ def direct_workshop_document() -> dict:
         "Networks": {NETWORK_NAME: {"IPAddress": "172.25.0.3"}}
     }
     return document
+
+
+def direct_network_document() -> dict:
+    return {
+        "Name": NETWORK_NAME,
+        "Driver": "bridge",
+        "Scope": "local",
+        "Internal": True,
+        "Attachable": False,
+        "Ingress": False,
+        "EnableIPv6": False,
+        "Labels": {
+            "dev.hermes.fleet.role": "egress-network",
+            "dev.hermes.fleet.execution": EXECUTION_ID,
+            "dev.hermes.fleet.network_mode": "project-allowlist",
+            "dev.hermes.fleet.network_policy": NETWORK_POLICY,
+            "dev.hermes.fleet.network_authority": NETWORK_AUTHORITY,
+        },
+        "Containers": {
+            CONTAINER_ID: {"Name": "workshop", "IPv4Address": "172.25.0.3/16"},
+            GATEWAY_ID: {"Name": "gateway", "IPv4Address": f"{GATEWAY_IP}/16"},
+        },
+    }
+
+
+def test_fleet_network_verifier_accepts_exact_internal_topology() -> None:
+    verify_fleet_network_document(
+        direct_network_document(),
+        network_name=NETWORK_NAME,
+        execution_id=EXECUTION_ID,
+        network_mode="project-allowlist",
+        network_policy=NETWORK_POLICY,
+        network_authority=NETWORK_AUTHORITY,
+        workshop_id=CONTAINER_ID,
+        gateway_id=GATEWAY_ID,
+        gateway_ip=GATEWAY_IP,
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutator", "match"),
+    [
+        (lambda value: value.__setitem__("Internal", False), "isolation"),
+        (lambda value: value.__setitem__("Driver", "macvlan"), "isolation"),
+        (
+            lambda value: value["Containers"].__setitem__(
+                "1" * 64, {"Name": "peer", "IPv4Address": "172.25.0.4/16"}
+            ),
+            "membership",
+        ),
+        (
+            lambda value: value["Containers"][GATEWAY_ID].__setitem__(
+                "IPv4Address", "172.25.0.9/16"
+            ),
+            "gateway IP",
+        ),
+    ],
+)
+def test_fleet_network_verifier_rejects_topology_drift(mutator, match) -> None:
+    document = direct_network_document()
+    mutator(document)
+    with pytest.raises(RuntimeError, match=match):
+        verify_fleet_network_document(
+            document,
+            network_name=NETWORK_NAME,
+            execution_id=EXECUTION_ID,
+            network_mode="project-allowlist",
+            network_policy=NETWORK_POLICY,
+            network_authority=NETWORK_AUTHORITY,
+            workshop_id=CONTAINER_ID,
+            gateway_id=GATEWAY_ID,
+            gateway_ip=GATEWAY_IP,
+        )
 
 
 def test_fleet_workshop_verifier_accepts_exact_hardened_container() -> None:

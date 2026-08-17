@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import platform
 import shutil
 import subprocess
@@ -28,20 +29,70 @@ def test_hermes_enters_exact_mediated_fleet_workshop() -> None:
     if probe.returncode != 0:
         pytest.skip("pinned base image is unavailable locally")
 
+    execution_id = f"phase4agent{uuid.uuid4().hex[:12]}"
     network_name = f"hermes-fleet-egress-{uuid.uuid4().hex[:24]}"
     network_policy = "sha256:" + "d" * 64
     network_authority = "sha256:" + "e" * 64
-    gateway_id = "f" * 64
-    gateway_ip = "172.25.0.2"
-    proxy = f"http://{gateway_ip}:8080"
     network = subprocess.run(
-        ["docker", "network", "create", "--internal", network_name],
+        [
+            "docker",
+            "network",
+            "create",
+            "--driver",
+            "bridge",
+            "--internal",
+            "--label",
+            "dev.hermes.fleet.role=egress-network",
+            "--label",
+            f"dev.hermes.fleet.execution={execution_id}",
+            "--label",
+            "dev.hermes.fleet.network_mode=project-allowlist",
+            "--label",
+            f"dev.hermes.fleet.network_policy={network_policy}",
+            "--label",
+            f"dev.hermes.fleet.network_authority={network_authority}",
+            network_name,
+        ],
         capture_output=True,
         check=False,
         text=True,
         timeout=10,
     )
     assert network.returncode == 0
+    gateway = subprocess.run(
+        ["docker", "create", "--network", network_name, BASE_IMAGE, "sleep", "infinity"],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=30,
+    )
+    if gateway.returncode != 0:
+        subprocess.run(
+            ["docker", "network", "rm", network_name],
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        pytest.fail("failed to create mediated Fleet gateway fixture")
+    gateway_id = gateway.stdout.strip()
+    gateway_started = subprocess.run(
+        ["docker", "start", gateway_id],
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    assert gateway_started.returncode == 0
+    gateway_document = json.loads(
+        subprocess.run(
+            ["docker", "inspect", gateway_id],
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=10,
+        ).stdout
+    )[0]
+    gateway_ip = gateway_document["NetworkSettings"]["Networks"][network_name]["IPAddress"]
+    proxy = f"http://{gateway_ip}:8080"
     deadline_ms = int(time.time() * 1_000) + 30_000
     create = subprocess.run(
         [
@@ -110,6 +161,8 @@ def test_hermes_enters_exact_mediated_fleet_workshop() -> None:
             "--label",
             "dev.hermes.fleet.backend=fleet.dev/docker-oci",
             "--label",
+            f"dev.hermes.fleet.execution={execution_id}",
+            "--label",
             f"dev.hermes.fleet.plan={PLAN}",
             "--label",
             "dev.hermes.fleet.role=workshop",
@@ -137,6 +190,12 @@ def test_hermes_enters_exact_mediated_fleet_workshop() -> None:
         timeout=30,
     )
     if create.returncode != 0:
+        subprocess.run(
+            ["docker", "rm", "--force", gateway_id],
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
         subprocess.run(
             ["docker", "network", "rm", network_name],
             capture_output=True,
@@ -185,6 +244,12 @@ def test_hermes_enters_exact_mediated_fleet_workshop() -> None:
             environment.cleanup()
         subprocess.run(
             ["docker", "rm", "--force", container_id],
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        subprocess.run(
+            ["docker", "rm", "--force", gateway_id],
             capture_output=True,
             check=False,
             timeout=10,

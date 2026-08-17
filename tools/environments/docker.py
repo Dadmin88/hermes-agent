@@ -49,6 +49,7 @@ _FLEET_CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _FLEET_PLAN_FINGERPRINT_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _FLEET_BACKEND_LABEL = "dev.hermes.fleet.backend"
 _FLEET_PLAN_LABEL = "dev.hermes.fleet.plan"
+_FLEET_EXECUTION_LABEL = "dev.hermes.fleet.execution"
 _FLEET_ROLE_LABEL = "dev.hermes.fleet.role"
 _FLEET_DEADLINE_LABEL = "dev.hermes.fleet.deadline_ms"
 _FLEET_NETWORK_MODE_LABEL = "dev.hermes.fleet.network_mode"
@@ -57,6 +58,7 @@ _FLEET_NETWORK_AUTHORITY_LABEL = "dev.hermes.fleet.network_authority"
 _FLEET_NETWORK_GATEWAY_LABEL = "dev.hermes.fleet.network_gateway"
 _FLEET_BACKEND_KIND = "fleet.dev/docker-oci"
 _FLEET_NETWORK_NAME_RE = re.compile(r"^hermes-fleet-egress-[0-9a-f]{24}$")
+_FLEET_EXECUTION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _FLEET_NETWORK_MODES = {
     "none",
     "provider-only",
@@ -1199,6 +1201,82 @@ def verify_fleet_workshop_document(
     )
 
 
+def verify_fleet_network_document(
+    document: object,
+    *,
+    network_name: str,
+    execution_id: str,
+    network_mode: str,
+    network_policy: str,
+    network_authority: str,
+    workshop_id: str,
+    gateway_id: str,
+    gateway_ip: str,
+) -> None:
+    """Independently prove the direct-egress Docker network topology."""
+    if _FLEET_NETWORK_NAME_RE.fullmatch(network_name) is None:
+        raise RuntimeError("Fleet-managed Docker network name is invalid")
+    if _FLEET_EXECUTION_ID_RE.fullmatch(execution_id) is None:
+        raise RuntimeError("Fleet-managed Docker execution identity is invalid")
+    if network_mode not in _FLEET_DIRECT_NETWORK_MODES:
+        raise RuntimeError("Fleet-managed Docker direct network mode is invalid")
+    for value, label in (
+        (network_policy, "policy"),
+        (network_authority, "authority"),
+    ):
+        if _FLEET_PLAN_FINGERPRINT_RE.fullmatch(value) is None:
+            raise RuntimeError(f"Fleet-managed Docker network {label} is invalid")
+    if _FLEET_CONTAINER_ID_RE.fullmatch(workshop_id) is None:
+        raise RuntimeError("Fleet-managed Docker workshop identity is invalid")
+    if _FLEET_CONTAINER_ID_RE.fullmatch(gateway_id) is None:
+        raise RuntimeError("Fleet-managed Docker gateway identity is invalid")
+    try:
+        parsed_gateway_ip = ipaddress.ip_address(gateway_ip)
+    except ValueError as exc:
+        raise RuntimeError("Fleet-managed Docker gateway IP is invalid") from exc
+    if (
+        parsed_gateway_ip.version != 4
+        or not parsed_gateway_ip.is_private
+        or parsed_gateway_ip.is_loopback
+    ):
+        raise RuntimeError("Fleet-managed Docker gateway IP is invalid")
+    if not isinstance(document, dict):
+        raise RuntimeError("Fleet-managed Docker network inspection is invalid")
+    if (
+        document.get("Name") != network_name
+        or document.get("Driver") != "bridge"
+        or document.get("Scope") != "local"
+        or document.get("Internal") is not True
+        or document.get("Attachable") is not False
+        or document.get("Ingress") is not False
+        or document.get("EnableIPv6") is not False
+    ):
+        raise RuntimeError("Fleet-managed Docker network isolation changed")
+    labels = document.get("Labels")
+    expected_labels = {
+        _FLEET_ROLE_LABEL: "egress-network",
+        _FLEET_EXECUTION_LABEL: execution_id,
+        _FLEET_NETWORK_MODE_LABEL: network_mode,
+        _FLEET_NETWORK_POLICY_LABEL: network_policy,
+        _FLEET_NETWORK_AUTHORITY_LABEL: network_authority,
+    }
+    if not isinstance(labels, dict) or any(
+        labels.get(key) != value for key, value in expected_labels.items()
+    ):
+        raise RuntimeError("Fleet-managed Docker network ownership changed")
+    containers = document.get("Containers")
+    if not isinstance(containers, dict) or set(containers) != {workshop_id, gateway_id}:
+        raise RuntimeError("Fleet-managed Docker network membership changed")
+    gateway = containers.get(gateway_id)
+    if not isinstance(gateway, dict):
+        raise RuntimeError("Fleet-managed Docker gateway attachment is invalid")
+    gateway_address = gateway.get("IPv4Address")
+    if not isinstance(gateway_address, str):
+        raise RuntimeError("Fleet-managed Docker gateway attachment is invalid")
+    if gateway_address.split("/", 1)[0] != gateway_ip:
+        raise RuntimeError("Fleet-managed Docker gateway IP changed")
+
+
 class FleetWorkshopEnvironment(BaseEnvironment):
     """Attach-only Hermes terminal environment for one Fleet-owned workshop.
 
@@ -1268,12 +1346,75 @@ class FleetWorkshopEnvironment(BaseEnvironment):
             raise RuntimeError("Fleet-managed Docker inspection is invalid")
         return payload[0]
 
+    def _inspect_exact_network(self, network_name: str) -> dict:
+        try:
+            result = subprocess.run(
+                [self._docker_exe, "network", "inspect", network_name],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise EnvironmentConnectionError(
+                "Fleet-managed Docker network inspection failed"
+            ) from exc
+        if result.returncode != 0:
+            raise RuntimeError("Fleet-managed Docker network is unavailable")
+        try:
+            payload = json.loads(result.stdout)
+        except (json.JSONDecodeError, UnicodeError) as exc:
+            raise RuntimeError("Fleet-managed Docker network inspection is invalid") from exc
+        if not isinstance(payload, list) or len(payload) != 1 or not isinstance(payload[0], dict):
+            raise RuntimeError("Fleet-managed Docker network inspection is invalid")
+        return payload[0]
+
     def _verify_exact_workshop(self) -> None:
+        document = self._inspect_exact_workshop()
         verify_fleet_workshop_document(
-            self._inspect_exact_workshop(),
+            document,
             container_id=self._container_id,
             plan_fingerprint=self._fleet_plan_fingerprint,
             **self._fleet_network_expectation,
+        )
+        expectation = self._fleet_network_expectation
+        mode = expectation["expected_network_mode"]
+        if mode not in _FLEET_DIRECT_NETWORK_MODES:
+            return
+        config = document.get("Config")
+        labels = config.get("Labels") if isinstance(config, dict) else None
+        execution_id = labels.get(_FLEET_EXECUTION_LABEL) if isinstance(labels, dict) else None
+        if not isinstance(execution_id, str):
+            raise RuntimeError("Fleet-managed Docker execution identity is unavailable")
+        network_name = expectation["expected_network_name"]
+        network_policy = expectation["expected_network_policy"]
+        network_authority = expectation["expected_network_authority"]
+        gateway_id = expectation["expected_gateway_id"]
+        gateway_ip = expectation["expected_gateway_ip"]
+        if not all(
+            isinstance(value, str)
+            for value in (
+                network_name,
+                network_policy,
+                network_authority,
+                gateway_id,
+                gateway_ip,
+            )
+        ):
+            raise RuntimeError("Fleet-managed Docker direct network binding is incomplete")
+        verify_fleet_network_document(
+            self._inspect_exact_network(network_name),
+            network_name=network_name,
+            execution_id=execution_id,
+            network_mode=mode,
+            network_policy=network_policy,
+            network_authority=network_authority,
+            workshop_id=self._container_id,
+            gateway_id=gateway_id,
+            gateway_ip=gateway_ip,
         )
 
     def _before_execute(self) -> None:
