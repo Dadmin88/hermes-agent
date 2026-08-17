@@ -30,6 +30,11 @@ def workshop_document() -> dict:
             },
             "User": "65532:65532",
             "WorkingDir": "/workspace",
+            "Env": [
+                "HOME=/home/fleet",
+                "TMPDIR=/tmp",
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            ],
         },
         "HostConfig": {
             "NetworkMode": "none",
@@ -68,6 +73,7 @@ def test_fleet_workshop_verifier_accepts_exact_hardened_container() -> None:
     ("section", "key", "unsafe"),
     [
         ("Config", "User", "0:0"),
+        ("Config", "User", "65532:0"),
         ("Config", "WorkingDir", "/root"),
         ("HostConfig", "NetworkMode", "bridge"),
         ("HostConfig", "ReadonlyRootfs", False),
@@ -127,6 +133,79 @@ def test_fleet_workshop_verifier_rejects_identity_mount_and_deadline_drift() -> 
             plan_fingerprint=PLAN,
             now_ms=DEADLINE_MS,
         )
+
+
+@pytest.mark.parametrize(
+    "extra_environment",
+    [
+        "SSH_AUTH_SOCK=/tmp/agent.sock",
+        "KERYX_NODE_TOKEN=opaque",
+        "FLEET_CONTROL_SOCKET=/run/fleet.sock",
+        "NODESCALE_SOCKET=/run/nodescale.sock",
+        "DOCKER_HOST=unix:///var/run/docker.sock",
+        "DOCKER_CONTEXT=host-control",
+        "HERMES_HOME=/host/hermes",
+        "OPENAI_API_KEY=opaque",
+        "AWS_ACCESS_KEY_ID=opaque",
+    ],
+)
+def test_fleet_workshop_verifier_rejects_forbidden_environment_authority(
+    extra_environment,
+) -> None:
+    document = workshop_document()
+    document["Config"]["Env"].append(extra_environment)
+    with pytest.raises(RuntimeError, match="forbidden authority"):
+        verify_fleet_workshop_document(
+            document,
+            container_id=CONTAINER_ID,
+            plan_fingerprint=PLAN,
+            now_ms=DEADLINE_MS - 1,
+        )
+
+
+def test_fleet_workshop_verifier_rejects_missing_or_duplicate_required_environment() -> None:
+    document = workshop_document()
+    document["Config"]["Env"].remove("HOME=/home/fleet")
+    with pytest.raises(RuntimeError, match="environment is invalid"):
+        verify_fleet_workshop_document(
+            document,
+            container_id=CONTAINER_ID,
+            plan_fingerprint=PLAN,
+            now_ms=DEADLINE_MS - 1,
+        )
+
+    document = workshop_document()
+    document["Config"]["Env"].append("HOME=/different")
+    with pytest.raises(RuntimeError, match="environment is invalid"):
+        verify_fleet_workshop_document(
+            document,
+            container_id=CONTAINER_ID,
+            plan_fingerprint=PLAN,
+            now_ms=DEADLINE_MS - 1,
+        )
+
+
+def test_fleet_workshop_environment_missing_exact_container_fails_without_fallback(
+    monkeypatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def run(argv, **_kwargs):
+        calls.append(list(argv))
+        assert argv == ["/usr/bin/docker", "inspect", CONTAINER_ID]
+        return SimpleNamespace(returncode=1, stdout="", stderr="No such container")
+
+    monkeypatch.setattr(docker_mod, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_mod.subprocess, "run", run)
+
+    with pytest.raises(RuntimeError, match="container is unavailable"):
+        FleetWorkshopEnvironment(
+            container_id=CONTAINER_ID,
+            plan_fingerprint=PLAN,
+            timeout=30,
+        )
+
+    assert calls == [["/usr/bin/docker", "inspect", CONTAINER_ID]]
 
 
 def test_fleet_workshop_environment_is_attach_only(monkeypatch) -> None:

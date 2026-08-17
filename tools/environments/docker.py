@@ -51,6 +51,30 @@ _FLEET_PLAN_LABEL = "dev.hermes.fleet.plan"
 _FLEET_ROLE_LABEL = "dev.hermes.fleet.role"
 _FLEET_DEADLINE_LABEL = "dev.hermes.fleet.deadline_ms"
 _FLEET_BACKEND_KIND = "fleet.dev/docker-oci"
+_FLEET_SECRET_ENV_NAME_RE = re.compile(
+    r"(?i)(?:token|secret|password|credential|api[_-]?key|private[_-]?key|"
+    r"access[_-]?key|cookie|jwt)"
+)
+_FLEET_FORBIDDEN_ENV_NAMES = frozenset(
+    {
+        "DOCKER_CONTEXT",
+        "DOCKER_HOST",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "HERMES_HOME",
+        "HERMES_PROFILE",
+        "SSH_AGENT_PID",
+        "SSH_AUTH_SOCK",
+    }
+)
+_FLEET_FORBIDDEN_ENV_PREFIXES = (
+    "DOCKER_",
+    "FLEET_",
+    "HERMES_",
+    "KERYX_",
+    "NODESCALE_",
+    "SSH_",
+)
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -924,11 +948,34 @@ def verify_fleet_workshop_document(
         value = host.get(key)
         if type(value) is not int or value <= 0:
             raise RuntimeError(f"Fleet-managed Docker {label} limit is invalid")
-    user = str(config.get("User") or "").split(":", 1)[0].strip().lower()
-    if user in {"", "0", "root"}:
-        raise RuntimeError("Fleet-managed Docker container must run as non-root")
+    if config.get("User") != "65532:65532":
+        raise RuntimeError("Fleet-managed Docker container must run as the dedicated non-root user")
     if config.get("WorkingDir") != "/workspace":
         raise RuntimeError("Fleet-managed Docker working directory is invalid")
+
+    environment = config.get("Env")
+    if not isinstance(environment, list):
+        raise RuntimeError("Fleet-managed Docker environment is invalid")
+    observed_environment: dict[str, str] = {}
+    for item in environment:
+        if not isinstance(item, str) or "=" not in item:
+            raise RuntimeError("Fleet-managed Docker environment is invalid")
+        name, value = item.split("=", 1)
+        if not name or name in observed_environment:
+            raise RuntimeError("Fleet-managed Docker environment is invalid")
+        observed_environment[name] = value
+    if (
+        observed_environment.get("HOME") != "/home/fleet"
+        or observed_environment.get("TMPDIR") != "/tmp"
+    ):
+        raise RuntimeError("Fleet-managed Docker environment is invalid")
+    for name in observed_environment:
+        if (
+            name in _FLEET_FORBIDDEN_ENV_NAMES
+            or name.startswith(_FLEET_FORBIDDEN_ENV_PREFIXES)
+            or _FLEET_SECRET_ENV_NAME_RE.search(name) is not None
+        ):
+            raise RuntimeError("Fleet-managed Docker environment contains forbidden authority")
 
     binds = host.get("Binds")
     mounts = document.get("Mounts")
