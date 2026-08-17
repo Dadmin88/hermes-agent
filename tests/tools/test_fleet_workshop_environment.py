@@ -50,9 +50,22 @@ def workshop_document() -> dict:
             "Devices": None,
             "DeviceRequests": None,
             "Tmpfs": {
-                "/workspace": "rw,nosuid,nodev,exec,size=268435456",
-                "/tmp": "rw,nosuid,nodev,exec,size=67108864",
-                "/home/fleet": "rw,nosuid,nodev,exec,size=67108864",
+                "/workspace": (
+                    "rw,nosuid,nodev,exec,size=268435456,"
+                    "uid=65532,gid=65532,mode=0711"
+                ),
+                "/workspace/inputs": (
+                    "rw,nosuid,nodev,exec,size=134217728,"
+                    "uid=65533,gid=65533,mode=0755"
+                ),
+                "/tmp": (
+                    "rw,nosuid,nodev,exec,size=67108864,"
+                    "uid=65532,gid=65532,mode=0700"
+                ),
+                "/home/fleet": (
+                    "rw,nosuid,nodev,exec,size=67108864,"
+                    "uid=65532,gid=65532,mode=0700"
+                ),
             },
         },
         "State": {"Status": "running"},
@@ -95,6 +108,56 @@ def test_fleet_workshop_verifier_rejects_security_drift(section, key, unsafe) ->
     document = workshop_document()
     document[section][key] = unsafe
     with pytest.raises(RuntimeError):
+        verify_fleet_workshop_document(
+            document,
+            container_id=CONTAINER_ID,
+            plan_fingerprint=PLAN,
+            now_ms=DEADLINE_MS - 1,
+        )
+
+
+def test_fleet_workshop_verifier_rejects_workspace_identity_drift() -> None:
+    document = workshop_document()
+    document["HostConfig"]["Tmpfs"]["/workspace/inputs"] = (
+        "rw,nosuid,nodev,exec,size=134217728,uid=65532,gid=65532,mode=0755"
+    )
+    with pytest.raises(RuntimeError, match="input staging"):
+        verify_fleet_workshop_document(
+            document,
+            container_id=CONTAINER_ID,
+            plan_fingerprint=PLAN,
+            now_ms=DEADLINE_MS - 1,
+        )
+
+    document = workshop_document()
+    document["HostConfig"]["Tmpfs"]["/workspace"] = (
+        "rw,nosuid,nodev,exec,size=268435456,uid=65532,gid=65532,mode=0700"
+    )
+    with pytest.raises(RuntimeError, match="workspace"):
+        verify_fleet_workshop_document(
+            document,
+            container_id=CONTAINER_ID,
+            plan_fingerprint=PLAN,
+            now_ms=DEADLINE_MS - 1,
+        )
+
+    document = workshop_document()
+    document["HostConfig"]["Tmpfs"]["/tmp"] = (
+        "rw,nosuid,nodev,exec,size=134217728,uid=65532,gid=65532,mode=0700"
+    )
+    with pytest.raises(RuntimeError, match="temporary directory"):
+        verify_fleet_workshop_document(
+            document,
+            container_id=CONTAINER_ID,
+            plan_fingerprint=PLAN,
+            now_ms=DEADLINE_MS - 1,
+        )
+
+    document = workshop_document()
+    document["HostConfig"]["Tmpfs"]["/home/fleet"] = (
+        "rw,nosuid,nodev,exec,size=67108864,uid=0,gid=0,mode=0700"
+    )
+    with pytest.raises(RuntimeError, match="disposable home"):
         verify_fleet_workshop_document(
             document,
             container_id=CONTAINER_ID,
