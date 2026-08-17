@@ -55,6 +55,10 @@ _FLEET_RUN_UID = 65532
 _FLEET_RUN_GID = 65532
 _FLEET_INPUT_UID = 65533
 _FLEET_INPUT_GID = 65533
+_FLEET_WORKSPACE_BYTES = 256 * 1024 * 1024
+_FLEET_INPUT_BYTES = 128 * 1024 * 1024
+_FLEET_TMP_BYTES = 64 * 1024 * 1024
+_FLEET_HOME_BYTES = 64 * 1024 * 1024
 _FLEET_SECRET_ENV_NAME_RE = re.compile(
     r"(?i)(?:token|secret|password|credential|api[_-]?key|private[_-]?key|"
     r"access[_-]?key|cookie|jwt)"
@@ -999,28 +1003,75 @@ def verify_fleet_workshop_document(
     tmpfs = host.get("Tmpfs")
     if not isinstance(tmpfs, dict):
         raise RuntimeError("Fleet-managed Docker tmpfs layout is missing")
-    workspace_options = tmpfs.get("/workspace")
-    input_options = tmpfs.get("/workspace/inputs")
-    if not isinstance(workspace_options, str) or not isinstance(input_options, str):
-        raise RuntimeError("Fleet-managed Docker workspace isolation is incomplete")
-    workspace_flags = {item.strip().lower() for item in workspace_options.split(",")}
-    required_workspace = {
-        "rw",
-        f"uid={_FLEET_RUN_UID}",
-        f"gid={_FLEET_RUN_GID}",
-        "mode=0711",
-    }
-    if not required_workspace.issubset(workspace_flags) or "ro" in workspace_flags:
-        raise RuntimeError("Fleet-managed Docker workspace ownership is invalid")
-    input_flags = {item.strip().lower() for item in input_options.split(",")}
-    required_inputs = {
-        "rw",
-        f"uid={_FLEET_INPUT_UID}",
-        f"gid={_FLEET_INPUT_GID}",
-        "mode=0755",
-    }
-    if not required_inputs.issubset(input_flags) or "ro" in input_flags:
-        raise RuntimeError("Fleet-managed Docker input staging ownership is invalid")
+
+    def require_tmpfs(
+        path: str,
+        *,
+        uid: int,
+        gid: int,
+        mode: str,
+        maximum_bytes: int,
+        label: str,
+    ) -> None:
+        options = tmpfs.get(path)
+        if not isinstance(options, str):
+            raise RuntimeError(f"Fleet-managed Docker {label} tmpfs is missing")
+        flags = {item.strip().lower() for item in options.split(",")}
+        required = {
+            "rw",
+            "nosuid",
+            "nodev",
+            "exec",
+            f"uid={uid}",
+            f"gid={gid}",
+            f"mode={mode}",
+        }
+        if not required.issubset(flags) or "ro" in flags:
+            raise RuntimeError(f"Fleet-managed Docker {label} tmpfs is invalid")
+        sizes = [flag.removeprefix("size=") for flag in flags if flag.startswith("size=")]
+        if len(sizes) != 1:
+            raise RuntimeError(f"Fleet-managed Docker {label} tmpfs size is invalid")
+        try:
+            size = int(sizes[0])
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Fleet-managed Docker {label} tmpfs size is invalid"
+            ) from exc
+        if not 0 < size <= maximum_bytes:
+            raise RuntimeError(f"Fleet-managed Docker {label} tmpfs size is invalid")
+
+    require_tmpfs(
+        "/workspace",
+        uid=_FLEET_RUN_UID,
+        gid=_FLEET_RUN_GID,
+        mode="0711",
+        maximum_bytes=_FLEET_WORKSPACE_BYTES,
+        label="workspace",
+    )
+    require_tmpfs(
+        "/workspace/inputs",
+        uid=_FLEET_INPUT_UID,
+        gid=_FLEET_INPUT_GID,
+        mode="0755",
+        maximum_bytes=_FLEET_INPUT_BYTES,
+        label="input staging",
+    )
+    require_tmpfs(
+        "/tmp",
+        uid=_FLEET_RUN_UID,
+        gid=_FLEET_RUN_GID,
+        mode="0700",
+        maximum_bytes=_FLEET_TMP_BYTES,
+        label="temporary directory",
+    )
+    require_tmpfs(
+        "/home/fleet",
+        uid=_FLEET_RUN_UID,
+        gid=_FLEET_RUN_GID,
+        mode="0700",
+        maximum_bytes=_FLEET_HOME_BYTES,
+        label="disposable home",
+    )
 
 
 class FleetWorkshopEnvironment(BaseEnvironment):
