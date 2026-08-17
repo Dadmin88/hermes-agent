@@ -5,6 +5,7 @@ import platform
 import shutil
 import subprocess
 import time
+import uuid
 
 import pytest
 
