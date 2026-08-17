@@ -679,6 +679,7 @@ def load_cli_config() -> Dict[str, Any]:
         "sandbox_dir": "TERMINAL_SANDBOX_DIR",
         # Persistent shell (non-local backends)
         "persistent_shell": "TERMINAL_PERSISTENT_SHELL",
+        "force_foreground": "TERMINAL_FORCE_FOREGROUND",
         # Sudo support (works with all backends)
         "sudo_password": "SUDO_PASSWORD",
     }

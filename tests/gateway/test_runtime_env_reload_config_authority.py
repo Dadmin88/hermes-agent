@@ -37,6 +37,40 @@ def test_reload_runtime_env_preserves_config_max_turns(tmp_path: Path, monkeypat
     assert os.environ["HERMES_MAX_ITERATIONS"] == "9000"
 
 
+def test_profile_config_iteration_budget_beats_process_global_env(monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_MAX_ITERATIONS", "500")
+
+    assert gateway_run._max_iterations_from_config(
+        {"agent": {"max_turns": 4}}
+    ) == 4
+
+
+def test_invalid_profile_iteration_budget_falls_back(monkeypatch) -> None:
+    monkeypatch.setattr(gateway_run, "_current_max_iterations", lambda: 321)
+
+    assert gateway_run._max_iterations_from_config({"agent": {"max_turns": True}}) == 321
+    assert gateway_run._max_iterations_from_config({"agent": {"max_turns": 0}}) == 321
+    assert gateway_run._max_iterations_from_config({}) == 321
+
+
+def test_turn_runner_reads_iteration_budget_from_request_profile_config() -> None:
+    import inspect
+
+    source = inspect.getsource(gateway_run.TurnRunner.run_sync)
+
+    assert "_max_iterations_from_config(ctx.user_config)" in source
+    assert "max_iterations = _current_max_iterations()" not in source
+
+
+def test_background_task_reads_iteration_budget_from_profile_config() -> None:
+    import inspect
+
+    source = inspect.getsource(gateway_run.GatewayRunner._run_background_task_inner)
+
+    assert "_max_iterations_from_config(user_config)" in source
+    assert "max_iterations = _current_max_iterations()" not in source
+
+
 def test_reload_runtime_env_preserves_config_terminal_backend(
     tmp_path: Path, monkeypatch
 ) -> None:

@@ -1,5 +1,7 @@
 """Regression tests for sudo detection and sudo password handling."""
 
+import json
+
 import tools.terminal_tool as terminal_tool
 
 
@@ -28,6 +30,26 @@ def test_terminal_schema_advertises_persistent_env_state():
     assert "exported environment variables persist between calls" in description
     assert "activate a virtualenv" in description
     assert "once per session" in description
+
+
+def test_force_foreground_policy_coerces_background_call(monkeypatch):
+    config = terminal_tool._get_env_config()
+    config["env_type"] = "local"
+    config["force_foreground"] = True
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+
+    result = json.loads(
+        terminal_tool.terminal_tool(
+            command="printf HERMES_FORCE_FOREGROUND",
+            background=True,
+            notify_on_complete=True,
+            session_id="force-foreground-test",
+        )
+    )
+
+    assert result["exit_code"] == 0
+    assert result["output"] == "HERMES_FORCE_FOREGROUND"
+    assert "session_id" not in result
 
 
 def test_printf_literal_sudo_does_not_trigger_rewrite(monkeypatch):

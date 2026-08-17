@@ -137,6 +137,35 @@ class TestSetupLogging:
 
 
 
+class TestReleaseLoggingHome:
+    def test_releases_only_target_profile_handlers(self, tmp_path):
+        home_a = tmp_path / "profile-a"
+        home_b = tmp_path / "profile-b"
+        hermes_logging.setup_logging(hermes_home=home_a)
+        hermes_logging.setup_logging(hermes_home=home_b)
+
+        logger = logging.getLogger("test_hermes_logging.release_home")
+        logger.info("before release")
+        hermes_logging.flush_log_queue()
+
+        released = hermes_logging.release_logging_home(home_a)
+        assert released == 2
+        remaining = [Path(h.baseFilename) for h in hermes_logging.rotating_file_handlers()]
+        assert remaining
+        assert all((home_a / "logs") not in path.parents for path in remaining)
+        assert any((home_b / "logs") in path.parents for path in remaining)
+
+        logger.info("after release")
+        hermes_logging.flush_log_queue()
+        assert "after release" in (home_b / "logs" / "agent.log").read_text()
+
+    def test_release_is_idempotent(self, tmp_path):
+        home = tmp_path / "ephemeral"
+        hermes_logging.setup_logging(hermes_home=home)
+        assert hermes_logging.release_logging_home(home) == 2
+        assert hermes_logging.release_logging_home(home) == 0
+
+
 class TestGatewayMode:
     """setup_logging(mode='gateway') creates a filtered gateway.log."""
 

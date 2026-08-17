@@ -10,6 +10,7 @@ Covers:
 """
 
 import asyncio
+import json
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -21,6 +22,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
+    _api_request_profile,
     _approval_event_choices,
     cors_middleware,
     security_headers_middleware,
@@ -71,6 +73,7 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
     app.router.add_post("/v1/runs/{run_id}/steer", adapter._handle_steer_run)
+    app.router.add_post("/v1/runs/{run_id}/finalize", adapter._handle_finalize_run)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
     return app
 
@@ -146,6 +149,21 @@ class TestStartRun:
                 assert status["run_id"] == data["run_id"]
                 assert status["status"] in {"queued", "running", "completed"}
                 assert status["object"] == "hermes.run"
+
+    @pytest.mark.asyncio
+    async def test_start_rejects_invalid_approval_budget(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/runs",
+                json={"input": "hello", "approval_budget": 0},
+            )
+            data = await resp.json()
+
+        assert resp.status == 400
+        assert data["error"]["code"] == "invalid_approval_budget"
+        assert adapter._run_streams == {}
+        assert adapter._run_approval_budgets == {}
 
     @pytest.mark.asyncio
     async def test_start_binds_chat_id_for_delegation_wake_target(self, adapter):
@@ -333,6 +351,130 @@ class TestRunEvents:
                 assert "run.completed" in body
                 assert "Hello!" in body
 
+    @pytest.mark.asyncio
+    async def test_tool_completed_events_record_final_tool_evidence(self, adapter):
+        run_id = "run_tool_evidence"
+        adapter._run_streams[run_id] = asyncio.Queue()
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "running",
+            "tool_calls": 0,
+            "tool_errors": 0,
+            "last_tool_error": None,
+        }
+        callback = adapter._make_run_event_callback(
+            run_id, asyncio.get_running_loop()
+        )
+
+        callback("tool.completed", tool_name="terminal", duration=0.1, is_error=True)
+        callback("tool.completed", tool_name="terminal", duration=0.1, is_error=False)
+        await asyncio.sleep(0)
+
+        status = adapter._run_statuses[run_id]
+        assert status["tool_calls"] == 2
+        assert status["tool_errors"] == 1
+        assert status["last_tool_error"] is False
+
+    @pytest.mark.asyncio
+    async def test_foreground_terminal_records_actual_command_exit(self, adapter):
+        run_id = "run_command_foreground"
+        adapter._run_streams[run_id] = asyncio.Queue()
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "running",
+            "tool_calls": 0,
+            "tool_errors": 0,
+            "last_tool_error": None,
+            "command_calls": 0,
+            "command_errors": 0,
+            "last_command_error": None,
+            "pending_processes": 0,
+            "command_evidence_invalid": False,
+        }
+        adapter._run_pending_processes[run_id] = set()
+        callback = adapter._make_run_event_callback(
+            run_id, asyncio.get_running_loop()
+        )
+
+        callback(
+            "tool.completed",
+            "terminal",
+            None,
+            {"command": "false", "background": False},
+            duration=0.1,
+            is_error=False,
+            result=json.dumps({"output": "", "exit_code": 1, "error": None}),
+        )
+        await asyncio.sleep(0)
+
+        status = adapter._run_statuses[run_id]
+        assert status["command_calls"] == 1
+        assert status["command_errors"] == 1
+        assert status["last_command_error"] is True
+        assert status["pending_processes"] == 0
+        assert status["command_evidence_invalid"] is False
+
+    @pytest.mark.asyncio
+    async def test_background_terminal_requires_process_exit_evidence(self, adapter):
+        run_id = "run_command_background"
+        adapter._run_streams[run_id] = asyncio.Queue()
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "running",
+            "tool_calls": 0,
+            "tool_errors": 0,
+            "last_tool_error": None,
+            "command_calls": 0,
+            "command_errors": 0,
+            "last_command_error": None,
+            "pending_processes": 0,
+            "command_evidence_invalid": False,
+        }
+        adapter._run_pending_processes[run_id] = set()
+        callback = adapter._make_run_event_callback(
+            run_id, asyncio.get_running_loop()
+        )
+
+        callback(
+            "tool.completed",
+            "terminal",
+            None,
+            {"command": "false", "background": True},
+            duration=0.01,
+            is_error=False,
+            result=json.dumps(
+                {
+                    "output": "Background process started",
+                    "session_id": "proc-1",
+                    "exit_code": 0,
+                    "error": None,
+                }
+            ),
+        )
+        status = adapter._run_statuses[run_id]
+        assert status["command_calls"] == 0
+        assert status["pending_processes"] == 1
+
+        callback(
+            "tool.completed",
+            "process",
+            None,
+            {"action": "wait", "session_id": "proc-1"},
+            duration=0.01,
+            is_error=False,
+            result=json.dumps({"status": "exited", "exit_code": 1}),
+        )
+        await asyncio.sleep(0)
+
+        status = adapter._run_statuses[run_id]
+        assert status["command_calls"] == 1
+        assert status["command_errors"] == 1
+        assert status["last_command_error"] is True
+        assert status["pending_processes"] == 0
+        assert status["command_evidence_invalid"] is False
 
     @pytest.mark.asyncio
     async def test_approval_resolve_all_is_scoped_to_target_run(self, auth_adapter):
@@ -403,6 +545,134 @@ class TestRunEvents:
                     approval_mod._gateway_queues.pop(victim_run, None)
                 victim_interrupted.set()
                 attacker_interrupted.set()
+
+
+@pytest.mark.asyncio
+async def test_bounded_run_rejects_persistent_and_bulk_approval(auth_adapter):
+    app = _create_runs_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        with patch.object(auth_adapter, "_create_agent") as mock_create:
+            agent, ready, interrupted = _make_slow_agent()
+            mock_create.return_value = agent
+            resp = await cli.post(
+                "/v1/runs",
+                json={"input": "bounded", "approval_budget": 1},
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert resp.status == 202
+            run_id = (await resp.json())["run_id"]
+            ready.wait(timeout=3.0)
+
+            entry = approval_mod._ApprovalEntry({
+                "command": "bash -c bounded-danger",
+                "description": "bounded approval",
+                "pattern_keys": ["shell-c"],
+            })
+            with approval_mod._lock:
+                approval_mod._gateway_queues[run_id] = [entry]
+
+            persistent = await cli.post(
+                f"/v1/runs/{run_id}/approval",
+                json={"choice": "session"},
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert persistent.status == 400
+            assert (await persistent.json())["error"]["code"] == (
+                "bounded_approval_choice_required"
+            )
+
+            bulk = await cli.post(
+                f"/v1/runs/{run_id}/approval",
+                json={"choice": "once", "resolve_all": True},
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert bulk.status == 400
+            assert (await bulk.json())["error"]["code"] == (
+                "bounded_approval_bulk_forbidden"
+            )
+            assert entry.result is None
+            assert not entry.event.is_set()
+
+            with approval_mod._lock:
+                approval_mod._gateway_queues.pop(run_id, None)
+            interrupted.set()
+
+
+@pytest.mark.asyncio
+async def test_approval_budget_auto_denies_request_over_limit(adapter):
+    app = _create_runs_app(adapter)
+    decisions = []
+
+    def _approval_run(user_message=None, conversation_history=None, task_id=None):
+        del user_message, conversation_history
+        with approval_mod._lock:
+            notify = approval_mod._gateway_notify_cbs[task_id]
+        for index in (1, 2):
+            decision = approval_mod._await_gateway_decision(
+                task_id,
+                notify,
+                {
+                    "command": f"bash -c bounded-{index}",
+                    "description": f"bounded approval {index}",
+                    "pattern_key": "shell-c",
+                    "pattern_keys": ["shell-c"],
+                    "allow_permanent": True,
+                    "allow_session": True,
+                },
+            )
+            decisions.append(decision)
+        return {"final_response": "bounded done"}
+
+    async with TestClient(TestServer(app)) as cli:
+        with patch.object(adapter, "_create_agent") as mock_create:
+            agent = MagicMock()
+            agent.run_conversation.side_effect = _approval_run
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            mock_create.return_value = agent
+
+            resp = await cli.post(
+                "/v1/runs",
+                json={"input": "bounded", "approval_budget": 1},
+            )
+            assert resp.status == 202
+            run_id = (await resp.json())["run_id"]
+
+            for _ in range(100):
+                status_resp = await cli.get(f"/v1/runs/{run_id}")
+                status = await status_resp.json()
+                if status["status"] == "waiting_for_approval":
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("first bounded approval did not become pending")
+
+            assert status["approval_budget"] == 1
+            assert status["approval_count"] == 1
+            approval = await cli.post(
+                f"/v1/runs/{run_id}/approval",
+                json={"choice": "once"},
+            )
+            assert approval.status == 200
+
+            for _ in range(100):
+                status_resp = await cli.get(f"/v1/runs/{run_id}")
+                status = await status_resp.json()
+                if status["status"] == "completed":
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("bounded run did not complete")
+
+    assert decisions[0]["choice"] == "once"
+    assert decisions[0]["resolved"] is True
+    assert decisions[1]["choice"] == "deny"
+    assert decisions[1]["resolved"] is True
+    assert decisions[1]["reason"] == "Run approval budget exhausted"
+    assert status["approval_budget"] == 1
+    assert status["approval_count"] == 2
+    assert status["approval_budget_exhausted"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -636,6 +906,190 @@ class TestRunLifecycleSweep:
 # ---------------------------------------------------------------------------
 # POST /v1/runs/{run_id}/stop — interrupt a running agent
 # ---------------------------------------------------------------------------
+
+
+class TestFinalizeRun:
+    @staticmethod
+    def _request(run_id: str):
+        request = MagicMock()
+        request.match_info = {"run_id": run_id}
+        return request
+
+    async def _finalize(self, adapter, run_id: str, profile: str = "fleet-execution"):
+        token = _api_request_profile.set(profile)
+        try:
+            with patch.object(adapter, "_check_auth", return_value=None):
+                return await adapter._handle_finalize_run(self._request(run_id))
+        finally:
+            _api_request_profile.reset(token)
+
+    @pytest.mark.asyncio
+    async def test_terminal_multiplex_run_finalizes_profile_runtime(self, adapter):
+        run_id = "run_final"
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "completed",
+            "quiescent": False,
+            "tool_calls": 2,
+            "tool_errors": 1,
+            "last_tool_error": False,
+        }
+        adapter._run_profiles[run_id] = "fleet-execution"
+
+        with patch.object(
+            adapter,
+            "_release_profile_runtime",
+            return_value={"session_db_released": True, "log_handlers_released": 2},
+        ) as release:
+            response = await self._finalize(adapter, run_id)
+
+        assert response.status == 200
+        payload = json.loads(response.text)
+        assert payload == {
+            "object": "hermes.run.finalization",
+            "run_id": run_id,
+            "status": "completed",
+            "quiescent": True,
+            "session_db_released": True,
+            "log_handlers_released": 2,
+            "tool_calls": 2,
+            "tool_errors": 1,
+            "last_tool_error": False,
+            "command_calls": 0,
+            "command_errors": 0,
+            "last_command_error": None,
+            "pending_processes": 0,
+            "command_evidence_invalid": False,
+        }
+        assert adapter._run_statuses[run_id]["quiescent"] is True
+        assert adapter._run_statuses[run_id]["last_event"] == "run.finalized"
+        release.assert_called_once_with("fleet-execution")
+
+    @pytest.mark.asyncio
+    async def test_finalize_resolves_unawaited_background_process(self, adapter):
+        from tools.process_registry import process_registry
+
+        run_id = "run_final_background"
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "completed",
+            "quiescent": False,
+            "tool_calls": 1,
+            "tool_errors": 0,
+            "last_tool_error": False,
+            "command_calls": 0,
+            "command_errors": 0,
+            "last_command_error": None,
+            "pending_processes": 1,
+            "command_evidence_invalid": False,
+        }
+        adapter._run_profiles[run_id] = "fleet-execution"
+        adapter._run_pending_processes[run_id] = {"proc-auto"}
+
+        with (
+            patch.object(
+                process_registry,
+                "poll",
+                return_value={"status": "exited", "exit_code": 1},
+            ) as poll,
+            patch.object(
+                adapter,
+                "_release_profile_runtime",
+                return_value={
+                    "session_db_released": True,
+                    "log_handlers_released": 0,
+                },
+            ),
+        ):
+            response = await self._finalize(adapter, run_id)
+
+        assert response.status == 200
+        payload = json.loads(response.text)
+        assert payload["command_calls"] == 1
+        assert payload["command_errors"] == 1
+        assert payload["last_command_error"] is True
+        assert payload["pending_processes"] == 0
+        assert payload["command_evidence_invalid"] is False
+        poll.assert_called_once_with("proc-auto")
+
+    @pytest.mark.asyncio
+    async def test_finalize_is_idempotent(self, adapter):
+        run_id = "run_final_idempotent"
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "completed",
+            "quiescent": False,
+        }
+        adapter._run_profiles[run_id] = "fleet-execution"
+        with patch.object(
+            adapter,
+            "_release_profile_runtime",
+            return_value={"session_db_released": True, "log_handlers_released": 2},
+        ) as release:
+            first = await self._finalize(adapter, run_id)
+            second = await self._finalize(adapter, run_id)
+
+        assert first.status == second.status == 200
+        assert json.loads(second.text)["quiescent"] is True
+        release.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_finalize_rejects_unknown_and_nonterminal_runs(self, adapter):
+        unknown = await self._finalize(adapter, "run_missing")
+        assert unknown.status == 404
+
+        run_id = "run_active"
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "running",
+            "quiescent": False,
+        }
+        adapter._run_profiles[run_id] = "fleet-execution"
+        nonterminal = await self._finalize(adapter, run_id)
+        assert nonterminal.status == 409
+        assert json.loads(nonterminal.text)["error"]["code"] == "run_not_terminal"
+
+    @pytest.mark.asyncio
+    async def test_finalize_rejects_wrong_profile(self, adapter):
+        run_id = "run_wrong_profile"
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "completed",
+            "quiescent": False,
+        }
+        adapter._run_profiles[run_id] = "fleet-execution"
+        response = await self._finalize(adapter, run_id, profile="other-profile")
+        assert response.status == 409
+        assert json.loads(response.text)["error"]["code"] == "run_profile_mismatch"
+
+    @pytest.mark.asyncio
+    async def test_finalize_rejects_while_same_profile_run_is_active(self, adapter):
+        run_id = "run_done"
+        other_id = "run_other"
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "completed",
+            "quiescent": False,
+        }
+        adapter._run_profiles[run_id] = "fleet-execution"
+        adapter._run_profiles[other_id] = "fleet-execution"
+        other_task = asyncio.create_task(asyncio.sleep(10))
+        adapter._active_run_tasks[other_id] = other_task
+        try:
+            response = await self._finalize(adapter, run_id)
+        finally:
+            other_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await other_task
+
+        assert response.status == 409
+        assert json.loads(response.text)["error"]["code"] == "run_profile_busy"
 
 
 class TestStopRun:

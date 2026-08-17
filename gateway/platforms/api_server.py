@@ -1428,6 +1428,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
+        # Multiplex profile identity retained until terminal run finalization.
+        # External lifecycle owners may require an explicit quiescence barrier
+        # before changing execution-bound state associated with the profile.
+        self._run_profiles: Dict[str, Optional[str]] = {}
+        self._run_finalize_locks: Dict[str, "asyncio.Lock"] = {}
         # Stop is cooperative: the executor thread may outlive the HTTP request.
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
@@ -1436,6 +1441,17 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        # Optional run-scoped approval budgets. Fleet supplies a finite ceiling
+        # so a looping model cannot turn repeated `once` approvals into
+        # effectively unbounded authority until the wall-clock deadline.
+        self._run_approval_budgets: Dict[str, int] = {}
+        self._run_approval_counts: Dict[str, int] = {}
+        self._run_approval_budget_lock = threading.Lock()
+        # Command evidence is stronger than generic tool completion. Foreground
+        # terminal calls contribute their actual exit code; background terminal
+        # calls remain pending until process status proves their exit outcome.
+        self._run_pending_processes: Dict[str, set[str]] = {}
+        self._run_command_evidence_lock = threading.Lock()
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         # Last-known-good resolved model per session (keyed by gateway_session_key
         # ONLY — never session_id, which rotates/is ephemeral for one-off API
@@ -2093,6 +2109,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
             ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
+            ("POST", "/v1/runs/{run_id}/finalize", self._handle_finalize_run),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
         ]
         if _CRON_AVAILABLE:
@@ -2191,6 +2208,38 @@ class APIServerAdapter(BasePlatformAdapter):
             db = SessionDB(db_path=home / "state.db")
             cache[key] = db
         return db
+
+    def _close_cached_profile_session_db(self, home: Path) -> bool:
+        """Close and evict one cached multiplex-profile SessionDB.
+
+        ``SessionDB.close()`` is the persistence barrier: it drains queued token
+        accounting before closing SQLite. The explicit API-run finalization
+        contract uses this to prove profile-owned persistence is quiescent.
+        """
+        key = str(home)
+        with self._session_db_cache_lock:
+            db = self._session_dbs.pop(key, None)
+        if db is None:
+            return False
+        try:
+            db.close()
+        except Exception as exc:
+            logger.warning("Failed to close profile SessionDB %s: %s", key, exc)
+            raise
+        return True
+
+    def _release_profile_runtime(self, profile: str) -> dict[str, Any]:
+        """Synchronously quiesce cached state rooted under one multiplex profile."""
+        from hermes_cli.profiles import get_profile_dir
+        from hermes_logging import release_logging_home
+
+        home = Path(get_profile_dir(profile))
+        session_db_released = self._close_cached_profile_session_db(home)
+        log_handlers_released = release_logging_home(home)
+        return {
+            "session_db_released": session_db_released,
+            "log_handlers_released": int(log_handlers_released),
+        }
 
     def _ensure_session_db(self):
         """Lazily initialise and return the SessionDB for the active profile home.
@@ -3130,6 +3179,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events_sse": True,
                 "run_stop": True,
                 "run_steer": True,
+                "run_finalize": True,
+                "run_approval_budget": True,
+                "run_tool_evidence": True,
+                "run_command_evidence": True,
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
@@ -3161,6 +3214,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_steer": {"method": "POST", "path": "/v1/runs/{run_id}/steer"},
+                "run_finalize": {"method": "POST", "path": "/v1/runs/{run_id}/finalize"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
@@ -6466,6 +6520,112 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_statuses[run_id] = current
         return current
 
+    @staticmethod
+    def _tool_result_document(value: Any) -> Optional[Dict[str, Any]]:
+        """Parse one bounded JSON tool result without trusting model-visible text."""
+        if type(value) is dict:
+            return value
+        if type(value) is not str or not 0 < len(value) <= 131_072:
+            return None
+        try:
+            decoded = json.loads(value)
+        except (ValueError, TypeError, RecursionError):
+            return None
+        return decoded if type(decoded) is dict else None
+
+    def _track_background_process(self, run_id: str, session_id: str) -> None:
+        if type(session_id) is not str or not session_id or len(session_id) > 512:
+            self._mark_command_evidence_invalid(run_id)
+            return
+        with self._run_command_evidence_lock:
+            pending = self._run_pending_processes.setdefault(run_id, set())
+            pending.add(session_id)
+            current = self._run_statuses.get(run_id, {})
+            self._set_run_status(
+                run_id,
+                current.get("status", "running"),
+                pending_processes=len(pending),
+            )
+
+    def _record_command_exit(
+        self,
+        run_id: str,
+        exit_code: int,
+        *,
+        session_id: Optional[str] = None,
+    ) -> None:
+        if type(exit_code) is not int:
+            self._mark_command_evidence_invalid(run_id, session_id=session_id)
+            return
+        with self._run_command_evidence_lock:
+            pending = self._run_pending_processes.setdefault(run_id, set())
+            if session_id is not None:
+                if session_id not in pending:
+                    return
+                pending.remove(session_id)
+            current = self._run_statuses.get(run_id, {})
+            command_calls = int(current.get("command_calls", 0) or 0) + 1
+            command_errors = int(current.get("command_errors", 0) or 0) + int(
+                exit_code != 0
+            )
+            self._set_run_status(
+                run_id,
+                current.get("status", "running"),
+                command_calls=command_calls,
+                command_errors=command_errors,
+                last_command_error=exit_code != 0,
+                pending_processes=len(pending),
+            )
+
+    def _mark_command_evidence_invalid(
+        self, run_id: str, *, session_id: Optional[str] = None
+    ) -> None:
+        with self._run_command_evidence_lock:
+            pending = self._run_pending_processes.setdefault(run_id, set())
+            if session_id is not None:
+                pending.discard(session_id)
+            current = self._run_statuses.get(run_id, {})
+            self._set_run_status(
+                run_id,
+                current.get("status", "running"),
+                command_evidence_invalid=True,
+                pending_processes=len(pending),
+            )
+
+    def _refresh_pending_process_evidence(self, run_id: str) -> None:
+        """Resolve exited background commands independently of model behavior."""
+        with self._run_command_evidence_lock:
+            pending = tuple(self._run_pending_processes.get(run_id, set()))
+        if not pending:
+            return
+        try:
+            from tools.process_registry import process_registry
+        except Exception:
+            self._mark_command_evidence_invalid(run_id)
+            return
+        for session_id in pending:
+            try:
+                result = process_registry.poll(session_id)
+            except Exception:
+                self._mark_command_evidence_invalid(run_id, session_id=session_id)
+                continue
+            if type(result) is not dict:
+                self._mark_command_evidence_invalid(run_id, session_id=session_id)
+                continue
+            status = result.get("status")
+            if status == "exited":
+                exit_code = result.get("exit_code")
+                if type(exit_code) is int:
+                    self._record_command_exit(
+                        run_id, exit_code, session_id=session_id
+                    )
+                else:
+                    self._mark_command_evidence_invalid(
+                        run_id, session_id=session_id
+                    )
+            elif status == "not_found":
+                self._mark_command_evidence_invalid(run_id, session_id=session_id)
+
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
         def _push(event: Dict[str, Any]) -> None:
@@ -6493,13 +6653,74 @@ class APIServerAdapter(BasePlatformAdapter):
                     "preview": preview,
                 })
             elif event_type == "tool.completed":
+                is_error = bool(kwargs.get("is_error", False))
+                current = self._run_statuses.get(run_id, {})
+                tool_calls = int(current.get("tool_calls", 0) or 0) + 1
+                tool_errors = int(current.get("tool_errors", 0) or 0) + int(is_error)
+                self._set_run_status(
+                    run_id,
+                    current.get("status", "running"),
+                    tool_calls=tool_calls,
+                    tool_errors=tool_errors,
+                    last_tool_error=is_error,
+                )
+
+                result_document = kwargs.get("result_metadata")
+                if type(result_document) is not dict or not result_document:
+                    result_document = self._tool_result_document(kwargs.get("result"))
+                if tool_name == "terminal":
+                    if result_document is None:
+                        if is_error:
+                            self._record_command_exit(run_id, -1)
+                        else:
+                            self._mark_command_evidence_invalid(run_id)
+                    else:
+                        process_session = result_document.get("session_id")
+                        if type(process_session) is str and process_session:
+                            self._track_background_process(run_id, process_session)
+                        else:
+                            exit_code = result_document.get("exit_code")
+                            if type(exit_code) is int:
+                                self._record_command_exit(run_id, exit_code)
+                            elif is_error:
+                                self._record_command_exit(run_id, -1)
+                            else:
+                                self._mark_command_evidence_invalid(run_id)
+                elif tool_name == "process" and type(args) is dict:
+                    action = args.get("action")
+                    process_session = args.get("session_id")
+                    if (
+                        action in {"poll", "wait"}
+                        and type(process_session) is str
+                        and process_session
+                        and result_document is not None
+                    ):
+                        process_status = result_document.get("status")
+                        exit_code = result_document.get("exit_code")
+                        if process_status == "exited" and type(exit_code) is int:
+                            self._record_command_exit(
+                                run_id, exit_code, session_id=process_session
+                            )
+                        elif process_status == "not_found":
+                            self._mark_command_evidence_invalid(
+                                run_id, session_id=process_session
+                            )
+                    elif (
+                        action in {"kill", "close"}
+                        and type(process_session) is str
+                        and process_session
+                    ):
+                        self._record_command_exit(
+                            run_id, -1, session_id=process_session
+                        )
+
                 _push({
                     "event": "tool.completed",
                     "run_id": run_id,
                     "timestamp": ts,
                     "tool": tool_name,
                     "duration": round(kwargs.get("duration", 0), 3),
-                    "error": kwargs.get("is_error", False),
+                    "error": is_error,
                 })
             elif event_type == "reasoning.available":
                 _push({
@@ -6577,6 +6798,18 @@ class APIServerAdapter(BasePlatformAdapter):
             body = await request.json()
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        approval_budget = body.get("approval_budget")
+        if approval_budget is not None and (
+            type(approval_budget) is not int or not 1 <= approval_budget <= 32
+        ):
+            return web.json_response(
+                _openai_error(
+                    "'approval_budget' must be an integer between 1 and 32",
+                    code="invalid_approval_budget",
+                ),
+                status=400,
+            )
 
         raw_input = body.get("input")
         if not raw_input:
@@ -6661,6 +6894,12 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_streams[run_id] = q
         self._run_streams_created[run_id] = created_at
         self._run_approval_sessions[run_id] = approval_session_key
+        if approval_budget is not None:
+            with self._run_approval_budget_lock:
+                self._run_approval_budgets[run_id] = approval_budget
+                self._run_approval_counts[run_id] = 0
+        with self._run_command_evidence_lock:
+            self._run_pending_processes[run_id] = set()
 
         event_cb = self._make_run_event_callback(run_id, loop)
 
@@ -6691,11 +6930,23 @@ class APIServerAdapter(BasePlatformAdapter):
             created_at=created_at,
             session_id=session_id,
             model=body.get("model", self._model_name),
+            quiescent=False,
+            approval_budget=approval_budget,
+            approval_count=0 if approval_budget is not None else None,
+            tool_calls=0,
+            tool_errors=0,
+            last_tool_error=None,
+            command_calls=0,
+            command_errors=0,
+            last_command_error=None,
+            pending_processes=0,
+            command_evidence_invalid=False,
         )
 
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
         request_profile = _api_request_profile.get()
+        self._run_profiles[run_id] = request_profile
 
         async def _run_and_close():
             try:
@@ -6736,19 +6987,65 @@ class APIServerAdapter(BasePlatformAdapter):
                         from gateway.run import _redact_approval_command
 
                         event["command"] = _redact_approval_command(event.get("command"))
+                    with self._run_approval_budget_lock:
+                        budget = self._run_approval_budgets.get(run_id)
+                        approval_count = self._run_approval_counts.get(run_id, 0) + 1
+                        if budget is not None:
+                            self._run_approval_counts[run_id] = approval_count
+
+                    if budget is not None and approval_count > budget:
+                        from tools.approval import resolve_gateway_approval
+
+                        resolved = resolve_gateway_approval(
+                            approval_session_key,
+                            "deny",
+                            reason="Run approval budget exhausted",
+                        )
+                        denied_event = {
+                            **event,
+                            "event": "approval.denied",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "reason": "approval_budget_exhausted",
+                            "approval_budget": budget,
+                            "approval_count": approval_count,
+                            "resolved": resolved,
+                        }
+                        self._set_run_status(
+                            run_id,
+                            "running",
+                            last_event="approval.denied",
+                            approval_budget=budget,
+                            approval_count=approval_count,
+                            approval_budget_exhausted=True,
+                        )
+                        try:
+                            loop.call_soon_threadsafe(q.put_nowait, denied_event)
+                        except Exception:
+                            pass
+                        return
+
                     event.update({
                         "event": "approval.request",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                        "choices": _approval_event_choices(
-                            smart_denied=bool(event.get("smart_denied")),
-                            allow_permanent=event.get("allow_permanent") is not False,
+                        "choices": (
+                            ["once", "deny"]
+                            if budget is not None
+                            else _approval_event_choices(
+                                smart_denied=bool(event.get("smart_denied")),
+                                allow_permanent=event.get("allow_permanent") is not False,
+                            )
                         ),
+                        "approval_budget": budget,
+                        "approval_count": approval_count if budget is not None else None,
                     })
                     self._set_run_status(
                         run_id,
                         "waiting_for_approval",
                         last_event="approval.request",
+                        approval_budget=budget,
+                        approval_count=approval_count if budget is not None else None,
                     )
                     try:
                         loop.call_soon_threadsafe(q.put_nowait, event)
@@ -6954,6 +7251,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
+                with self._run_approval_budget_lock:
+                    self._run_approval_budgets.pop(run_id, None)
+                    self._run_approval_counts.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
 
         self._activate_admitted_request()
@@ -7073,6 +7373,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 status=400,
             )
+        with self._run_approval_budget_lock:
+            approval_budget = self._run_approval_budgets.get(run_id)
+        if approval_budget is not None and choice not in {"once", "deny"}:
+            return web.json_response(
+                _openai_error(
+                    "Run-scoped approval budgets permit only once or deny",
+                    code="bounded_approval_choice_required",
+                ),
+                status=400,
+            )
 
         approval_session_key = self._run_approval_sessions.get(run_id)
         if not approval_session_key:
@@ -7088,6 +7398,14 @@ class APIServerAdapter(BasePlatformAdapter):
             _coerce_request_bool(body.get("all"), default=False)
             or _coerce_request_bool(body.get("resolve_all"), default=False)
         )
+        if approval_budget is not None and resolve_all:
+            return web.json_response(
+                _openai_error(
+                    "Run-scoped approval budgets do not permit bulk approval",
+                    code="bounded_approval_bulk_forbidden",
+                ),
+                status=400,
+            )
         try:
             from tools.approval import resolve_gateway_approval
 
@@ -7190,6 +7508,169 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
         return web.json_response({"object": "hermes.run.steer", "run_id": run_id, "accepted": True})
 
+    async def _handle_finalize_run(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/finalize — prove profile runtime quiescence.
+
+        Terminal model output is not sufficient proof that profile-owned
+        persistence is quiescent. Finalization closes the profile's cached
+        SessionDB (draining async token accounting) and drains + detaches
+        profile-specific file log handlers. The endpoint is
+        intentionally idempotent so a control plane can safely retry after an
+        uncertain HTTP response.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        status = self._run_statuses.get(run_id)
+        if status is None:
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
+
+        terminal_states = {"completed", "failed", "cancelled"}
+        if status.get("status") not in terminal_states:
+            return web.json_response(
+                _openai_error(
+                    f"Run is not terminal: {run_id}", code="run_not_terminal"
+                ),
+                status=409,
+            )
+
+        run_profile = self._run_profiles.get(run_id)
+        request_profile = _api_request_profile.get()
+        if run_profile is None:
+            return web.json_response(
+                _openai_error(
+                    "Run finalization requires a multiplex profile",
+                    code="run_not_multiplexed",
+                ),
+                status=409,
+            )
+        if request_profile != run_profile:
+            return web.json_response(
+                _openai_error(
+                    "Run finalization profile does not match the run",
+                    code="run_profile_mismatch",
+                ),
+                status=409,
+            )
+
+        lock = self._run_finalize_locks.get(run_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._run_finalize_locks[run_id] = lock
+
+        async with lock:
+            status = self._run_statuses.get(run_id)
+            if status is None:
+                return web.json_response(
+                    _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                    status=404,
+                )
+            if status.get("quiescent") is True:
+                return web.json_response({
+                    "object": "hermes.run.finalization",
+                    "run_id": run_id,
+                    "status": status.get("status"),
+                    "quiescent": True,
+                    "session_db_released": False,
+                    "log_handlers_released": 0,
+                    "tool_calls": int(status.get("tool_calls", 0) or 0),
+                    "tool_errors": int(status.get("tool_errors", 0) or 0),
+                    "last_tool_error": status.get("last_tool_error"),
+                    "command_calls": int(status.get("command_calls", 0) or 0),
+                    "command_errors": int(status.get("command_errors", 0) or 0),
+                    "last_command_error": status.get("last_command_error"),
+                    "pending_processes": int(status.get("pending_processes", 0) or 0),
+                    "command_evidence_invalid": bool(
+                        status.get("command_evidence_invalid", False)
+                    ),
+                })
+
+            task = self._active_run_tasks.get(run_id)
+            if task is not None and not task.done():
+                return web.json_response(
+                    _openai_error(
+                        "Run terminal status is still finalizing",
+                        code="run_finalization_pending",
+                    ),
+                    status=409,
+                )
+
+            for other_id, other_profile in list(self._run_profiles.items()):
+                if other_id == run_id or other_profile != run_profile:
+                    continue
+                other_task = self._active_run_tasks.get(other_id)
+                if other_task is not None and not other_task.done():
+                    return web.json_response(
+                        _openai_error(
+                            "Another run is active for this profile",
+                            code="run_profile_busy",
+                        ),
+                        status=409,
+                    )
+
+            await asyncio.to_thread(self._refresh_pending_process_evidence, run_id)
+            status = self._run_statuses.get(run_id) or status
+
+            try:
+                released = await asyncio.to_thread(
+                    self._release_profile_runtime, run_profile
+                )
+            except Exception:
+                logger.exception(
+                    "[api_server] run %s profile finalization failed", run_id
+                )
+                return web.json_response(
+                    _openai_error(
+                        "Run profile finalization failed",
+                        err_type="server_error",
+                        code="run_finalization_failed",
+                    ),
+                    status=500,
+                )
+
+            finalized_at = time.time()
+            current_state = str(status.get("status") or "")
+            self._set_run_status(
+                run_id,
+                current_state,
+                quiescent=True,
+                finalized_at=finalized_at,
+                last_event="run.finalized",
+            )
+            q = self._run_streams.get(run_id)
+            if q is not None:
+                try:
+                    q.put_nowait({
+                        "event": "run.finalized",
+                        "run_id": run_id,
+                        "timestamp": finalized_at,
+                        "quiescent": True,
+                    })
+                except Exception:
+                    pass
+            return web.json_response({
+                "object": "hermes.run.finalization",
+                "run_id": run_id,
+                "status": current_state,
+                "quiescent": True,
+                "tool_calls": int(status.get("tool_calls", 0) or 0),
+                "tool_errors": int(status.get("tool_errors", 0) or 0),
+                "last_tool_error": status.get("last_tool_error"),
+                "command_calls": int(status.get("command_calls", 0) or 0),
+                "command_errors": int(status.get("command_errors", 0) or 0),
+                "last_command_error": status.get("last_command_error"),
+                "pending_processes": int(status.get("pending_processes", 0) or 0),
+                "command_evidence_invalid": bool(
+                    status.get("command_evidence_invalid", False)
+                ),
+                **released,
+            })
+
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
         auth_err = self._check_auth(request)
@@ -7259,6 +7740,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
+                with self._run_approval_budget_lock:
+                    self._run_approval_budgets.pop(run_id, None)
+                    self._run_approval_counts.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
 
         stale_statuses = [
@@ -7269,6 +7753,10 @@ class APIServerAdapter(BasePlatformAdapter):
         ]
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
+            self._run_profiles.pop(run_id, None)
+            self._run_finalize_locks.pop(run_id, None)
+            with self._run_command_evidence_lock:
+                self._run_pending_processes.pop(run_id, None)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface

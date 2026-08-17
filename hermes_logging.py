@@ -700,6 +700,56 @@ def rotating_file_handlers() -> list:
     return list(_queued_file_handlers)
 
 
+def release_logging_home(hermes_home: Path) -> int:
+    """Drain and detach file handlers rooted under one Hermes profile home.
+
+    A long-lived gateway must not retain a rotating handler after a profile's
+    runtime state is explicitly finalized. This helper drains the shared queue
+    first, removes only handlers below ``<home>/logs``, closes
+    them, and restarts the listener for every other profile's handlers.
+
+    Returns the number of handlers released.  The operation is idempotent.
+    """
+    if not isinstance(hermes_home, Path):
+        hermes_home = Path(hermes_home)
+    target = (hermes_home / "logs").resolve()
+    removed: list[logging.Handler] = []
+
+    global _queue_listener
+    with _queue_state_lock:
+        # QueueListener.stop() drains every record already enqueued before the
+        # listener thread joins.  That gives the profile's file handlers a real
+        # persistence barrier before we close them.
+        _stop_queue_listener_locked()
+
+        kept: list[logging.Handler] = []
+        for handler in _queued_file_handlers:
+            try:
+                base = Path(getattr(handler, "baseFilename", "")).resolve()
+                belongs_to_home = base == target or target in base.parents
+            except Exception:
+                belongs_to_home = False
+            if belongs_to_home:
+                removed.append(handler)
+            else:
+                kept.append(handler)
+
+        _queued_file_handlers[:] = kept
+        for handler in removed:
+            try:
+                handler.close()
+            except Exception:
+                pass
+
+        if _log_queue is not None and _queued_file_handlers:
+            _queue_listener = QueueListener(
+                _log_queue, *_queued_file_handlers, respect_handler_level=True
+            )
+            _queue_listener.start()
+
+    return len(removed)
+
+
 def _reset_queued_handlers() -> None:
     """Tear down the async logging queue + listener (test-isolation helper)."""
     global _log_queue
