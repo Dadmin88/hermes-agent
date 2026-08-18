@@ -23,14 +23,23 @@ Design:
 - Frozen snapshot pattern: system prompt is stable, tool responses show live state
 """
 
+import hashlib
 import json
 import logging
+import os
+import re
+import stat
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, get_process_hermes_home
 from typing import Dict, Any, List, Optional, Tuple
 
+from agent.fleet_memory_scope import (
+    FleetMemoryBinding,
+    FleetMemoryScopeRef,
+    get_fleet_memory,
+)
 from utils import atomic_write_text
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
@@ -54,6 +63,11 @@ def get_memory_dir() -> Path:
     """Return the profile-scoped memories directory."""
     return get_hermes_home() / "memories"
 
+
+def get_fleet_memory_root() -> Path:
+    """Return the process-wide native memory root shared across Hermes profiles."""
+    return get_process_hermes_home() / "memories" / _FLEET_MEMORY_DIR
+
 # Stable header prefixes for the system-prompt memory blocks rendered by
 # MemoryStore._render_block. Exported so compression's prompt-retention check
 # (agent/conversation_compression.py) can detect a leftover block for a
@@ -65,6 +79,15 @@ MEMORY_BLOCK_HEADERS = {
 }
 
 ENTRY_DELIMITER = "\n§\n"
+
+FLEET_MEMORY_META_SCHEMA = "fleet.memory-entry-metadata.v1"
+FLEET_MEMORY_SCOPE_SCHEMA = "fleet.memory-scope-directory.v1"
+_FLEET_MEMORY_DIR = "fleet-v1"
+_FLEET_META_SUFFIX = ".fleet-meta.json"
+_FLEET_HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_FLEET_ALLOWED_SENSITIVITY = frozenset({"private", "internal", "shared"})
+_FLEET_ALLOWED_TRUST = frozenset({"run-derived", "operator", "promoted"})
+_FLEET_ALLOWED_PROMOTION = frozenset({"private", "promoted"})
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +190,7 @@ class MemoryStore:
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
+        self._fleet_memory: Optional[FleetMemoryBinding] = get_fleet_memory()
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
         # Per-turn counter of failed at-capacity consolidation attempts; reset
@@ -217,9 +241,12 @@ class MemoryStore:
         Scanning is deterministic from disk bytes, so the snapshot remains
         stable for the entire session (prefix-cache invariant holds).
         """
+        if self._fleet_memory is not None:
+            self._load_fleet_scoped()
+            return
+
         mem_dir = get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
-
         self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
         self.user_entries = self._read_file(mem_dir / "USER.md")
 
@@ -313,11 +340,407 @@ class MemoryStore:
             fd.close()
 
     @staticmethod
-    def _path_for(target: str) -> Path:
+    def _entry_hash(content: str) -> str:
+        return "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _now_ms() -> int:
+        return int(time.time() * 1000)
+
+    @staticmethod
+    def _target_filename(target: str) -> str:
+        return "USER.md" if target == "user" else "MEMORY.md"
+
+    @staticmethod
+    def _metadata_filename(target: str) -> str:
+        return MemoryStore._target_filename(target) + _FLEET_META_SUFFIX
+
+    @staticmethod
+    def _require_no_symlink_components(path: Path) -> None:
+        if not path.is_absolute() or ".." in path.parts:
+            raise RuntimeError("Fleet memory path is unsafe")
+        normalized = Path(os.path.abspath(os.fspath(path)))
+        current = Path(normalized.anchor)
+        try:
+            identity = current.lstat()
+            for component in normalized.parts[1:]:
+                current /= component
+                if not current.exists() and not current.is_symlink():
+                    break
+                identity = current.lstat()
+                if stat.S_ISLNK(identity.st_mode):
+                    raise RuntimeError("Fleet memory path contains a symbolic link")
+                if current != normalized and not stat.S_ISDIR(identity.st_mode):
+                    raise RuntimeError("Fleet memory path component is not a directory")
+        except OSError as error:
+            raise RuntimeError("Fleet memory path is unsafe") from error
+
+    @staticmethod
+    def _owned_by_current_process(identity: os.stat_result) -> bool:
+        getter = getattr(os, "geteuid", None)
+        if getter is None:
+            return True
+        return identity.st_uid == getter()
+
+    @staticmethod
+    def _require_private_directory(path: Path) -> None:
+        MemoryStore._require_no_symlink_components(path)
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        MemoryStore._require_no_symlink_components(path)
+        identity = path.lstat()
+        if (
+            stat.S_ISLNK(identity.st_mode)
+            or not stat.S_ISDIR(identity.st_mode)
+            or not MemoryStore._owned_by_current_process(identity)
+        ):
+            raise RuntimeError("Fleet memory directory is unsafe")
+        if os.name != "nt":
+            os.chmod(path, 0o700, follow_symlinks=False)
+        verified = path.lstat()
+        if (
+            stat.S_ISLNK(verified.st_mode)
+            or not stat.S_ISDIR(verified.st_mode)
+            or not MemoryStore._owned_by_current_process(verified)
+            or (os.name != "nt" and stat.S_IMODE(verified.st_mode) != 0o700)
+        ):
+            raise RuntimeError("Fleet memory directory permissions are unsafe")
+
+    @staticmethod
+    def _require_private_file(path: Path, *, allow_missing: bool = True) -> bool:
+        MemoryStore._require_no_symlink_components(path)
+        try:
+            identity = path.lstat()
+        except FileNotFoundError:
+            if allow_missing:
+                return False
+            raise RuntimeError("Fleet memory file is missing") from None
+        except OSError as error:
+            raise RuntimeError("Fleet memory file is unsafe") from error
+        if (
+            stat.S_ISLNK(identity.st_mode)
+            or not stat.S_ISREG(identity.st_mode)
+            or not MemoryStore._owned_by_current_process(identity)
+            or identity.st_nlink != 1
+        ):
+            raise RuntimeError("Fleet memory file is unsafe")
+        if os.name != "nt":
+            os.chmod(path, 0o600, follow_symlinks=False)
+        verified = path.lstat()
+        if (
+            stat.S_ISLNK(verified.st_mode)
+            or not stat.S_ISREG(verified.st_mode)
+            or not MemoryStore._owned_by_current_process(verified)
+            or verified.st_nlink != 1
+            or (os.name != "nt" and stat.S_IMODE(verified.st_mode) != 0o600)
+        ):
+            raise RuntimeError("Fleet memory file permissions are unsafe")
+        return True
+
+    def _scope_dir(self, scope: FleetMemoryScopeRef) -> Path:
+        fleet_root = get_fleet_memory_root()
+        root = fleet_root.parent
+        kind_root = fleet_root / scope.kind
+        path = kind_root / scope.storage_key
+        for directory in (root, fleet_root, kind_root, path):
+            self._require_private_directory(directory)
+        return path
+
+    def _scope_descriptor_path(self, scope: FleetMemoryScopeRef) -> Path:
+        return self._scope_dir(scope) / "SCOPE.json"
+
+    def _metadata_path(self, target: str, scope: FleetMemoryScopeRef) -> Path:
+        return self._scope_dir(scope) / self._metadata_filename(target)
+
+    def _ensure_scope_descriptor(self, scope: FleetMemoryScopeRef) -> None:
+        directory = self._scope_dir(scope)
+        directory.mkdir(parents=True, exist_ok=True)
+        descriptor = self._scope_descriptor_path(scope)
+        expected = {
+            "schema": FLEET_MEMORY_SCOPE_SCHEMA,
+            "scope": scope.to_request(),
+        }
+        if self._require_private_file(descriptor):
+            try:
+                current = json.loads(descriptor.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                raise RuntimeError("Fleet memory scope descriptor is unreadable") from error
+            if current != expected:
+                raise RuntimeError("Fleet memory scope descriptor identity changed")
+            return
+        atomic_write_text(
+            descriptor,
+            json.dumps(expected, sort_keys=True, separators=(",", ":")),
+            tmp_prefix=".fleet_scope_",
+        )
+        self._require_private_file(descriptor, allow_missing=False)
+
+    def _read_fleet_metadata(
+        self,
+        target: str,
+        scope: FleetMemoryScopeRef,
+    ) -> Dict[str, Dict[str, Any]]:
+        path = self._metadata_path(target, scope)
+        if not self._require_private_file(path):
+            return {}
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise RuntimeError("Fleet memory metadata is unreadable") from error
+        if (
+            type(document) is not dict
+            or set(document) != {"schema", "scope", "entries"}
+            or document.get("schema") != FLEET_MEMORY_META_SCHEMA
+            or document.get("scope") != scope.to_request()
+            or type(document.get("entries")) is not list
+        ):
+            raise RuntimeError("Fleet memory metadata shape is invalid")
+        result: Dict[str, Dict[str, Any]] = {}
+        expected_fields = {
+            "content_hash",
+            "owner_principal_id",
+            "owner_principal_kind",
+            "scope_kind",
+            "scope_id",
+            "source_run",
+            "agent_instance_id",
+            "sensitivity",
+            "trust",
+            "promotion_state",
+            "retention_until_ms",
+            "provenance",
+            "created_at_ms",
+            "updated_at_ms",
+            "revoked_at_ms",
+        }
+        for item in document["entries"]:
+            if type(item) is not dict or set(item) != expected_fields:
+                raise RuntimeError("Fleet memory entry metadata shape is invalid")
+            content_hash = item.get("content_hash")
+            if type(content_hash) is not str or _FLEET_HASH_RE.fullmatch(content_hash) is None:
+                raise RuntimeError("Fleet memory entry hash is invalid")
+            if content_hash in result:
+                raise RuntimeError("Fleet memory metadata contains duplicate entries")
+            if item.get("scope_kind") != scope.kind or item.get("scope_id") != scope.scope_id:
+                raise RuntimeError("Fleet memory metadata scope identity changed")
+            if item.get("sensitivity") not in _FLEET_ALLOWED_SENSITIVITY:
+                raise RuntimeError("Fleet memory sensitivity is invalid")
+            if item.get("trust") not in _FLEET_ALLOWED_TRUST:
+                raise RuntimeError("Fleet memory trust is invalid")
+            if item.get("promotion_state") not in _FLEET_ALLOWED_PROMOTION:
+                raise RuntimeError("Fleet memory promotion state is invalid")
+            for field in ("created_at_ms", "updated_at_ms"):
+                value = item.get(field)
+                if isinstance(value, bool) or type(value) is not int or value < 1:
+                    raise RuntimeError("Fleet memory timestamp is invalid")
+            retention = item.get("retention_until_ms")
+            revoked = item.get("revoked_at_ms")
+            for value, label in ((retention, "retention"), (revoked, "revocation")):
+                if value is not None and (
+                    isinstance(value, bool) or type(value) is not int or value < 1
+                ):
+                    raise RuntimeError(f"Fleet memory {label} timestamp is invalid")
+            result[content_hash] = dict(item)
+        return result
+
+    def _fleet_metadata_visible(
+        self,
+        metadata: Dict[str, Any],
+        scope: FleetMemoryScopeRef,
+        now_ms: int,
+    ) -> bool:
+        binding = self._fleet_memory
+        if binding is None:
+            return False
+        if binding.retention_until_ms is not None and now_ms >= binding.retention_until_ms:
+            return False
+        if metadata.get("revoked_at_ms") is not None:
+            return False
+        retention = metadata.get("retention_until_ms")
+        if retention is not None and now_ms >= retention:
+            return False
+        if metadata.get("trust") not in _FLEET_ALLOWED_TRUST:
+            return False
+        if metadata.get("sensitivity") not in _FLEET_ALLOWED_SENSITIVITY:
+            return False
+        promotion = metadata.get("promotion_state")
+        if scope.kind == "principal":
+            if promotion not in {"private", "promoted"}:
+                return False
+            if metadata.get("owner_principal_id") != binding.principal_id:
+                return False
+            if metadata.get("owner_principal_kind") != binding.principal_kind:
+                return False
+            if metadata.get("agent_instance_id") != binding.agent_instance_id:
+                return False
+        else:
+            if promotion != "promoted":
+                return False
+            if scope.kind == "agent_instance" and scope.scope_id != binding.agent_instance_id:
+                return False
+        return True
+
+    @staticmethod
+    def _fleet_content_error(content: str) -> Optional[str]:
+        try:
+            from agent.redact import redact_sensitive_text
+
+            if redact_sensitive_text(content, force=True) != content:
+                return "Fleet scoped memory cannot persist credential or secret bodies."
+        except Exception:
+            return "Fleet scoped memory secret classification is unavailable."
+        lowered = content.lower()
+        if "fleet.run-authority.v1" in lowered or "run_authority_hash" in lowered:
+            return "Fleet scoped memory cannot persist RunAuthority material."
+        return None
+
+    def _load_scope_entries(
+        self,
+        target: str,
+        scope: FleetMemoryScopeRef,
+        *,
+        now_ms: int,
+    ) -> List[str]:
+        descriptor = self._scope_descriptor_path(scope)
+        if not self._require_private_file(descriptor):
+            return []
+        try:
+            self._ensure_scope_descriptor(scope)
+            native_path = self._scope_dir(scope) / self._target_filename(target)
+            if self._require_private_file(native_path):
+                entries = self._read_file(native_path)
+            else:
+                entries = []
+            metadata = self._read_fleet_metadata(target, scope)
+        except Exception as error:
+            logger.warning("Fleet scoped memory ignored for %s: %s", scope.kind, error)
+            return []
+        visible: List[str] = []
+        for entry in entries:
+            item = metadata.get(self._entry_hash(entry))
+            if item is None or not self._fleet_metadata_visible(item, scope, now_ms):
+                continue
+            if self._fleet_content_error(entry) is not None:
+                continue
+            visible.append(entry)
+        return visible
+
+    def _load_fleet_scoped(self) -> None:
+        binding = self._fleet_memory
+        if binding is None:
+            return
+        self._ensure_scope_descriptor(binding.write_scope)
+        now_ms = self._now_ms()
+        principal_memory = self._load_scope_entries("memory", binding.write_scope, now_ms=now_ms)
+        principal_user = self._load_scope_entries("user", binding.write_scope, now_ms=now_ms)
+        self.memory_entries = list(dict.fromkeys(principal_memory))
+        self.user_entries = list(dict.fromkeys(principal_user))
+
+        snapshots: Dict[str, List[str]] = {"memory": [], "user": []}
+        for scope in binding.read_scopes:
+            for target in ("memory", "user"):
+                values = self._load_scope_entries(target, scope, now_ms=now_ms)
+                for value in values:
+                    if value not in snapshots[target]:
+                        snapshots[target].append(value)
+        for target in ("memory", "user"):
+            sanitized = self._sanitize_entries_for_snapshot(
+                snapshots[target],
+                self._target_filename(target),
+            )
+            limit = self._char_limit(target)
+            bounded: List[str] = []
+            used = 0
+            for entry in sanitized:
+                extra = len(entry) + (len(ENTRY_DELIMITER) if bounded else 0)
+                if used + extra > limit:
+                    break
+                bounded.append(entry)
+                used += extra
+            self._system_prompt_snapshot[target] = self._render_block(target, bounded)
+
+    def _path_for(self, target: str) -> Path:
+        if self._fleet_memory is not None:
+            self._ensure_scope_descriptor(self._fleet_memory.write_scope)
+            return self._scope_dir(self._fleet_memory.write_scope) / self._target_filename(target)
         mem_dir = get_memory_dir()
-        if target == "user":
-            return mem_dir / "USER.md"
-        return mem_dir / "MEMORY.md"
+        return mem_dir / self._target_filename(target)
+
+    def _fleet_write_consistency_error(self, target: str) -> Optional[str]:
+        binding = self._fleet_memory
+        if binding is None:
+            return None
+        try:
+            path = self._path_for(target)
+            if self._require_private_file(path):
+                entries = self._read_file(path)
+            else:
+                entries = []
+            metadata = self._read_fleet_metadata(target, binding.write_scope)
+        except Exception:
+            return "Fleet scoped memory metadata is unavailable; refusing the write."
+        hashes = {self._entry_hash(entry) for entry in entries}
+        if hashes != set(metadata):
+            return "Fleet scoped memory content/metadata drift detected; refusing the write."
+        for item in metadata.values():
+            if (
+                item.get("owner_principal_id") != binding.principal_id
+                or item.get("owner_principal_kind") != binding.principal_kind
+                or item.get("agent_instance_id") != binding.agent_instance_id
+                or item.get("scope_kind") != binding.write_scope.kind
+                or item.get("scope_id") != binding.write_scope.scope_id
+            ):
+                return "Fleet scoped memory identity metadata changed; refusing the write."
+        return None
+
+    def _sync_fleet_metadata(self, target: str, entries: List[str]) -> None:
+        binding = self._fleet_memory
+        if binding is None:
+            return
+        scope = binding.write_scope
+        self._ensure_scope_descriptor(scope)
+        path = self._metadata_path(target, scope)
+        try:
+            existing = self._read_fleet_metadata(target, scope)
+        except Exception:
+            existing = {}
+        now_ms = self._now_ms()
+        documents: List[Dict[str, Any]] = []
+        for entry in entries:
+            content_hash = self._entry_hash(entry)
+            current = existing.get(content_hash)
+            if current is not None:
+                documents.append(current)
+                continue
+            documents.append(
+                {
+                    "content_hash": content_hash,
+                    "owner_principal_id": binding.principal_id,
+                    "owner_principal_kind": binding.principal_kind,
+                    "scope_kind": scope.kind,
+                    "scope_id": scope.scope_id,
+                    "source_run": binding.source_run,
+                    "agent_instance_id": binding.agent_instance_id,
+                    "sensitivity": "private",
+                    "trust": "run-derived",
+                    "promotion_state": "private",
+                    "retention_until_ms": binding.retention_until_ms,
+                    "provenance": "fleet-run-v1",
+                    "created_at_ms": now_ms,
+                    "updated_at_ms": now_ms,
+                    "revoked_at_ms": None,
+                }
+            )
+        document = {
+            "schema": FLEET_MEMORY_META_SCHEMA,
+            "scope": scope.to_request(),
+            "entries": sorted(documents, key=lambda item: item["content_hash"]),
+        }
+        atomic_write_text(
+            path,
+            json.dumps(document, sort_keys=True, separators=(",", ":")),
+            tmp_prefix=".fleet_meta_",
+        )
+        self._require_private_file(path, allow_missing=False)
 
     def _reload_target(self, target: str, *, skip_drift: bool = False):
         """Re-read entries from disk into in-memory state.
@@ -357,13 +780,34 @@ class MemoryStore:
         bak = None if skip_drift else self._detect_external_drift(target, raw)
         fresh = self._parse_entries(raw)
         fresh = list(dict.fromkeys(fresh))  # deduplicate
+        if self._fleet_memory is not None:
+            metadata = self._read_fleet_metadata(target, self._fleet_memory.write_scope)
+            now_ms = self._now_ms()
+            fresh = [
+                entry
+                for entry in fresh
+                if (
+                    (item := metadata.get(self._entry_hash(entry))) is not None
+                    and self._fleet_metadata_visible(
+                        item,
+                        self._fleet_memory.write_scope,
+                        now_ms,
+                    )
+                )
+            ]
         self._set_entries(target, fresh)
         return bak
 
     def save_to_disk(self, target: str):
         """Persist entries to the appropriate file. Called after every mutation."""
-        get_memory_dir().mkdir(parents=True, exist_ok=True)
-        self._write_file(self._path_for(target), self._entries_for(target))
+        if self._fleet_memory is None:
+            get_memory_dir().mkdir(parents=True, exist_ok=True)
+        entries = self._entries_for(target)
+        path = self._path_for(target)
+        self._write_file(path, entries)
+        if self._fleet_memory is not None:
+            self._require_private_file(path, allow_missing=False)
+            self._sync_fleet_metadata(target, entries)
 
     def _entries_for(self, target: str) -> List[str]:
         if target == "user":
@@ -392,6 +836,12 @@ class MemoryStore:
         content = content.strip()
         if not content:
             return {"success": False, "error": "Content cannot be empty."}
+        consistency_error = self._fleet_write_consistency_error(target)
+        if consistency_error:
+            return {"success": False, "error": consistency_error}
+        fleet_error = self._fleet_content_error(content) if self._fleet_memory else None
+        if fleet_error:
+            return {"success": False, "error": fleet_error}
 
         # Scan for injection/exfiltration before accepting
         scan_error = _scan_memory_content(content)
@@ -454,6 +904,12 @@ class MemoryStore:
             return {"success": False, "error": "old_text cannot be empty."}
         if not new_content:
             return {"success": False, "error": "new_content cannot be empty. Use 'remove' to delete entries."}
+        consistency_error = self._fleet_write_consistency_error(target)
+        if consistency_error:
+            return {"success": False, "error": consistency_error}
+        fleet_error = self._fleet_content_error(new_content) if self._fleet_memory else None
+        if fleet_error:
+            return {"success": False, "error": fleet_error}
 
         # Scan replacement content for injection/exfiltration
         scan_error = _scan_memory_content(new_content)
@@ -522,6 +978,9 @@ class MemoryStore:
         old_text = old_text.strip()
         if not old_text:
             return {"success": False, "error": "old_text cannot be empty."}
+        consistency_error = self._fleet_write_consistency_error(target)
+        if consistency_error:
+            return {"success": False, "error": consistency_error}
 
         with self._file_lock(self._path_for(target)):
             bak = self._reload_target(target)
@@ -574,6 +1033,9 @@ class MemoryStore:
         """
         if not operations:
             return {"success": False, "error": "operations list is empty."}
+        consistency_error = self._fleet_write_consistency_error(target)
+        if consistency_error:
+            return {"success": False, "error": consistency_error}
 
         # Scan every add/replace content for injection/exfil BEFORE touching
         # disk -- a single poisoned op rejects the whole batch.
@@ -581,6 +1043,13 @@ class MemoryStore:
             act = (op or {}).get("action")
             new_content = (op or {}).get("content")
             if act in {"add", "replace"} and new_content:
+                if self._fleet_memory is not None:
+                    fleet_error = self._fleet_content_error(new_content)
+                    if fleet_error:
+                        return {
+                            "success": False,
+                            "error": f"Operation {i + 1}: {fleet_error}",
+                        }
                 scan_error = _scan_memory_content(new_content)
                 if scan_error:
                     return {"success": False, "error": f"Operation {i + 1}: {scan_error}"}
@@ -1072,6 +1541,11 @@ def memory_tool(
     """
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
+    if get_fleet_memory() is not None and (operations or action in {"add", "replace", "remove"}):
+        return tool_error(
+            "Fleet scoped memory writes require Fleet-authorized persistence after the run.",
+            success=False,
+        )
 
     # Some strict providers fill optional schema fields with JSON null rather
     # than omitting them.  Treat ``target: null`` as omitted so memory writes
