@@ -1751,11 +1751,21 @@ def init_agent(
     # So the built-in store is created unless memory is globally disabled, while
     # the external-provider block below stays gated on skip_memory.
     _memory_toolset_requested = "memory" in (agent.enabled_toolsets or [])
-    if not skip_memory or _memory_toolset_requested:
+    mem_config = {}
+    from agent.fleet_memory_scope import get_fleet_memory
+    from agent.fleet_runtime_scope import get_fleet_runtime
+
+    _fleet_runtime_active = get_fleet_runtime() is not None
+    _fleet_memory_binding = get_fleet_memory()
+    _fleet_memory_fail_closed = _fleet_runtime_active and _fleet_memory_binding is None
+    if (not skip_memory or _memory_toolset_requested) and not _fleet_memory_fail_closed:
         try:
             mem_config = _agent_cfg.get("memory", {})
             agent._memory_enabled = mem_config.get("memory_enabled", False)
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
+            if _fleet_memory_binding is not None:
+                agent._memory_enabled = True
+                agent._user_profile_enabled = True
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
             if agent._memory_enabled or agent._user_profile_enabled:
                 from tools.memory_tool import MemoryStore
@@ -1772,7 +1782,11 @@ def init_agent(
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
     agent._memory_manager = None
-    if not skip_memory:
+    # External providers are not allowed to participate in Fleet-scoped runs
+    # until they explicitly implement the same deterministic principal/scope
+    # isolation contract. Falling back to a global provider would defeat the
+    # native scoped store even if MEMORY.md itself were isolated.
+    if not skip_memory and not _fleet_runtime_active:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 

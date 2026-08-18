@@ -92,6 +92,11 @@ from gateway.platforms.base import (
     is_network_accessible,
     validate_media_delivery_path,
 )
+from agent.fleet_memory_scope import (
+    FleetMemoryBinding,
+    FleetMemoryScopeError,
+    fleet_memory_scope,
+)
 from agent.fleet_runtime_scope import (
     FleetRuntimeBinding,
     FleetRuntimeScopeError,
@@ -2110,6 +2115,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
+            ("POST", "/v1/fleet/memory", self._handle_fleet_memory_write),
             ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
@@ -3191,6 +3197,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_steer": True,
                 "run_finalize": True,
                 "run_fleet_runtime": True,
+                "run_fleet_memory_scope": True,
+                "fleet_scoped_memory_write": True,
                 "run_approval_budget": True,
                 "run_tool_evidence": True,
                 "run_command_evidence": True,
@@ -3220,6 +3228,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "model_options": {"method": "GET", "path": "/api/model/options"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
+                "fleet_scoped_memory": {"method": "POST", "path": "/v1/fleet/memory"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
@@ -6791,6 +6800,88 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return _callback
 
+    async def _handle_fleet_memory_write(self, request: "web.Request") -> "web.Response":
+        """Persist one Fleet-authorized scoped memory mutation through Hermes native storage."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        allowed = {
+            "fleet_memory",
+            "action",
+            "target",
+            "content",
+            "old_text",
+            "operations",
+        }
+        if type(body) is not dict or set(body) - allowed or "fleet_memory" not in body:
+            return web.json_response(
+                _openai_error("Invalid Fleet memory write shape", code="invalid_fleet_memory"),
+                status=400,
+            )
+        try:
+            binding = FleetMemoryBinding.from_request(body["fleet_memory"])
+        except FleetMemoryScopeError as error:
+            return web.json_response(
+                _openai_error(str(error), code="invalid_fleet_memory"),
+                status=400,
+            )
+        if binding.retention_until_ms is not None and int(time.time() * 1000) >= binding.retention_until_ms:
+            return web.json_response(
+                _openai_error("Fleet memory retention has expired", code="expired_fleet_memory"),
+                status=409,
+            )
+        target = body.get("target", "memory")
+        if target not in {"memory", "user"}:
+            return web.json_response(
+                _openai_error("Fleet memory target is invalid", code="invalid_fleet_memory"),
+                status=400,
+            )
+        operations = body.get("operations")
+        action = body.get("action")
+        if operations is not None and action is not None:
+            return web.json_response(
+                _openai_error("Fleet memory write must use one mutation shape", code="invalid_fleet_memory"),
+                status=400,
+            )
+        try:
+            from tools.memory_tool import load_on_disk_store
+
+            with fleet_memory_scope(binding):
+                store = load_on_disk_store()
+                if operations is not None:
+                    if type(operations) is not list:
+                        raise ValueError("Fleet memory operations must be a list")
+                    result = store.apply_batch(target, operations)
+                elif action == "add":
+                    result = store.add(target, body.get("content") or "")
+                elif action == "replace":
+                    result = store.replace(
+                        target,
+                        body.get("old_text") or "",
+                        body.get("content") or "",
+                    )
+                elif action == "remove":
+                    result = store.remove(target, body.get("old_text") or "")
+                else:
+                    raise ValueError("Fleet memory action is invalid")
+        except (FleetMemoryScopeError, RuntimeError, ValueError) as error:
+            return web.json_response(
+                _openai_error(str(error), code="fleet_memory_write_failed"),
+                status=409,
+            )
+        status = 200 if result.get("success") is True else 409
+        return web.json_response(
+            {
+                "object": "hermes.api_server.fleet_memory_write",
+                "result": result,
+            },
+            status=status,
+        )
+
     @_admit_api_agent_request
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs — start an agent run, return run_id immediately."""
@@ -6821,6 +6912,38 @@ class APIServerAdapter(BasePlatformAdapter):
                         code="invalid_fleet_runtime",
                     ),
                     status=400,
+                )
+
+        fleet_memory = None
+        if "fleet_memory" in body:
+            if fleet_runtime is None:
+                return web.json_response(
+                    _openai_error(
+                        "fleet_memory requires fleet_runtime",
+                        code="invalid_fleet_memory",
+                    ),
+                    status=400,
+                )
+            try:
+                fleet_memory = FleetMemoryBinding.from_request(body["fleet_memory"])
+            except FleetMemoryScopeError as error:
+                return web.json_response(
+                    _openai_error(
+                        str(error),
+                        code="invalid_fleet_memory",
+                    ),
+                    status=400,
+                )
+            if (
+                fleet_memory.retention_until_ms is not None
+                and int(time.time() * 1000) >= fleet_memory.retention_until_ms
+            ):
+                return web.json_response(
+                    _openai_error(
+                        "Fleet memory retention has expired",
+                        code="expired_fleet_memory",
+                    ),
+                    status=409,
                 )
 
         approval_budget = body.get("approval_budget")
@@ -7286,7 +7409,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._stopping_run_ids.discard(run_id)
 
         self._activate_admitted_request()
-        with fleet_runtime_scope(fleet_runtime):
+        with fleet_runtime_scope(fleet_runtime), fleet_memory_scope(fleet_memory):
             task = asyncio.create_task(_run_and_close())
         self._active_run_tasks[run_id] = task
         try:
