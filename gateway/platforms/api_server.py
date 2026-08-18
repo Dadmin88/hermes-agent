@@ -47,7 +47,7 @@ import hmac
 import itertools
 import json
 from contextlib import contextmanager, nullcontext, suppress
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from functools import wraps
 import logging
 import os
@@ -91,6 +91,12 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
     validate_media_delivery_path,
+)
+from agent.fleet_runtime_scope import (
+    FleetRuntimeBinding,
+    FleetRuntimeScopeError,
+    fleet_runtime_scope,
+    get_fleet_runtime,
 )
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
@@ -2924,6 +2930,10 @@ class APIServerAdapter(BasePlatformAdapter):
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
 
         max_iterations = _current_max_iterations()
+        fleet_runtime = get_fleet_runtime()
+        if fleet_runtime is not None:
+            enabled_toolsets = list(fleet_runtime.toolsets)
+            max_iterations = fleet_runtime.max_iterations
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
@@ -3180,6 +3190,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": True,
                 "run_steer": True,
                 "run_finalize": True,
+                "run_fleet_runtime": True,
                 "run_approval_budget": True,
                 "run_tool_evidence": True,
                 "run_command_evidence": True,
@@ -6799,6 +6810,19 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
 
+        fleet_runtime = None
+        if "fleet_runtime" in body:
+            try:
+                fleet_runtime = FleetRuntimeBinding.from_request(body["fleet_runtime"])
+            except FleetRuntimeScopeError as error:
+                return web.json_response(
+                    _openai_error(
+                        str(error),
+                        code="invalid_fleet_runtime",
+                    ),
+                    status=400,
+                )
+
         approval_budget = body.get("approval_budget")
         if approval_budget is not None and (
             type(approval_budget) is not int or not 1 <= approval_budget <= 32
@@ -7121,7 +7145,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         }
                         return r, u
 
-                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                executor_context = copy_context()
+                result, usage = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    executor_context.run,
+                    _run_sync,
+                )
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
                         "event": "run.cancelled",
@@ -7257,7 +7286,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._stopping_run_ids.discard(run_id)
 
         self._activate_admitted_request()
-        task = asyncio.create_task(_run_and_close())
+        with fleet_runtime_scope(fleet_runtime):
+            task = asyncio.create_task(_run_and_close())
         self._active_run_tasks[run_id] = task
         try:
             self._background_tasks.add(task)
