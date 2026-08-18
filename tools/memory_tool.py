@@ -376,6 +376,13 @@ class MemoryStore:
             raise RuntimeError("Fleet memory path is unsafe") from error
 
     @staticmethod
+    def _owned_by_current_process(identity: os.stat_result) -> bool:
+        getter = getattr(os, "geteuid", None)
+        if getter is None:
+            return True
+        return identity.st_uid == getter()
+
+    @staticmethod
     def _require_private_directory(path: Path) -> None:
         MemoryStore._require_no_symlink_components(path)
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -384,16 +391,17 @@ class MemoryStore:
         if (
             stat.S_ISLNK(identity.st_mode)
             or not stat.S_ISDIR(identity.st_mode)
-            or identity.st_uid != os.geteuid()
+            or not MemoryStore._owned_by_current_process(identity)
         ):
             raise RuntimeError("Fleet memory directory is unsafe")
-        os.chmod(path, 0o700, follow_symlinks=False)
+        if os.name != "nt":
+            os.chmod(path, 0o700, follow_symlinks=False)
         verified = path.lstat()
         if (
             stat.S_ISLNK(verified.st_mode)
             or not stat.S_ISDIR(verified.st_mode)
-            or verified.st_uid != os.geteuid()
-            or stat.S_IMODE(verified.st_mode) != 0o700
+            or not MemoryStore._owned_by_current_process(verified)
+            or (os.name != "nt" and stat.S_IMODE(verified.st_mode) != 0o700)
         ):
             raise RuntimeError("Fleet memory directory permissions are unsafe")
 
@@ -411,18 +419,19 @@ class MemoryStore:
         if (
             stat.S_ISLNK(identity.st_mode)
             or not stat.S_ISREG(identity.st_mode)
-            or identity.st_uid != os.geteuid()
+            or not MemoryStore._owned_by_current_process(identity)
             or identity.st_nlink != 1
         ):
             raise RuntimeError("Fleet memory file is unsafe")
-        os.chmod(path, 0o600, follow_symlinks=False)
+        if os.name != "nt":
+            os.chmod(path, 0o600, follow_symlinks=False)
         verified = path.lstat()
         if (
             stat.S_ISLNK(verified.st_mode)
             or not stat.S_ISREG(verified.st_mode)
-            or verified.st_uid != os.geteuid()
+            or not MemoryStore._owned_by_current_process(verified)
             or verified.st_nlink != 1
-            or stat.S_IMODE(verified.st_mode) != 0o600
+            or (os.name != "nt" and stat.S_IMODE(verified.st_mode) != 0o600)
         ):
             raise RuntimeError("Fleet memory file permissions are unsafe")
         return True
