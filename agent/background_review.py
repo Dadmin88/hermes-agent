@@ -665,6 +665,7 @@ def _run_review_in_thread(
     agent: Any,
     messages_snapshot: List[Dict],
     prompt: str,
+    review_skills: bool = False,
 ) -> None:
     """Worker function executed in the background-review daemon thread.
 
@@ -1000,6 +1001,26 @@ def _run_review_in_thread(
                 # path (this whole block is inside the try/finally above).
                 _unregister_review_agent(review_agent)
 
+            # Fleet Phase 16: once the review fork has finished authoring its
+            # Phase 15 candidates, deterministically quarantine/freeze every
+            # candidate bound to this exact run authority. A scanner failure is
+            # fail-closed: candidates remain hidden, inactive, and unverified.
+            if review_skills:
+                try:
+                    from agent.fleet_skill_learning_scope import get_fleet_skill_learning
+                    from tools.fleet_skill_quarantine import (
+                        quarantine_candidates_for_binding,
+                    )
+
+                    _learning = get_fleet_skill_learning()
+                    if _learning is not None:
+                        quarantine_candidates_for_binding(_learning)
+                except Exception as e:
+                    logger.warning(
+                        "Fleet skill quarantine failed closed; candidates remain inactive: %s",
+                        e,
+                    )
+
             # Snapshot review actions before teardown. close() is allowed to
             # clean per-session state, but the user-visible self-improvement
             # summary still needs the completed review agent's tool results.
@@ -1139,7 +1160,9 @@ def spawn_background_review_thread(
         )
 
     def _target() -> None:
-        _run_review_in_thread(agent, messages_snapshot, prompt)
+        _run_review_in_thread(
+            agent, messages_snapshot, prompt, review_skills=review_skills
+        )
 
     return _target, prompt
 

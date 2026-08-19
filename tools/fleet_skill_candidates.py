@@ -17,6 +17,9 @@ _CANDIDATE_SCHEMA = "fleet-skill-candidate-v1"
 _CANDIDATE_ROOT = ".fleet"
 _CANDIDATES_DIR = "candidates"
 _METADATA_FILE = "candidate.json"
+_CANDIDATE_STATES = frozenset(
+    {"quarantined", "rejected", "needs-review", "verification-ready"}
+)
 _MAX_COMMANDS = 64
 _MAX_FILES = 128
 _MAX_BUNDLE_BYTES = 4 * 1024 * 1024
@@ -359,7 +362,7 @@ def _load_existing_metadata(candidate_dir: Path) -> dict[str, Any] | None:
         type(principal) is not dict
         or type(scope) is not dict
         or type(provenance) is not dict
-        or value.get("state") != "quarantined"
+        or value.get("state") not in _CANDIDATE_STATES
         or value.get("active") is not False
         or value.get("authority") != "none"
     ):
@@ -403,6 +406,15 @@ def _ensure_candidate(
             or provenance.get("target_digest") != binding.target_digest
         ):
             raise FleetSkillCandidateError("candidate identity changed")
+        risk = existing_metadata.get("risk")
+        if (
+            existing_metadata.get("state") != "quarantined"
+            or type(risk) is not dict
+            or risk.get("state") != "unassessed"
+        ):
+            raise FleetSkillCandidateError(
+                "candidate is immutable after Phase 16 quarantine classification"
+            )
         return (
             candidate_dir,
             cast_optional_string(existing_metadata.get("category")),
