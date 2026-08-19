@@ -838,25 +838,88 @@ def skills_list(category: str = None, task_id: str = None) -> str:
 
         # Sort by category then name
         all_skills = _sort_skills(all_skills)
+        total_count = len(all_skills)
+        firewall_truncated = False
+        try:
+            from agent.fleet_context_firewall import sanitize_fleet_skill_listing
+
+            all_skills, firewall_truncated = sanitize_fleet_skill_listing(all_skills)
+        except Exception:
+            from agent.fleet_context_scope import get_fleet_context
+
+            if get_fleet_context() is not None:
+                raise
 
         # Extract unique categories
         categories = sorted(
             {s.get("category") for s in all_skills if s.get("category")}
         )
 
-        return json.dumps(
-            {
-                "success": True,
-                "skills": all_skills,
-                "categories": categories,
-                "count": len(all_skills),
-                "hint": "Use skill_view(name) to see full content, tags, and linked files",
-            },
-            ensure_ascii=False,
-        )
+        payload: dict[str, Any] = {
+            "success": True,
+            "skills": all_skills,
+            "categories": categories,
+            "count": len(all_skills),
+            "hint": "Use skill_view(name) to see full content, tags, and linked files",
+        }
+        try:
+            from agent.fleet_context_firewall import fleet_context_firewall_active
+
+            if fleet_context_firewall_active():
+                payload["context_provenance"] = {
+                    "version": "fleet-context-firewall-v1",
+                    "kind": "skill-discovery-metadata",
+                    "authority": "none",
+                    "note": "Full skill content is independently firewalled when loaded.",
+                }
+        except Exception:
+            from agent.fleet_context_scope import get_fleet_context
+
+            if get_fleet_context() is not None:
+                raise
+        if firewall_truncated:
+            payload["total_count"] = total_count
+            payload["context_firewall_truncated"] = True
+        return json.dumps(payload, ensure_ascii=False)
 
     except Exception as e:
         return tool_error(str(e), success=False)
+
+
+def _fleet_firewall_skill_content(
+    content: str,
+    *,
+    source: str,
+    kind: str,
+    source_path: Path | None = None,
+) -> tuple[str | None, str | None]:
+    """Apply the Fleet pre-prompt firewall without changing non-Fleet behavior."""
+    from agent.fleet_context_scope import get_fleet_context
+
+    if get_fleet_context() is None:
+        return content, None
+    try:
+        from agent.fleet_context_firewall import (
+            FleetContextFirewallError,
+            sanitize_fleet_skill_text,
+        )
+    except Exception as error:
+        logger.warning("Fleet context firewall import failed for %s: %s", source, error)
+        return None, "Fleet context firewall is unavailable"
+
+    try:
+        return sanitize_fleet_skill_text(
+            content,
+            source=source,
+            kind=kind,
+            source_path=source_path,
+        ), None
+    except FleetContextFirewallError as error:
+        logger.warning("Fleet context firewall blocked %s: %s", source, error)
+        return None, str(error)
+    except Exception as error:
+        logger.warning("Fleet context firewall failed for %s: %s", source, error)
+        return None, "Fleet context firewall is unavailable"
 
 
 # ── Plugin skill serving ──────────────────────────────────────────────────
@@ -925,6 +988,22 @@ def _serve_plugin_skill(
             ensure_ascii=False,
         )
 
+    _preflight, firewall_error = _fleet_firewall_skill_content(
+        content,
+        source=qualified_name,
+        kind="skill",
+        source_path=skill_md,
+    )
+    if firewall_error is not None:
+        return json.dumps(
+            {
+                "success": False,
+                "error": firewall_error,
+                "code": "fleet_context_firewall_blocked",
+            },
+            ensure_ascii=False,
+        )
+
     if file_path:
         from tools.path_security import has_traversal_component, validate_within_dir
 
@@ -966,12 +1045,27 @@ def _serve_plugin_skill(
                 {"success": False, "error": f"Failed to read '{file_path}': {exc}"},
                 ensure_ascii=False,
             )
+        rendered_file, firewall_error = _fleet_firewall_skill_content(
+            content,
+            source=f"{qualified_name}/{file_path}",
+            kind="skill_file",
+            source_path=target,
+        )
+        if firewall_error is not None:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": firewall_error,
+                    "code": "fleet_context_firewall_blocked",
+                },
+                ensure_ascii=False,
+            )
         return json.dumps(
             {
                 "success": True,
                 "name": f"{namespace}:{bare}",
                 "file": file_path,
-                "content": content,
+                "content": rendered_file,
                 "file_type": target.suffix,
                 "_source_path": str(target),
             },
@@ -1022,11 +1116,27 @@ def _serve_plugin_skill(
                 "Could not preprocess plugin skill %s:%s", namespace, bare, exc_info=True
             )
 
+    final_content = f"{banner}{rendered_content}" if banner else rendered_content
+    final_content, firewall_error = _fleet_firewall_skill_content(
+        final_content,
+        source=qualified_name,
+        kind="skill",
+        source_path=skill_md,
+    )
+    if firewall_error is not None:
+        return json.dumps(
+            {
+                "success": False,
+                "error": firewall_error,
+                "code": "fleet_context_firewall_blocked",
+            },
+            ensure_ascii=False,
+        )
     return json.dumps(
         {
             "success": True,
             "name": f"{namespace}:{bare}",
-            "content": f"{banner}{rendered_content}" if banner else rendered_content,
+            "content": final_content,
             "description": description,
             "linked_files": _plugin_skill_linked_files(skill_md.parent),
             "readiness_status": SkillReadinessStatus.AVAILABLE.value,
@@ -1420,6 +1530,22 @@ def skill_view(
                 ensure_ascii=False,
             )
 
+        _preflight, firewall_error = _fleet_firewall_skill_content(
+            content,
+            source=str(resolved_name),
+            kind="skill",
+            source_path=skill_md,
+        )
+        if firewall_error is not None:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": firewall_error,
+                    "code": "fleet_context_firewall_blocked",
+                },
+                ensure_ascii=False,
+            )
+
         # If a specific file path is requested, read that instead
         if file_path and skill_dir:
             from tools.path_security import validate_within_dir, has_traversal_component
@@ -1521,12 +1647,27 @@ def skill_view(
                     exc_info=True,
                 )
 
+            rendered_file, firewall_error = _fleet_firewall_skill_content(
+                content,
+                source=f"{name}/{file_path}",
+                kind="skill_file",
+                source_path=target_file,
+            )
+            if firewall_error is not None:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": firewall_error,
+                        "code": "fleet_context_firewall_blocked",
+                    },
+                    ensure_ascii=False,
+                )
             return json.dumps(
                 {
                     "success": True,
                     "name": name,
                     "file": file_path,
-                    "content": content,
+                    "content": rendered_file,
                     "file_type": target_file.suffix,
                     # Internal: absolute source path for the repeat-view dedup
                     # fingerprint (mtime+size change detection).
@@ -1761,6 +1902,22 @@ def skill_view(
                     skill_name,
                     exc_info=True,
                 )
+
+        rendered_content, firewall_error = _fleet_firewall_skill_content(
+            rendered_content,
+            source=skill_name,
+            kind="skill",
+            source_path=skill_md,
+        )
+        if firewall_error is not None:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": firewall_error,
+                    "code": "fleet_context_firewall_blocked",
+                },
+                ensure_ascii=False,
+            )
 
         result = {
             "success": True,

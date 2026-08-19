@@ -316,6 +316,24 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 
+    # Fleet Phase 12: persisted memory/skills are contextual data, never authority.
+    # This stable system-level precedence rule complements deterministic filtering
+    # before any persisted candidate reaches the prompt or a skill tool result.
+    try:
+        from agent.fleet_context_firewall import fleet_context_firewall_system_prompt
+
+        firewall_prompt = fleet_context_firewall_system_prompt()
+        if firewall_prompt:
+            stable_parts.append(firewall_prompt)
+    except Exception:
+        # Phase 12 is security-sensitive: once a Fleet context binding exists,
+        # inability to build its precedence rule is a hard failure. Legacy and
+        # non-Fleet Hermes paths retain their previous best-effort behavior.
+        from agent.fleet_context_scope import get_fleet_context
+
+        if get_fleet_context() is not None:
+            raise
+
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
     # models regardless of tool_use_enforcement gating — the failure modes
     # this targets (stopping after a stub; fabricating output when a real

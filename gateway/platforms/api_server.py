@@ -92,6 +92,11 @@ from gateway.platforms.base import (
     is_network_accessible,
     validate_media_delivery_path,
 )
+from agent.fleet_context_scope import (
+    FleetContextBinding,
+    FleetContextScopeError,
+    fleet_context_scope,
+)
 from agent.fleet_memory_scope import (
     FleetMemoryBinding,
     FleetMemoryScopeError,
@@ -3198,6 +3203,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_finalize": True,
                 "run_fleet_runtime": True,
                 "run_fleet_memory_scope": True,
+                "run_fleet_context_firewall": True,
                 "fleet_scoped_memory_write": True,
                 "run_approval_budget": True,
                 "run_tool_evidence": True,
@@ -6946,6 +6952,39 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=409,
                 )
 
+        fleet_context = None
+        if "fleet_context" in body:
+            if fleet_runtime is None or fleet_memory is None:
+                return web.json_response(
+                    _openai_error(
+                        "fleet_context requires fleet_runtime and fleet_memory",
+                        code="invalid_fleet_context",
+                    ),
+                    status=400,
+                )
+            try:
+                fleet_context = FleetContextBinding.from_request(body["fleet_context"])
+            except FleetContextScopeError as error:
+                return web.json_response(
+                    _openai_error(str(error), code="invalid_fleet_context"),
+                    status=400,
+                )
+            if (
+                fleet_context.principal_id != fleet_memory.principal_id
+                or fleet_context.principal_kind != fleet_memory.principal_kind
+                or fleet_context.principal_generation != fleet_memory.principal_generation
+                or fleet_context.principal_binding_hash
+                != fleet_memory.principal_binding_hash
+                or fleet_context.agent_instance_id != fleet_memory.agent_instance_id
+            ):
+                return web.json_response(
+                    _openai_error(
+                        "Fleet context identity does not match Fleet memory",
+                        code="invalid_fleet_context",
+                    ),
+                    status=400,
+                )
+
         approval_budget = body.get("approval_budget")
         if approval_budget is not None and (
             type(approval_budget) is not int or not 1 <= approval_budget <= 32
@@ -7409,7 +7448,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._stopping_run_ids.discard(run_id)
 
         self._activate_admitted_request()
-        with fleet_runtime_scope(fleet_runtime), fleet_memory_scope(fleet_memory):
+        with (
+            fleet_runtime_scope(fleet_runtime),
+            fleet_memory_scope(fleet_memory),
+            fleet_context_scope(fleet_context),
+        ):
             task = asyncio.create_task(_run_and_close())
         self._active_run_tasks[run_id] = task
         try:
