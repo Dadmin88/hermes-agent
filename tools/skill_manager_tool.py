@@ -1590,6 +1590,47 @@ def skill_manage(
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)
 
+    # Fleet Phase 15: autonomous background-review writes under an exact
+    # run-scoped learning binding become inactive native skill candidates.
+    # This route intentionally happens before the normal active-skill approval
+    # gate: writing a quarantined candidate is not activation, and falling
+    # through to the active tree if candidate persistence fails would widen the
+    # effect of the review fork. Foreground/user-directed writes are unchanged.
+    try:
+        from tools.fleet_skill_candidates import route_fleet_skill_candidate_write
+
+        candidate_result = route_fleet_skill_candidate_write(
+            action=action,
+            name=name,
+            content=content,
+            category=category,
+            file_path=file_path,
+            file_content=file_content,
+            old_string=old_string,
+            new_string=new_string,
+            replace_all=replace_all,
+            absorbed_into=absorbed_into,
+        )
+    except Exception as error:
+        try:
+            from agent.fleet_skill_learning_scope import get_fleet_skill_learning
+            from tools.skill_provenance import is_background_review
+
+            fleet_candidate_required = (
+                get_fleet_skill_learning() is not None and is_background_review()
+            )
+        except Exception:
+            fleet_candidate_required = False
+        if fleet_candidate_required:
+            logger.warning("Fleet skill candidate routing failed", exc_info=True)
+            return tool_error(
+                "Fleet skill candidate persistence is unavailable; active skill mutation is refused.",
+                success=False,
+            )
+        candidate_result = None
+    if candidate_result is not None:
+        return json.dumps(candidate_result, ensure_ascii=False)
+
     # Approval gate: when on, stages the write for review (skills are too large
     # to review inline, so they always stage regardless of origin); when off
     # (default) passes straight through. The gate is bypassed when this call is

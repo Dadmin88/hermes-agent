@@ -92,6 +92,43 @@ def test_empty_inputs():
     assert _summarize(None, None) == []
 
 
+def test_skill_candidate_summary_does_not_imply_activation():
+    review_messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "skill_candidate",
+                    "function": {
+                        "name": "skill_manage",
+                        "arguments": json.dumps(
+                            {"action": "create", "name": "deploy-helper"}
+                        ),
+                    },
+                }
+            ],
+        },
+        _tool_msg(
+            "skill_candidate",
+            {
+                "success": True,
+                "candidate": True,
+                "state": "quarantined",
+                "active": False,
+                "message": (
+                    "Skill candidate 'deploy-helper' recorded privately and "
+                    "quarantined; it is not active and grants no authority."
+                ),
+            },
+        ),
+    ]
+
+    actions = _summarize(review_messages, [])
+
+    assert actions == [
+        "🧪 Skill candidate 'deploy-helper' recorded "
+        "(private, quarantined, inactive)"
+    ]
 
 
 def test_removed_or_replaced_relabels_by_target():
