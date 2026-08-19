@@ -283,12 +283,13 @@ def _load_bound_base_manifest() -> tuple[Path, dict[str, dict[str, object]]]:
         info = manifest_path.lstat()
     except OSError as error:
         raise FleetContextFirewallError("Agent base manifest is unavailable") from error
+    current_euid = getattr(os, "geteuid", None)
     if (
         stat.S_ISLNK(info.st_mode)
         or not stat.S_ISREG(info.st_mode)
         or info.st_size > _MAX_BASE_MANIFEST_BYTES
         or info.st_nlink != 1
-        or (os.name != "nt" and info.st_uid != os.geteuid())
+        or (current_euid is not None and info.st_uid != current_euid())
         or (os.name != "nt" and stat.S_IMODE(info.st_mode) != 0o600)
     ):
         raise FleetContextFirewallError("Agent base manifest is unsafe")
