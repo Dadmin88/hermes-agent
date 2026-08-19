@@ -108,6 +108,12 @@ from agent.fleet_runtime_scope import (
     fleet_runtime_scope,
     get_fleet_runtime,
 )
+from agent.fleet_runtime_material import (
+    FleetRuntimeMaterialError,
+    FleetVaultBinding,
+    fleet_vault_scope,
+    validate_fleet_vault_expiry,
+)
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
@@ -3205,6 +3211,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_fleet_memory_scope": True,
                 "run_fleet_context_firewall": True,
                 "run_sensitive_interception": True,
+                "run_fleet_vault_scope": True,
                 "fleet_scoped_memory_write": True,
                 "run_approval_budget": True,
                 "run_tool_evidence": True,
@@ -6994,6 +7001,36 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
 
+        fleet_vault = None
+        if "fleet_vault" in body:
+            if fleet_runtime is None or fleet_memory is None or fleet_context is None:
+                return web.json_response(
+                    _openai_error(
+                        "fleet_vault requires fleet_runtime, fleet_memory, and fleet_context",
+                        code="invalid_fleet_vault",
+                    ),
+                    status=400,
+                )
+            try:
+                fleet_vault = FleetVaultBinding.from_request(body["fleet_vault"])
+                validate_fleet_vault_expiry(fleet_vault)
+            except FleetRuntimeMaterialError as error:
+                return web.json_response(
+                    _openai_error(str(error), code="invalid_fleet_vault"),
+                    status=400,
+                )
+            if (
+                fleet_vault.run_authority_hash != fleet_context.run_authority_hash
+                or fleet_vault.run_id != fleet_memory.source_run
+            ):
+                return web.json_response(
+                    _openai_error(
+                        "Fleet Vault identity does not match Fleet run/context",
+                        code="invalid_fleet_vault",
+                    ),
+                    status=400,
+                )
+
         approval_budget = body.get("approval_budget")
         if approval_budget is not None and (
             type(approval_budget) is not int or not 1 <= approval_budget <= 32
@@ -7461,6 +7498,7 @@ class APIServerAdapter(BasePlatformAdapter):
             fleet_runtime_scope(fleet_runtime),
             fleet_memory_scope(fleet_memory),
             fleet_context_scope(fleet_context),
+            fleet_vault_scope(fleet_vault),
         ):
             task = asyncio.create_task(_run_and_close())
         self._active_run_tasks[run_id] = task

@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 import uuid
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional
 
@@ -78,6 +79,9 @@ _FLEET_INPUT_UID = 65533
 _FLEET_INPUT_GID = 65533
 _FLEET_WORKSPACE_BYTES = 256 * 1024 * 1024
 _FLEET_INPUT_BYTES = 128 * 1024 * 1024
+_FLEET_RUNTIME_MATERIAL_COMMAND: ContextVar[bool] = ContextVar(
+    "_FLEET_RUNTIME_MATERIAL_COMMAND", default=False
+)
 _FLEET_TMP_BYTES = 64 * 1024 * 1024
 _FLEET_HOME_BYTES = 64 * 1024 * 1024
 _FLEET_SECRET_ENV_NAME_RE = re.compile(
@@ -1331,7 +1335,80 @@ class FleetWorkshopEnvironment(BaseEnvironment):
         }
         super().__init__(cwd="/workspace", timeout=timeout)
         self._verify_exact_workshop()
+        self._stage_fleet_file_material()
         self.init_session()
+
+    def _stage_fleet_file_material(self) -> None:
+        """Redeem file handles into the disposable container's /tmp tmpfs.
+
+        Protected bytes travel only on docker-exec stdin. They never enter
+        command arguments, Agent profile state, the session snapshot, or logs.
+        """
+        try:
+            from agent.fleet_runtime_material import redeem_file_material
+
+            material = redeem_file_material()
+        except Exception as error:
+            raise RuntimeError("Fleet runtime file material is unavailable") from error
+        if not material:
+            return
+        try:
+            for name, payload in material.items():
+                target = f"/tmp/hermes-secrets/{name}"
+                script = (
+                    "umask 077; "
+                    "mkdir -p /tmp/hermes-secrets; "
+                    "chmod 700 /tmp/hermes-secrets; "
+                    f"cat > {shlex.quote(target)}; "
+                    f"chmod 600 {shlex.quote(target)}"
+                )
+                try:
+                    result = subprocess.run(
+                        [
+                            self._docker_exe,
+                            "exec",
+                            "-i",
+                            self._container_id,
+                            "bash",
+                            "-c",
+                            script,
+                        ],
+                        input=payload,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        timeout=15,
+                        check=False,
+                    )
+                except (subprocess.TimeoutExpired, OSError) as error:
+                    raise RuntimeError("Fleet runtime file injection failed") from error
+                if result.returncode != 0:
+                    raise RuntimeError("Fleet runtime file injection failed")
+        finally:
+            material.clear()
+
+    def execute(
+        self,
+        command: str,
+        cwd: str = "",
+        *,
+        timeout: int | None = None,
+        stdin_data: str | None = None,
+        rewrite_compound_background: bool = True,
+        bounded_capture: bool = False,
+    ) -> dict:
+        """Inject run-scoped env material only for the actual command spawn."""
+        token = _FLEET_RUNTIME_MATERIAL_COMMAND.set(True)
+        try:
+            return super().execute(
+                command,
+                cwd,
+                timeout=timeout,
+                stdin_data=stdin_data,
+                rewrite_compound_background=rewrite_compound_background,
+                bounded_capture=bounded_capture,
+            )
+        finally:
+            _FLEET_RUNTIME_MATERIAL_COMMAND.reset(token)
 
     def _inspect_exact_workshop(self) -> dict:
         try:
@@ -1442,16 +1519,65 @@ class FleetWorkshopEnvironment(BaseEnvironment):
         stdin_data: str | None = None,
     ):
         del timeout
-        cmd = [self._docker_exe, "exec"]
-        if stdin_data is not None:
-            cmd.append("-i")
-        cmd.append(self._container_id)
-        cmd.extend(["bash", "-l" if login else "-c"])
-        if login:
-            cmd.extend(["-c", cmd_string])
-        else:
-            cmd.append(cmd_string)
-        return _popen_bash(cmd, stdin_data)
+        environment: dict[str, str] = {}
+        if _FLEET_RUNTIME_MATERIAL_COMMAND.get():
+            try:
+                from agent.fleet_runtime_material import redeem_environment_material
+
+                environment = redeem_environment_material()
+            except Exception as error:
+                raise RuntimeError(
+                    "Fleet runtime environment material is unavailable"
+                ) from error
+
+        if not environment:
+            cmd = [self._docker_exe, "exec"]
+            if stdin_data is not None:
+                cmd.append("-i")
+            cmd.append(self._container_id)
+            cmd.extend(["bash", "-l" if login else "-c"])
+            if login:
+                cmd.extend(["-c", cmd_string])
+            else:
+                cmd.append(cmd_string)
+            return _popen_bash(cmd, stdin_data)
+
+        # Values travel only over stdin. docker exec argv contains validated
+        # environment names and the existing command, never protected bytes.
+        reads: list[str] = []
+        payload: list[str] = []
+        try:
+            for index, (name, value) in enumerate(sorted(environment.items())):
+                variable = f"__hermes_runtime_material_{index}"
+                reads.extend(
+                    [
+                        f"IFS= read -r -d '' {variable} || exit 125",
+                        f"export {name}=\"${variable}\"",
+                        f"unset {variable}",
+                    ]
+                )
+                payload.append(value)
+            shell = "bash -l -c" if login else "bash -c"
+            bootstrap = "; ".join(
+                [
+                    *reads,
+                    f"exec {shell} {shlex.quote(cmd_string)}",
+                ]
+            )
+            combined_stdin = "\x00".join(payload) + "\x00" + (stdin_data or "")
+            cmd = [
+                self._docker_exe,
+                "exec",
+                "-i",
+                self._container_id,
+                "bash",
+                "-c",
+                bootstrap,
+            ]
+            return _popen_bash(cmd, combined_stdin)
+        finally:
+            environment.clear()
+            payload.clear()
 
     def cleanup(self):
         """Release no container lifecycle state; Fleet remains the sole owner."""
