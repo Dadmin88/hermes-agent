@@ -855,8 +855,9 @@ def _redact_compaction_text(text: Any) -> str:
         if not uncertain:
             # The sensitive body is blocked from summary persistence, while the
             # surrounding context remains useful after forced non-reusable
-            # redaction. The interception audit still records a blocked summary
-            # boundary, not an allowed sensitive write.
+            # redaction. Summaries are stricter than diagnostic exports: strip
+            # even recognizable vendor-prefix labels from redaction sentinels.
+            redacted = re.sub(r"«redacted:[^»]*»", "***", redacted)
             return redacted
         return "[summary source blocked: persistence classification unavailable]"
     except Exception:
