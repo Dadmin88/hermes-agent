@@ -837,23 +837,28 @@ def _redact_compaction_text(text: Any) -> str:
     Compaction summaries persist across sessions and are re-injected into
     subsequent summarizer prompts. Phase 13 therefore treats summary source
     as a blocking persistence sink: if the central interception boundary
-    detects sensitive material, the entire source fragment is replaced by a
-    value-free marker carrying only finding classes and a one-way fingerprint.
+    detects sensitive material, the sensitive body is excluded and only the
+    forced-redacted surrounding context may continue into summary generation.
     Non-sensitive source text passes through unchanged.
     """
     raw = "" if text is None else str(text)
     try:
-        from agent.sensitive_interception import intercept_persistence
+        from agent.sensitive_interception import (
+            classify_sensitive_text,
+            intercept_persistence,
+        )
 
         decision = intercept_persistence(raw, sink="summary")
         if not decision.found:
             return raw
-        kinds = ",".join(finding.kind for finding in decision.findings) or "unknown"
-        fingerprint = decision.findings[0].fingerprint if decision.findings else "none"
-        return (
-            "[summary source blocked by sensitive-content interception; "
-            f"findings={kinds}; fingerprint={fingerprint}]"
-        )
+        _findings, redacted, uncertain = classify_sensitive_text(raw)
+        if not uncertain:
+            # The sensitive body is blocked from summary persistence, while the
+            # surrounding context remains useful after forced non-reusable
+            # redaction. The interception audit still records a blocked summary
+            # boundary, not an allowed sensitive write.
+            return redacted
+        return "[summary source blocked: persistence classification unavailable]"
     except Exception:
         # Summary is durable and re-enters future prompts. Fail closed rather
         # than persisting raw text if the interception boundary is unavailable.

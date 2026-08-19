@@ -73,11 +73,11 @@ def test_transcript_and_fts_never_receive_raw_value(tmp_path: Path) -> None:
         db.close()
 
 
-def test_summary_source_is_blocked_instead_of_redacted_into_durable_summary() -> None:
+def test_summary_source_blocks_sensitive_body_but_preserves_redacted_context() -> None:
     result = _redact_compaction_text(f"important context {FAKE_KEY}")
     assert FAKE_KEY not in result
-    assert "summary source blocked" in result
-    assert "fingerprint=sha256:" in result
+    assert "important context" in result
+    assert "***" in result or "redacted" in result.lower()
 
 
 def test_external_memory_sync_blocks_before_provider_indexing() -> None:

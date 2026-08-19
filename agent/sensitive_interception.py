@@ -111,7 +111,32 @@ def classify_sensitive_text(
     try:
         from agent.redact import redact_sensitive_text
 
-        redacted = redact_sensitive_text(raw, force=True, redact_url_credentials=True)
+        try:
+            redacted = redact_sensitive_text(
+                raw,
+                force=True,
+                redact_url_credentials=True,
+            )
+            if redacted != raw:
+                # Durable/export boundaries must not retain debugging fragments
+                # of a credential body. Re-run in non-reusable file-read mode
+                # where supported; fall back to the strict result for opaque
+                # JSON/form fields that file-read mode intentionally skips.
+                nonreusable = redact_sensitive_text(
+                    raw,
+                    force=True,
+                    file_read=True,
+                    redact_url_credentials=True,
+                )
+                if nonreusable != raw:
+                    redacted = nonreusable
+        except TypeError as error:
+            # Some tests/plugins monkeypatch the historical two-argument
+            # redactor. Preserve that compatibility while keeping the normal
+            # runtime on strict URL-credential redaction.
+            if "redact_url_credentials" not in str(error):
+                raise
+            redacted = redact_sensitive_text(raw, force=True)
     except Exception:
         finding = SensitiveFinding("classification_unavailable", _fingerprint(raw))
         return (finding,), "[classification-unavailable]", True

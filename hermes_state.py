@@ -8570,7 +8570,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             try:
                 from agent.sensitive_interception import redact_persisted_value
 
-                msg = redact_persisted_value(msg, sink="transcript")
+                safe_msg = redact_persisted_value(msg, sink="transcript")
+                if not isinstance(safe_msg, dict):
+                    raise TypeError("transcript message sanitizer changed mapping shape")
+                # Preserve the caller's dict identity. Several prompt/TUI flows
+                # rely on _insert_message_rows writing the resulting _row_id
+                # back onto the exact message object they supplied.
+                msg.clear()
+                msg.update(safe_msg)
             except Exception as error:
                 raise RuntimeError(
                     "Transcript persistence classification is unavailable"
