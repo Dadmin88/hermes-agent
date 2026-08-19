@@ -72,6 +72,7 @@ async def test_capabilities_advertises_session_control_surface(adapter):
     assert features["run_sensitive_interception"] is True
     assert features["run_fleet_vault_scope"] is True
     assert features["run_fleet_skill_learning"] is True
+    assert features["run_fleet_skill_quarantine"] is True
     assert features["admin_config_rw"] is False
     assert features["memory_write_api"] is False
     assert features["skills_api"] is True
