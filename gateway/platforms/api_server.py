@@ -3219,6 +3219,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_fleet_vault_scope": True,
                 "run_fleet_skill_learning": True,
                 "run_fleet_skill_quarantine": True,
+                "run_fleet_skill_verification": True,
                 "fleet_scoped_memory_write": True,
                 "run_approval_budget": True,
                 "run_tool_evidence": True,

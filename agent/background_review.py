@@ -1001,23 +1001,29 @@ def _run_review_in_thread(
                 # path (this whole block is inside the try/finally above).
                 _unregister_review_agent(review_agent)
 
-            # Fleet Phase 16: once the review fork has finished authoring its
+            # Fleet Phases 16-17: once the review fork has finished authoring
             # Phase 15 candidates, deterministically quarantine/freeze every
-            # candidate bound to this exact run authority. A scanner failure is
-            # fail-closed: candidates remain hidden, inactive, and unverified.
+            # candidate bound to this exact run authority, then verify only the
+            # verification-ready subset in a disposable runtime. Any scanner or
+            # verifier infrastructure failure is fail-closed: candidates remain
+            # hidden, inactive, authority-free, and unpromoted.
             if review_skills:
                 try:
                     from agent.fleet_skill_learning_scope import get_fleet_skill_learning
                     from tools.fleet_skill_quarantine import (
                         quarantine_candidates_for_binding,
                     )
+                    from tools.fleet_skill_verification import (
+                        verify_candidates_for_binding,
+                    )
 
                     _learning = get_fleet_skill_learning()
                     if _learning is not None:
                         quarantine_candidates_for_binding(_learning)
+                        verify_candidates_for_binding(_learning)
                 except Exception as e:
                     logger.warning(
-                        "Fleet skill quarantine failed closed; candidates remain inactive: %s",
+                        "Fleet skill quarantine/verification failed closed; candidates remain inactive: %s",
                         e,
                     )
 
