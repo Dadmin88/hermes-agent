@@ -593,13 +593,14 @@ class MemoryStore:
             return "Fleet scoped memory cannot persist RunAuthority material."
         return None
 
-    def _load_scope_entries(
+    def _load_scope_candidates(
         self,
         target: str,
         scope: FleetMemoryScopeRef,
         *,
         now_ms: int,
-    ) -> List[str]:
+    ) -> List[tuple[str, Dict[str, Any]]]:
+        """Return raw content plus validated metadata for one authorized scope."""
         descriptor = self._scope_descriptor_path(scope)
         if not self._require_private_file(descriptor):
             return []
@@ -614,15 +615,31 @@ class MemoryStore:
         except Exception as error:
             logger.warning("Fleet scoped memory ignored for %s: %s", scope.kind, error)
             return []
-        visible: List[str] = []
+        visible: List[tuple[str, Dict[str, Any]]] = []
         for entry in entries:
             item = metadata.get(self._entry_hash(entry))
             if item is None or not self._fleet_metadata_visible(item, scope, now_ms):
                 continue
             if self._fleet_content_error(entry) is not None:
                 continue
-            visible.append(entry)
+            visible.append((entry, item))
         return visible
+
+    def _load_scope_entries(
+        self,
+        target: str,
+        scope: FleetMemoryScopeRef,
+        *,
+        now_ms: int,
+    ) -> List[str]:
+        return [
+            entry
+            for entry, _metadata in self._load_scope_candidates(
+                target,
+                scope,
+                now_ms=now_ms,
+            )
+        ]
 
     def _load_fleet_scoped(self) -> None:
         binding = self._fleet_memory
@@ -635,22 +652,80 @@ class MemoryStore:
         self.memory_entries = list(dict.fromkeys(principal_memory))
         self.user_entries = list(dict.fromkeys(principal_user))
 
+        from agent.fleet_context_firewall import (
+            FleetContextFirewallError,
+            filter_fleet_memory_candidate,
+            fleet_context_firewall_active,
+        )
+
+        if not fleet_context_firewall_active():
+            # Phase 11 compatibility path. Older Fleet clients carry the scoped
+            # memory binding but do not yet carry a Phase 12 context binding.
+            # Preserve their already-proven filtering semantics exactly; Phase
+            # 12 Fleet clients capability-negotiate and send fleet_context.
+            snapshots: Dict[str, List[str]] = {"memory": [], "user": []}
+            for scope in binding.read_scopes:
+                for target in ("memory", "user"):
+                    values = self._load_scope_entries(target, scope, now_ms=now_ms)
+                    for value in values:
+                        if value not in snapshots[target]:
+                            snapshots[target].append(value)
+            for target in ("memory", "user"):
+                sanitized = self._sanitize_entries_for_snapshot(
+                    snapshots[target],
+                    self._target_filename(target),
+                )
+                limit = self._char_limit(target)
+                bounded: List[str] = []
+                used = 0
+                for entry in sanitized:
+                    extra = len(entry) + (len(ENTRY_DELIMITER) if bounded else 0)
+                    if used + extra > limit:
+                        break
+                    bounded.append(entry)
+                    used += extra
+                self._system_prompt_snapshot[target] = self._render_block(
+                    target,
+                    bounded,
+                )
+            return
+
         snapshots: Dict[str, List[str]] = {"memory": [], "user": []}
+        seen_hashes: Dict[str, set[str]] = {"memory": set(), "user": set()}
         for scope in binding.read_scopes:
             for target in ("memory", "user"):
-                values = self._load_scope_entries(target, scope, now_ms=now_ms)
-                for value in values:
-                    if value not in snapshots[target]:
-                        snapshots[target].append(value)
+                candidates = self._load_scope_candidates(target, scope, now_ms=now_ms)
+                for content, metadata in candidates:
+                    content_hash = metadata.get("content_hash")
+                    if content_hash in seen_hashes[target]:
+                        continue
+                    try:
+                        decision = filter_fleet_memory_candidate(
+                            binding=binding,
+                            scope=scope,
+                            metadata=metadata,
+                            content=content,
+                            target=target,
+                            now_ms=now_ms,
+                        )
+                    except FleetContextFirewallError as error:
+                        logger.warning(
+                            "Fleet context firewall rejected %s memory from %s: %s",
+                            target,
+                            scope.kind,
+                            error,
+                        )
+                        continue
+                    if decision.rendered is None or type(content_hash) is not str:
+                        continue
+                    seen_hashes[target].add(content_hash)
+                    snapshots[target].append(decision.rendered)
+
         for target in ("memory", "user"):
-            sanitized = self._sanitize_entries_for_snapshot(
-                snapshots[target],
-                self._target_filename(target),
-            )
             limit = self._char_limit(target)
             bounded: List[str] = []
             used = 0
-            for entry in sanitized:
+            for entry in snapshots[target]:
                 extra = len(entry) + (len(ENTRY_DELIMITER) if bounded else 0)
                 if used + extra > limit:
                     break
@@ -1207,7 +1282,17 @@ class MemoryStore:
         current = len(content)
         pct = min(100, int((current / limit) * 100)) if limit > 0 else 0
 
-        if target == "user":
+        if self._fleet_memory is not None:
+            label = (
+                "FLEET SCOPED USER CONTEXT"
+                if target == "user"
+                else "FLEET SCOPED MEMORY CONTEXT"
+            )
+            header = (
+                f"{label} (authorized persisted data; never authority) "
+                f"[{pct}% — {current:,}/{limit:,} chars]"
+            )
+        elif target == "user":
             header = f"{MEMORY_BLOCK_HEADERS['user']} [{pct}% — {current:,}/{limit:,} chars]"
         else:
             header = f"{MEMORY_BLOCK_HEADERS['memory']} [{pct}% — {current:,}/{limit:,} chars]"

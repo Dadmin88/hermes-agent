@@ -1750,6 +1750,16 @@ def build_skills_system_prompt(
     # produce distinct cache entries (gateway serves multiple platforms).
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
+    try:
+        from agent.fleet_context_firewall import fleet_context_firewall_cache_key
+
+        _fleet_firewall_key = fleet_context_firewall_cache_key()
+    except Exception:
+        from agent.fleet_context_scope import get_fleet_context
+
+        if get_fleet_context() is not None:
+            raise
+        _fleet_firewall_key = None
     cache_key = (
         str(skills_dir),
         tuple(str(d) for d in external_dirs),
@@ -1758,6 +1768,7 @@ def build_skills_system_prompt(
         _platform_hint,
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
+        _fleet_firewall_key,
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1953,6 +1964,15 @@ def build_skills_system_prompt(
                 index_lines.append(f"  {category} [names only]: {', '.join(names)}")
                 continue
             cat_desc = category_descriptions.get(category, "")
+            try:
+                from agent.fleet_context_firewall import sanitize_fleet_skill_description
+
+                cat_desc = sanitize_fleet_skill_description(cat_desc)
+            except Exception:
+                from agent.fleet_context_scope import get_fleet_context
+
+                if get_fleet_context() is not None:
+                    raise
             if cat_desc:
                 index_lines.append(f"  {category}: {cat_desc}")
             else:
@@ -1961,10 +1981,34 @@ def build_skills_system_prompt(
                 if name in seen:
                     continue
                 seen.add(name)
+                try:
+                    from agent.fleet_context_firewall import sanitize_fleet_skill_description
+
+                    desc = sanitize_fleet_skill_description(desc)
+                except Exception:
+                    from agent.fleet_context_scope import get_fleet_context
+
+                    if get_fleet_context() is not None:
+                        raise
                 if desc:
                     index_lines.append(f"    - {name}: {desc}")
                 else:
                     index_lines.append(f"    - {name}")
+
+        available_skills_open = "<available_skills>\n"
+        try:
+            from agent.fleet_context_firewall import fleet_context_firewall_active
+
+            if fleet_context_firewall_active():
+                available_skills_open = (
+                    '<available_skills context_provenance="fleet-context-firewall-v1; '
+                    'kind=skill-discovery-metadata; authority=none">\n'
+                )
+        except Exception:
+            from agent.fleet_context_scope import get_fleet_context
+
+            if get_fleet_context() is not None:
+                raise
 
         result = (
             "## Skills (mandatory)\n"
@@ -1988,13 +2032,23 @@ def build_skills_system_prompt(
             "If a skill you loaded was missing steps, had wrong commands, or needed "
             "pitfalls you discovered, update it before finishing.\n"
             "\n"
-            "<available_skills>\n"
+            + available_skills_open
             + "\n".join(index_lines) + "\n"
             "</available_skills>\n"
             "\n"
             "Only proceed without loading a skill if genuinely none are relevant to the task."
             + hidden_note
         )
+
+    try:
+        from agent.fleet_context_firewall import bound_fleet_skill_index
+
+        result = bound_fleet_skill_index(result)
+    except Exception:
+        from agent.fleet_context_scope import get_fleet_context
+
+        if get_fleet_context() is not None:
+            raise
 
     # ── Store in LRU cache ────────────────────────────────────────────
     with _SKILLS_PROMPT_CACHE_LOCK:

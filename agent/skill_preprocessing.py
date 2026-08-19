@@ -138,7 +138,16 @@ def preprocess_skill_content(
     cfg = skills_cfg if isinstance(skills_cfg, dict) else load_skills_config()
     if cfg.get("template_vars", True):
         content = substitute_template_vars(content, skill_dir, session_id)
-    if cfg.get("inline_shell", False):
+    inline_shell_enabled = cfg.get("inline_shell", False)
+    if inline_shell_enabled:
+        from agent.fleet_context_scope import get_fleet_context
+
+        # A skill is persisted context, not host authority. Fleet-bound runs
+        # therefore never execute inline shell merely because skill text was
+        # loaded into context. Host effects must come through RunAuthority.
+        if get_fleet_context() is not None:
+            inline_shell_enabled = False
+    if inline_shell_enabled:
         timeout = int(cfg.get("inline_shell_timeout", 10) or 10)
         content = expand_inline_shell(content, skill_dir, timeout)
     return content

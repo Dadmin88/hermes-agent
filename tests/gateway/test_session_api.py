@@ -68,6 +68,7 @@ async def test_capabilities_advertises_session_control_surface(adapter):
     assert features["session_fork"] is True
     assert features["run_steer"] is True
     assert features["run_fleet_runtime"] is True
+    assert features["run_fleet_context_firewall"] is True
     assert features["admin_config_rw"] is False
     assert features["memory_write_api"] is False
     assert features["skills_api"] is True
