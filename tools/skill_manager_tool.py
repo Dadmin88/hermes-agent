@@ -122,6 +122,22 @@ def _guard_agent_created_enabled() -> bool:
         return False
 
 
+def _sensitive_skill_error(content: str, *, file_path: str | None = None) -> Optional[str]:
+    """Block sensitive material before it enters durable skill state."""
+    try:
+        from agent.sensitive_interception import (
+            SensitiveInterceptionError,
+            require_persistable_text,
+        )
+
+        require_persistable_text(content, sink="skill", path=file_path)
+    except SensitiveInterceptionError as error:
+        return str(error)
+    except Exception:
+        return "Skill persistence classification is unavailable; refusing the write."
+    return None
+
+
 def _security_scan_skill(skill_dir: Path) -> Optional[str]:
     """Scan a skill directory after write. Returns error string if blocked, else None.
 
@@ -924,6 +940,9 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     err = _validate_content_size(content)
     if err:
         return {"success": False, "error": err}
+    sensitive_error = _sensitive_skill_error(content, file_path="SKILL.md")
+    if sensitive_error:
+        return {"success": False, "error": sensitive_error}
 
     # Check for name collisions across all directories
     existing = _find_skill(name)
@@ -1012,6 +1031,9 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     err = _validate_content_size(content)
     if err:
         return {"success": False, "error": err}
+    sensitive_error = _sensitive_skill_error(content, file_path="SKILL.md")
+    if sensitive_error:
+        return {"success": False, "error": sensitive_error}
 
     existing = _find_skill(name)
     if not existing:
@@ -1150,6 +1172,9 @@ def _patch_skill(
     err = _validate_content_size(new_content, label=target_label)
     if err:
         return {"success": False, "error": err}
+    sensitive_error = _sensitive_skill_error(new_content, file_path=target_label)
+    if sensitive_error:
+        return {"success": False, "error": sensitive_error}
 
     # If patching SKILL.md, validate frontmatter is still intact
     if not file_path:
@@ -1316,6 +1341,9 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     err = _validate_content_size(file_content, label=file_path)
     if err:
         return {"success": False, "error": err}
+    sensitive_error = _sensitive_skill_error(file_content, file_path=file_path)
+    if sensitive_error:
+        return {"success": False, "error": sensitive_error}
 
     existing = _find_skill(name)
     if not existing:

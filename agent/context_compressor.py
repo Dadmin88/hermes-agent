@@ -832,24 +832,32 @@ _HISTORICAL_TASK_SECTION_RE = re.compile(
 
 
 def _redact_compaction_text(text: Any) -> str:
-    """Redact text that crosses a compaction summary boundary.
+    """Intercept text that crosses a compaction summary boundary.
 
     Compaction summaries persist across sessions and are re-injected into
-    every subsequent summarizer prompt, so this boundary uses strict mode:
-
-    - ``force=True`` — deliberately overrides ``security.redact_secrets:
-      false``. That opt-out targets *live tool output* (e.g. working on the
-      redactor itself); a summary is a persistence boundary where a leaked
-      credential keeps re-entering prompts indefinitely.
-    - ``redact_url_credentials=True`` — OAuth callback codes, magic-link
-      tokens, and URL userinfo never need to survive summarization the way
-      they must survive live navigation flows.
+    subsequent summarizer prompts. Phase 13 therefore treats summary source
+    as a blocking persistence sink: if the central interception boundary
+    detects sensitive material, the entire source fragment is replaced by a
+    value-free marker carrying only finding classes and a one-way fingerprint.
+    Non-sensitive source text passes through unchanged.
     """
-    return redact_sensitive_text(
-        text or "",
-        force=True,
-        redact_url_credentials=True,
-    )
+    raw = "" if text is None else str(text)
+    try:
+        from agent.sensitive_interception import intercept_persistence
+
+        decision = intercept_persistence(raw, sink="summary")
+        if not decision.found:
+            return raw
+        kinds = ",".join(finding.kind for finding in decision.findings) or "unknown"
+        fingerprint = decision.findings[0].fingerprint if decision.findings else "none"
+        return (
+            "[summary source blocked by sensitive-content interception; "
+            f"findings={kinds}; fingerprint={fingerprint}]"
+        )
+    except Exception:
+        # Summary is durable and re-enters future prompts. Fail closed rather
+        # than persisting raw text if the interception boundary is unavailable.
+        return "[summary source blocked: persistence classification unavailable]"
 
 
 def _dedupe_append(items: list[str], value: str, *, limit: int) -> None:

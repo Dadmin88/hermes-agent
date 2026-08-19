@@ -111,6 +111,22 @@ def _scan_memory_content(content: str) -> Optional[str]:
     return _first_threat_message(content, scope="strict")
 
 
+def _sensitive_persistence_error(content: str) -> Optional[str]:
+    """Block credential-bearing memory before any durable write."""
+    try:
+        from agent.sensitive_interception import (
+            SensitiveInterceptionError,
+            require_persistable_text,
+        )
+
+        require_persistable_text(content, sink="memory")
+    except SensitiveInterceptionError as error:
+        return str(error)
+    except Exception:
+        return "Memory persistence classification is unavailable; refusing the write."
+    return None
+
+
 def _drift_error(path: "Path", bak_path: str) -> Dict[str, Any]:
     """Build the error dict returned when external drift is detected.
 
@@ -911,6 +927,9 @@ class MemoryStore:
         content = content.strip()
         if not content:
             return {"success": False, "error": "Content cannot be empty."}
+        persistence_error = _sensitive_persistence_error(content)
+        if persistence_error:
+            return {"success": False, "error": persistence_error}
         consistency_error = self._fleet_write_consistency_error(target)
         if consistency_error:
             return {"success": False, "error": consistency_error}
@@ -979,6 +998,9 @@ class MemoryStore:
             return {"success": False, "error": "old_text cannot be empty."}
         if not new_content:
             return {"success": False, "error": "new_content cannot be empty. Use 'remove' to delete entries."}
+        persistence_error = _sensitive_persistence_error(new_content)
+        if persistence_error:
+            return {"success": False, "error": persistence_error}
         consistency_error = self._fleet_write_consistency_error(target)
         if consistency_error:
             return {"success": False, "error": consistency_error}
@@ -1118,6 +1140,12 @@ class MemoryStore:
             act = (op or {}).get("action")
             new_content = (op or {}).get("content")
             if act in {"add", "replace"} and new_content:
+                persistence_error = _sensitive_persistence_error(new_content)
+                if persistence_error:
+                    return {
+                        "success": False,
+                        "error": f"Operation {i + 1}: {persistence_error}",
+                    }
                 if self._fleet_memory is not None:
                     fleet_error = self._fleet_content_error(new_content)
                     if fleet_error:

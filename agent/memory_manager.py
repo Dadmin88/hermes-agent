@@ -706,6 +706,28 @@ class MemoryManager:
             return
         user_content = clean_user_content
 
+        # External memory providers may embed and/or search-index synced turns.
+        # Phase 13 blocks the entire provider sync when any raw sensitive body
+        # is present, so a provider never sees material merely because it uses a
+        # different persistence backend than native Hermes memory.
+        try:
+            from agent.sensitive_interception import block_if_sensitive
+
+            if (
+                block_if_sensitive(user_content, sink="embedding")
+                or block_if_sensitive(assistant_content, sink="embedding")
+                or (messages is not None and block_if_sensitive(messages, sink="embedding"))
+            ):
+                logger.warning(
+                    "External memory provider sync blocked by sensitive-content interception"
+                )
+                return
+        except Exception:
+            logger.warning(
+                "External memory provider sync blocked: persistence classification unavailable"
+            )
+            return
+
         def _run() -> None:
             for provider in providers:
                 try:

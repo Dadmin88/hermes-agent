@@ -8105,6 +8105,46 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         from every outgoing payload anyway, so the scrubbed form IS the
         wire bytes).
         """
+        # Durable transcripts are a persistence boundary. Keep live model
+        # context unchanged, but never store raw sensitive bodies in replayable
+        # session state, structured tool calls, reasoning sidecars, or display
+        # metadata.
+        try:
+            from agent.sensitive_interception import redact_persisted_value
+
+            content = redact_persisted_value(content, sink="transcript")
+            tool_calls = redact_persisted_value(tool_calls, sink="transcript")
+            reasoning = redact_persisted_value(reasoning, sink="transcript")
+            reasoning_content = redact_persisted_value(
+                reasoning_content, sink="transcript"
+            )
+            reasoning_details = redact_persisted_value(
+                reasoning_details, sink="transcript"
+            )
+            codex_reasoning_items = redact_persisted_value(
+                codex_reasoning_items, sink="transcript"
+            )
+            codex_message_items = redact_persisted_value(
+                codex_message_items, sink="transcript"
+            )
+            api_content = redact_persisted_value(api_content, sink="transcript")
+            display_metadata = redact_persisted_value(
+                display_metadata, sink="transcript"
+            )
+        except Exception:
+            # Transcript persistence is durable and searchable. If the
+            # classifier cannot run, fail closed rather than writing the raw
+            # payload into SQLite.
+            content = "[transcript content blocked: persistence classification unavailable]"
+            tool_calls = None
+            reasoning = "[blocked]"
+            reasoning_content = "[blocked]"
+            reasoning_details = None
+            codex_reasoning_items = None
+            codex_message_items = None
+            api_content = None
+            display_metadata = None
+
         # Display metadata is presentation-only and never changes the model
         # context role/content replayed to providers.
         display_metadata_json = self._encode_display_metadata(display_metadata)
@@ -8527,6 +8567,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         inserted = 0
         tool_calls_total = 0
         for msg in messages:
+            try:
+                from agent.sensitive_interception import redact_persisted_value
+
+                msg = redact_persisted_value(msg, sink="transcript")
+            except Exception as error:
+                raise RuntimeError(
+                    "Transcript persistence classification is unavailable"
+                ) from error
             role = msg.get("role", "unknown")
             tool_calls = msg.get("tool_calls")
             message_timestamp = now_ts

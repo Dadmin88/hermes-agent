@@ -3204,6 +3204,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_fleet_runtime": True,
                 "run_fleet_memory_scope": True,
                 "run_fleet_context_firewall": True,
+                "run_sensitive_interception": True,
                 "fleet_scoped_memory_write": True,
                 "run_approval_budget": True,
                 "run_tool_evidence": True,
@@ -6542,6 +6543,14 @@ class APIServerAdapter(BasePlatformAdapter):
             "updated_at": now,
         })
         current.setdefault("created_at", fields.pop("created_at", now))
+        try:
+            from agent.sensitive_interception import redact_persisted_value
+
+            fields = redact_persisted_value(fields, sink="evidence")
+        except Exception:
+            # Pollable run evidence crosses a control-plane boundary. Do not
+            # surface raw values if interception is unavailable.
+            fields = {"evidence_redaction": "classification-unavailable"}
         current.update(fields)
         self._run_statuses[run_id] = current
         return current

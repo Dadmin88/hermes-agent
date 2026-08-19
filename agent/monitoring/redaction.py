@@ -43,10 +43,15 @@ _UUID_RE = re.compile(
 def _secret_redact(text: str) -> str:
     """Always-on secret redaction. force=True so user config can't disable it."""
     try:
-        from agent.redact import redact_sensitive_text
-        out = redact_sensitive_text(text, force=True)
+        from agent.sensitive_interception import intercept_persistence
+
+        decision = intercept_persistence(text, sink="log")
+        if decision.uncertain or decision.persisted_text is None:
+            return "[redaction-unavailable]"
+        out = decision.persisted_text
     except Exception:
-        # Fail CLOSED: if the redactor can't run, do not emit the raw string.
+        # Fail CLOSED: if the interception boundary can't run, do not emit the
+        # raw string.
         return "[redaction-unavailable]"
     out = _BEARER_RE.sub("[redacted]", out)
     out = _TOKEN_RE.sub("[redacted]", out)
