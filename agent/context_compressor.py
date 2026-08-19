@@ -832,24 +832,38 @@ _HISTORICAL_TASK_SECTION_RE = re.compile(
 
 
 def _redact_compaction_text(text: Any) -> str:
-    """Redact text that crosses a compaction summary boundary.
+    """Intercept text that crosses a compaction summary boundary.
 
     Compaction summaries persist across sessions and are re-injected into
-    every subsequent summarizer prompt, so this boundary uses strict mode:
-
-    - ``force=True`` — deliberately overrides ``security.redact_secrets:
-      false``. That opt-out targets *live tool output* (e.g. working on the
-      redactor itself); a summary is a persistence boundary where a leaked
-      credential keeps re-entering prompts indefinitely.
-    - ``redact_url_credentials=True`` — OAuth callback codes, magic-link
-      tokens, and URL userinfo never need to survive summarization the way
-      they must survive live navigation flows.
+    subsequent summarizer prompts. Phase 13 therefore treats summary source
+    as a blocking persistence sink: if the central interception boundary
+    detects sensitive material, the sensitive body is excluded and only the
+    forced-redacted surrounding context may continue into summary generation.
+    Non-sensitive source text passes through unchanged.
     """
-    return redact_sensitive_text(
-        text or "",
-        force=True,
-        redact_url_credentials=True,
-    )
+    raw = "" if text is None else str(text)
+    try:
+        from agent.sensitive_interception import (
+            classify_sensitive_text,
+            intercept_persistence,
+        )
+
+        decision = intercept_persistence(raw, sink="summary")
+        if not decision.found:
+            return raw
+        _findings, redacted, uncertain = classify_sensitive_text(raw)
+        if not uncertain:
+            # The sensitive body is blocked from summary persistence, while the
+            # surrounding context remains useful after forced non-reusable
+            # redaction. Summaries are stricter than diagnostic exports: strip
+            # even recognizable vendor-prefix labels from redaction sentinels.
+            redacted = re.sub(r"«redacted:[^»]*»", "***", redacted)
+            return redacted
+        return "[summary source blocked: persistence classification unavailable]"
+    except Exception:
+        # Summary is durable and re-enters future prompts. Fail closed rather
+        # than persisting raw text if the interception boundary is unavailable.
+        return "[summary source blocked: persistence classification unavailable]"
 
 
 def _dedupe_append(items: list[str], value: str, *, limit: int) -> None:

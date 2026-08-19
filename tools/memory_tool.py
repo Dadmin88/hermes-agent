@@ -111,6 +111,22 @@ def _scan_memory_content(content: str) -> Optional[str]:
     return _first_threat_message(content, scope="strict")
 
 
+def _sensitive_persistence_error(content: str) -> Optional[str]:
+    """Block credential-bearing memory before any durable write."""
+    try:
+        from agent.sensitive_interception import (
+            SensitiveInterceptionError,
+            require_persistable_text,
+        )
+
+        require_persistable_text(content, sink="memory")
+    except SensitiveInterceptionError as error:
+        return str(error)
+    except Exception:
+        return "Memory persistence classification is unavailable; refusing the write."
+    return None
+
+
 def _drift_error(path: "Path", bak_path: str) -> Dict[str, Any]:
     """Build the error dict returned when external drift is detected.
 
@@ -917,6 +933,9 @@ class MemoryStore:
         fleet_error = self._fleet_content_error(content) if self._fleet_memory else None
         if fleet_error:
             return {"success": False, "error": fleet_error}
+        persistence_error = _sensitive_persistence_error(content)
+        if persistence_error:
+            return {"success": False, "error": persistence_error}
 
         # Scan for injection/exfiltration before accepting
         scan_error = _scan_memory_content(content)
@@ -985,6 +1004,9 @@ class MemoryStore:
         fleet_error = self._fleet_content_error(new_content) if self._fleet_memory else None
         if fleet_error:
             return {"success": False, "error": fleet_error}
+        persistence_error = _sensitive_persistence_error(new_content)
+        if persistence_error:
+            return {"success": False, "error": persistence_error}
 
         # Scan replacement content for injection/exfiltration
         scan_error = _scan_memory_content(new_content)
@@ -1125,6 +1147,12 @@ class MemoryStore:
                             "success": False,
                             "error": f"Operation {i + 1}: {fleet_error}",
                         }
+                persistence_error = _sensitive_persistence_error(new_content)
+                if persistence_error:
+                    return {
+                        "success": False,
+                        "error": f"Operation {i + 1}: {persistence_error}",
+                    }
                 scan_error = _scan_memory_content(new_content)
                 if scan_error:
                     return {"success": False, "error": f"Operation {i + 1}: {scan_error}"}
