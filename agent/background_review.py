@@ -515,6 +515,16 @@ def summarize_background_review_actions(
         is_skill = detail.get("tool") == "skill_manage"
 
         message_lower = message.lower()
+        if is_skill and data.get("candidate") is True:
+            skill_name = detail.get("name", "")
+            if skill_name:
+                actions.append(
+                    f"🧪 Skill candidate '{skill_name}' recorded "
+                    "(private, quarantined, inactive)"
+                )
+            elif message:
+                actions.append(f"🧪 {message}")
+            continue
         if not verbose:
             if "created" in message_lower:
                 actions.append(message)
