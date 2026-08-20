@@ -317,11 +317,23 @@ def test_skill_promotion_rejects_promoted_name_collision(
     commit_skill_promotion(authorization=first_auth)
 
     second_binding = replace(learning_binding(), source_run="run-second")
-    _bound, second_candidate = create_candidate(
+    _bound, _candidate_hint = create_candidate(
         isolated_home,
         content=SAFE_SKILL,
         bound=second_binding,
     )
+    second_candidate = None
+    candidate_root = isolated_home / ".fleet" / "candidates"
+    for candidate in candidate_root.iterdir():
+        if not candidate.is_dir():
+            continue
+        metadata = json.loads(
+            (candidate / "candidate.json").read_text(encoding="utf-8")
+        )
+        if metadata.get("source_run") == second_binding.source_run:
+            second_candidate = candidate
+            break
+    assert second_candidate is not None
     quarantine = quarantine_skill_candidate(
         second_candidate,
         expected_binding=second_binding,
