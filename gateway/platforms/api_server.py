@@ -100,6 +100,7 @@ from agent.fleet_context_scope import (
 from agent.fleet_memory_scope import (
     FleetMemoryBinding,
     FleetMemoryScopeError,
+    FleetMemoryScopeRef,
     fleet_memory_scope,
 )
 from agent.fleet_runtime_scope import (
@@ -118,6 +119,11 @@ from agent.fleet_skill_learning_scope import (
     FleetSkillLearningBinding,
     FleetSkillLearningScopeError,
     fleet_skill_learning_scope,
+)
+from agent.fleet_promotion import (
+    FleetPromotionAuthorization,
+    FleetPromotionError,
+    FleetPromotionScopeRef,
 )
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
@@ -2132,6 +2138,10 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
             ("POST", "/v1/fleet/memory", self._handle_fleet_memory_write),
+            ("POST", "/v1/fleet/promotions/prepare", self._handle_fleet_promotion_prepare),
+            ("POST", "/v1/fleet/promotions/commit", self._handle_fleet_promotion_commit),
+            ("POST", "/v1/fleet/promotions/rollback", self._handle_fleet_promotion_rollback),
+            ("POST", "/v1/fleet/promotions/history", self._handle_fleet_promotion_history),
             ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
@@ -3221,6 +3231,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_fleet_skill_quarantine": True,
                 "run_fleet_skill_verification": True,
                 "fleet_scoped_memory_write": True,
+                "fleet_learning_promotion": True,
                 "run_approval_budget": True,
                 "run_tool_evidence": True,
                 "run_command_evidence": True,
@@ -6910,6 +6921,237 @@ class APIServerAdapter(BasePlatformAdapter):
                 "result": result,
             },
             status=status,
+        )
+
+    async def _handle_fleet_promotion_prepare(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """Prepare exact sanitized/re-verified Phase 18 content without mutating state."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if type(body) is not dict or body.get("subject_kind") not in {"memory", "skill"}:
+            return web.json_response(
+                _openai_error(
+                    "Invalid Fleet promotion prepare shape",
+                    code="invalid_fleet_promotion",
+                ),
+                status=400,
+            )
+        try:
+            from tools.fleet_promotion import (
+                FleetPromotionMutationError,
+                prepare_memory_promotion,
+                prepare_skill_promotion,
+            )
+
+            if body["subject_kind"] == "memory":
+                expected = {
+                    "subject_kind",
+                    "target",
+                    "source_scope",
+                    "source_content_hash",
+                    "source_owner_principal_id",
+                    "agent_instance_id",
+                }
+                if set(body) != expected or body.get("target") not in {"memory", "user"}:
+                    raise FleetPromotionMutationError(
+                        "memory promotion prepare shape is invalid"
+                    )
+                source_scope = FleetMemoryScopeRef.from_request(body["source_scope"])
+                prepared = prepare_memory_promotion(
+                    target=body["target"],
+                    source_scope=source_scope,
+                    source_content_hash=body["source_content_hash"],
+                    source_owner_principal_id=body["source_owner_principal_id"],
+                    agent_instance_id=body["agent_instance_id"],
+                )
+            else:
+                expected = {
+                    "subject_kind",
+                    "candidate_id",
+                    "source_owner_principal_id",
+                    "agent_instance_id",
+                }
+                if set(body) != expected:
+                    raise FleetPromotionMutationError(
+                        "skill promotion prepare shape is invalid"
+                    )
+                prepared = prepare_skill_promotion(
+                    candidate_id=body["candidate_id"],
+                    source_owner_principal_id=body["source_owner_principal_id"],
+                    agent_instance_id=body["agent_instance_id"],
+                )
+        except (FleetPromotionError, FleetPromotionMutationError, KeyError) as error:
+            return web.json_response(
+                _openai_error(str(error), code="fleet_promotion_prepare_failed"),
+                status=409,
+            )
+        return web.json_response(
+            {
+                "object": "hermes.api_server.fleet_promotion_prepare",
+                "prepared": prepared.to_document(),
+            }
+        )
+
+    async def _handle_fleet_promotion_commit(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """Commit one exact Fleet-authorized memory or skill promotion."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if type(body) is not dict or set(body) - {"authorization", "target"} or "authorization" not in body:
+            return web.json_response(
+                _openai_error(
+                    "Invalid Fleet promotion commit shape",
+                    code="invalid_fleet_promotion",
+                ),
+                status=400,
+            )
+        try:
+            from tools.fleet_promotion import (
+                FleetPromotionMutationError,
+                commit_memory_promotion,
+                commit_skill_promotion,
+            )
+
+            authorization = FleetPromotionAuthorization.from_request(body["authorization"])
+            if authorization.operation != "promote":
+                raise FleetPromotionMutationError(
+                    "promotion commit requires a normal promotion authorization"
+                )
+            if authorization.subject_kind == "memory":
+                target = body.get("target")
+                if target not in {"memory", "user"}:
+                    raise FleetPromotionMutationError(
+                        "memory promotion commit target is invalid"
+                    )
+                result = commit_memory_promotion(
+                    target=target,
+                    authorization=authorization,
+                )
+            else:
+                if "target" in body:
+                    raise FleetPromotionMutationError(
+                        "skill promotion commit does not accept a memory target"
+                    )
+                result = commit_skill_promotion(authorization=authorization)
+        except (FleetPromotionError, FleetPromotionMutationError, KeyError) as error:
+            return web.json_response(
+                _openai_error(str(error), code="fleet_promotion_commit_failed"),
+                status=409,
+            )
+        return web.json_response(
+            {
+                "object": "hermes.api_server.fleet_promotion_commit",
+                "result": result.to_document(),
+            }
+        )
+
+    async def _handle_fleet_promotion_rollback(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """Apply an append-only rollback to an exact historical promotion version."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if type(body) is not dict or set(body) != {"authorization"}:
+            return web.json_response(
+                _openai_error(
+                    "Invalid Fleet promotion rollback shape",
+                    code="invalid_fleet_promotion",
+                ),
+                status=400,
+            )
+        try:
+            from tools.fleet_promotion import (
+                FleetPromotionMutationError,
+                rollback_promotion,
+            )
+
+            authorization = FleetPromotionAuthorization.from_request(body["authorization"])
+            if authorization.operation != "rollback":
+                raise FleetPromotionMutationError(
+                    "promotion rollback requires a rollback authorization"
+                )
+            result = rollback_promotion(authorization=authorization)
+        except (FleetPromotionError, FleetPromotionMutationError, KeyError) as error:
+            return web.json_response(
+                _openai_error(str(error), code="fleet_promotion_rollback_failed"),
+                status=409,
+            )
+        return web.json_response(
+            {
+                "object": "hermes.api_server.fleet_promotion_rollback",
+                "result": result.to_document(),
+            }
+        )
+
+    async def _handle_fleet_promotion_history(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """Return bounded non-content promotion history for conflict handling and operators."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if type(body) is not dict or set(body) != {
+            "subject_kind",
+            "subject_key",
+            "source_owner_principal_id",
+            "agent_instance_id",
+            "source_scope",
+            "target_scope",
+        }:
+            return web.json_response(
+                _openai_error(
+                    "Invalid Fleet promotion history shape",
+                    code="invalid_fleet_promotion",
+                ),
+                status=400,
+            )
+        try:
+            from tools.fleet_promotion import (
+                FleetPromotionMutationError,
+                promotion_history,
+            )
+
+            source_scope = FleetPromotionScopeRef.from_request(body["source_scope"])
+            target_scope = FleetPromotionScopeRef.from_request(body["target_scope"])
+            result = promotion_history(
+                subject_kind=body["subject_kind"],
+                subject_key=body["subject_key"],
+                source_owner_principal_id=body["source_owner_principal_id"],
+                agent_instance_id=body["agent_instance_id"],
+                source_scope=source_scope.to_request(),
+                target_scope=target_scope.to_request(),
+            )
+        except (FleetPromotionError, FleetPromotionMutationError, KeyError) as error:
+            return web.json_response(
+                _openai_error(str(error), code="fleet_promotion_history_failed"),
+                status=409,
+            )
+        return web.json_response(
+            {
+                "object": "hermes.api_server.fleet_promotion_history",
+                "result": result,
+            }
         )
 
     @_admit_api_agent_request

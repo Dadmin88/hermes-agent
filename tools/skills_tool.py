@@ -670,6 +670,54 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         return False
 
 
+def _visible_fleet_promoted_skill_files() -> List[Path]:
+    """Return only Phase 18 promoted skills visible to the current Fleet scope."""
+    try:
+        from tools.fleet_promotion import visible_promoted_skill_files
+
+        return visible_promoted_skill_files()
+    except Exception as error:
+        logger.debug("Fleet promoted-skill discovery failed closed: %s", error)
+        return []
+
+
+def _merge_fleet_promoted_skill_metadata(
+    skills: List[Dict[str, Any]], disabled: Set[str]
+) -> List[Dict[str, Any]]:
+    """Add current scope-authorized promoted skills without shadowing native skills."""
+    merged = [dict(skill) for skill in skills]
+    seen_names = {skill.get("name") for skill in merged}
+    for skill_md in _visible_fleet_promoted_skill_files():
+        try:
+            content = skill_md.read_text(encoding="utf-8-sig", errors="replace")[:4000]
+            frontmatter, body = _parse_frontmatter(content)
+            if not skill_matches_platform(frontmatter) or not skill_matches_environment(frontmatter):
+                continue
+            name = frontmatter.get("name", skill_md.parent.name)[:MAX_NAME_LENGTH]
+            if name in seen_names or name in disabled:
+                continue
+            description = frontmatter.get("description", "")
+            if not description:
+                for line in body.strip().split("\n"):
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        description = line
+                        break
+            if len(description) > MAX_DESCRIPTION_LENGTH:
+                description = description[: MAX_DESCRIPTION_LENGTH - 3] + "..."
+            merged.append(
+                {
+                    "name": name,
+                    "description": description,
+                    "category": frontmatter.get("category") or "fleet-promoted",
+                }
+            )
+            seen_names.add(name)
+        except Exception as error:
+            logger.debug("Skipping promoted Fleet skill %s: %s", skill_md, error)
+    return merged
+
+
 def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     """Recursively find all skills in ~/.hermes/skills/ and external dirs.
 
@@ -714,7 +762,9 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
         # Per-call shallow copies: callers mutate the returned dicts
         # (e.g. web_server annotates s["enabled"]/s["usage"]) — handing
         # out the cached objects would poison the cache for everyone else.
-        return [dict(s) for s in cached[2]]
+        return _merge_fleet_promoted_skill_metadata(
+            [dict(s) for s in cached[2]], disabled
+        )
 
     skills = []
     seen_names: set = set()
@@ -778,7 +828,9 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     # re-scans rather than serving the torn result past the TTL). Same
     # shallow-copy contract as the hit path — the caller may mutate.
     _SKILLS_CACHE[cache_key] = (signature, now, skills)
-    return [dict(s) for s in skills]
+    return _merge_fleet_promoted_skill_metadata(
+        [dict(s) for s in skills], disabled
+    )
 
 
 def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1326,8 +1378,9 @@ def skill_view(
         if active_skills_dir.exists():
             all_dirs.append(active_skills_dir)
         all_dirs.extend(get_external_skills_dirs())
+        promoted_skill_files = _visible_fleet_promoted_skill_files()
 
-        if not all_dirs:
+        if not all_dirs and not promoted_skill_files:
             return json.dumps(
                 {
                     "success": False,
@@ -1420,6 +1473,22 @@ def skill_view(
                 ):
                     _record(None, found_md)
 
+        # Phase 18 promoted skills are outside the native active tree and are
+        # supplied only when the current Fleet run can read their promoted scope.
+        for promoted_md in promoted_skill_files:
+            try:
+                promoted_content = promoted_md.read_text(
+                    encoding="utf-8-sig", errors="replace"
+                )
+                promoted_frontmatter, _ = _parse_frontmatter(promoted_content)
+            except Exception:
+                continue
+            if (
+                promoted_md.parent.name == name
+                or promoted_frontmatter.get("name") == name
+            ):
+                _record(promoted_md.parent, promoted_md)
+
         if len(candidates) > 1:
             paths = [str(smd) for _, smd in candidates]
             logging.getLogger(__name__).warning(
@@ -1477,6 +1546,7 @@ def skill_view(
         _trusted_dirs = [active_skills_dir.resolve()]
         try:
             _trusted_dirs.extend(d.resolve() for d in all_dirs[1:])
+            _trusted_dirs.extend(path.parent.resolve() for path in promoted_skill_files)
         except Exception:
             pass
         for _td in _trusted_dirs:
