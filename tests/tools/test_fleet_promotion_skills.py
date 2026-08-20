@@ -67,11 +67,17 @@ def promotion_authorization(
     source_hash: str,
     approved_hash: str,
     verification_digest: str,
+    source_scope: dict[str, str] | None = None,
+    target_scope: dict[str, str] | None = None,
+    administrator_principal_id: str = ADMIN,
+    administrator_binding_hash: str = ADMIN_BINDING,
     expected_current: str | None = None,
     rollback_to: str | None = None,
     operation: str = "promote",
     issued_at_ms: int = 10_000,
 ) -> FleetPromotionAuthorization:
+    source_scope = source_scope or {"kind": "principal", "scope_id": P1}
+    target_scope = target_scope or {"kind": "project", "scope_id": "project-one"}
     unsigned: dict[str, object] = {
         "version": "fleet-promotion-v1",
         "policy_version": "phase18-v1",
@@ -79,15 +85,15 @@ def promotion_authorization(
         "subject_key": candidate_id,
         "source_owner_principal_id": P1,
         "agent_instance_id": AGENT,
-        "source_scope": {"kind": "principal", "scope_id": P1},
-        "target_scope": {"kind": "project", "scope_id": "project-one"},
+        "source_scope": source_scope,
+        "target_scope": target_scope,
         "source_content_hash": source_hash,
         "approved_content_hash": approved_hash,
         "administrator": {
-            "principal_id": ADMIN,
-            "kind": "project",
+            "principal_id": administrator_principal_id,
+            "kind": target_scope["kind"],
             "generation": 1,
-            "binding_hash": ADMIN_BINDING,
+            "binding_hash": administrator_binding_hash,
         },
         "issued_at_ms": issued_at_ms,
         "expires_at_ms": issued_at_ms + 60_000,
@@ -113,11 +119,15 @@ def promotion_authorization(
     )
 
 
-def scoped_reader(*, include_project: bool) -> FleetMemoryBinding:
+def scoped_reader(
+    *, include_project: bool, include_network: bool = False
+) -> FleetMemoryBinding:
     private = FleetMemoryScopeRef("principal", P1)
     reads = [private]
     if include_project:
         reads.append(FleetMemoryScopeRef("project", "project-one"))
+    if include_network:
+        reads.append(FleetMemoryScopeRef("network", "network-one"))
     return FleetMemoryBinding(
         version="fleet-memory-v1",
         principal_id=P1,
@@ -189,6 +199,83 @@ def test_verified_skill_promotion_is_visible_only_in_authorized_scope(
     assert persisted["state"] == "verification-ready"
     assert persisted["active"] is False
     assert persisted["authority"] == "none"
+
+
+def test_skill_multi_hop_requires_current_source_promotion(
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _candidate, metadata = verified_candidate(isolated_home, monkeypatch)
+    candidate_id = metadata["candidate_id"]
+    prepared = prepare_skill_promotion(
+        candidate_id=candidate_id,
+        source_owner_principal_id=P1,
+        agent_instance_id=AGENT,
+    )
+    authorization = promotion_authorization(
+        candidate_id=candidate_id,
+        source_hash=prepared.source_content_hash,
+        approved_hash=prepared.approved_content_hash,
+        verification_digest=prepared.verification_digest or "",
+        source_scope={"kind": "project", "scope_id": "project-one"},
+        target_scope={"kind": "network", "scope_id": "network-one"},
+    )
+    with pytest.raises(
+        FleetPromotionMutationError,
+        match="source scope is not currently promoted",
+    ):
+        commit_skill_promotion(authorization=authorization)
+
+
+def test_skill_multi_hop_prefers_broadest_visible_exact_version(
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _candidate, metadata = verified_candidate(isolated_home, monkeypatch)
+    candidate_id = metadata["candidate_id"]
+    prepared = prepare_skill_promotion(
+        candidate_id=candidate_id,
+        source_owner_principal_id=P1,
+        agent_instance_id=AGENT,
+    )
+    project_authorization = promotion_authorization(
+        candidate_id=candidate_id,
+        source_hash=prepared.source_content_hash,
+        approved_hash=prepared.approved_content_hash,
+        verification_digest=prepared.verification_digest or "",
+    )
+    project_result = commit_skill_promotion(
+        authorization=project_authorization
+    )
+    assert project_result.operation == "promote"
+
+    network_authorization = promotion_authorization(
+        candidate_id=candidate_id,
+        source_hash=prepared.source_content_hash,
+        approved_hash=prepared.approved_content_hash,
+        verification_digest=prepared.verification_digest or "",
+        source_scope={"kind": "project", "scope_id": "project-one"},
+        target_scope={"kind": "network", "scope_id": "network-one"},
+        issued_at_ms=20_000,
+    )
+    network_result = commit_skill_promotion(
+        authorization=network_authorization
+    )
+    assert network_result.operation == "promote"
+
+    with fleet_memory_scope(
+        scoped_reader(include_project=True, include_network=True)
+    ):
+        visible = visible_promoted_skill_files()
+        assert len(visible) == 1
+        assert network_authorization.promotion_id.removeprefix("sha256:") in str(
+            visible[0]
+        )
+        viewed = json.loads(
+            skills_tool.skill_view("safe-helper", preprocess=False)
+        )
+        assert viewed["success"] is True
+        assert "# Safe helper" in viewed["content"]
 
 
 def test_promoted_skill_tamper_invalidates_visibility(

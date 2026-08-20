@@ -47,6 +47,7 @@ from tools.memory_tool import MemoryStore
 
 _MAX_SKILL_FILES = 128
 _MAX_SKILL_BYTES = 2 * 1024 * 1024
+_SCOPE_RANK = {"principal": 0, "project": 1, "network": 2, "owner": 3}
 
 
 class FleetPromotionMutationError(RuntimeError):
@@ -723,6 +724,116 @@ def _skill_version_dir(promotion_id: str) -> Path:
     return _promotion_root() / "skill-bundles" / promotion_id[7:] / "bundle"
 
 
+def _validated_current_skill_record(
+    state: Mapping[str, Any],
+) -> tuple[dict[str, Any], Path, str]:
+    current = state.get("current_promotion_id")
+    if type(current) is not str:
+        raise FleetPromotionMutationError("current promoted skill version is invalid")
+    record = _read_json(_record_path(current))
+    if (
+        record is None
+        or record.get("promotion_id") != current
+        or record.get("authority") != "none"
+    ):
+        raise FleetPromotionMutationError(
+            "current promoted skill record is unavailable"
+        )
+    authorization = record.get("authorization")
+    prepared = record.get("prepared")
+    detail = record.get("subject_detail")
+    if (
+        type(authorization) is not dict
+        or type(prepared) is not dict
+        or type(detail) is not dict
+    ):
+        raise FleetPromotionMutationError("current promoted skill record is malformed")
+    if (
+        authorization.get("subject_kind") != "skill"
+        or authorization.get("subject_key") != state.get("subject_key")
+        or authorization.get("source_owner_principal_id")
+        != state.get("source_owner_principal_id")
+        or authorization.get("agent_instance_id") != state.get("agent_instance_id")
+        or authorization.get("source_scope") != state.get("source_scope")
+        or authorization.get("target_scope") != state.get("target_scope")
+    ):
+        raise FleetPromotionMutationError("current promoted skill identity changed")
+    expected_bundle = _skill_version_dir(current)
+    if detail.get("bundle") != str(expected_bundle):
+        raise FleetPromotionMutationError("current promoted skill bundle path changed")
+    skill_name = detail.get("name")
+    if type(skill_name) is not str or not skill_name:
+        raise FleetPromotionMutationError("current promoted skill name is invalid")
+    _files, observed_hash, changed = _sanitized_skill_manifest(expected_bundle)
+    if changed or observed_hash != prepared.get("approved_content_hash"):
+        raise FleetPromotionMutationError(
+            "current promoted skill bundle changed after approval"
+        )
+    skill_md = expected_bundle / "SKILL.md"
+    try:
+        info = skill_md.lstat()
+    except OSError as error:
+        raise FleetPromotionMutationError(
+            "current promoted skill SKILL.md is unavailable"
+        ) from error
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise FleetPromotionMutationError(
+            "current promoted skill SKILL.md is unsafe"
+        )
+    return record, skill_md, skill_name
+
+
+def _require_current_skill_source_promotion(
+    *,
+    prepared: PreparedPromotion,
+    authorization: FleetPromotionAuthorization,
+) -> None:
+    if authorization.source_scope.kind == "principal":
+        return
+    subjects = _promotion_root() / "subjects"
+    if not subjects.exists():
+        raise FleetPromotionMutationError(
+            "skill promotion source scope is not currently promoted"
+        )
+    matches = 0
+    for state_path in sorted(subjects.glob("*.json")):
+        state = _read_json(state_path)
+        if state is None or state.get("subject_kind") != "skill":
+            continue
+        if (
+            state.get("subject_key") != authorization.subject_key
+            or state.get("source_owner_principal_id")
+            != authorization.source_owner_principal_id
+            or state.get("agent_instance_id") != authorization.agent_instance_id
+            or state.get("target_scope") != authorization.source_scope.to_request()
+        ):
+            continue
+        record, _skill_md, _skill_name = _validated_current_skill_record(state)
+        source_prepared = record.get("prepared")
+        if type(source_prepared) is not dict:
+            raise FleetPromotionMutationError(
+                "skill promotion source record is malformed"
+            )
+        if (
+            source_prepared.get("approved_content_hash")
+            != prepared.approved_content_hash
+            or source_prepared.get("verification_digest")
+            != prepared.verification_digest
+        ):
+            raise FleetPromotionMutationError(
+                "skill promotion source scope has a different approved version"
+            )
+        matches += 1
+    if matches == 0:
+        raise FleetPromotionMutationError(
+            "skill promotion source scope is not currently promoted"
+        )
+    if matches != 1:
+        raise FleetPromotionMutationError(
+            "skill promotion source scope is ambiguous"
+        )
+
+
 def _assert_no_promoted_skill_name_collision(
     *,
     skill_name: str,
@@ -928,6 +1039,10 @@ def commit_skill_promotion(
                 operation="promote",
                 idempotent=True,
             )
+        _require_current_skill_source_promotion(
+            prepared=prepared,
+            authorization=authorization,
+        )
         previous_id = _assert_expected_current(state, authorization)
         skill_name = _commit_skill(prepared=prepared, authorization=authorization)
         record = _record_document(
@@ -1232,51 +1347,74 @@ def visible_promoted_skill_files() -> list[Path]:
     binding = get_fleet_memory()
     if binding is None:
         return []
-    allowed = {(scope.kind, scope.scope_id) for scope in binding.read_scopes if scope.kind != "principal"}
+    allowed = {
+        (scope.kind, scope.scope_id)
+        for scope in binding.read_scopes
+        if scope.kind != "principal"
+    }
     subjects = _promotion_root() / "subjects"
     if not subjects.exists():
         return []
-    result: list[Path] = []
+
+    # One learned candidate may be promoted through multiple visible scopes.
+    # Prefer the broadest exact current version so project+network visibility
+    # does not create two candidates for the same immutable learned skill.
+    best_by_subject: dict[str, tuple[int, str, Path, str, object]] = {}
     for path in sorted(subjects.glob("*.json")):
         state = _read_json(path)
         if state is None or state.get("subject_kind") != "skill":
             continue
         scope = state.get("target_scope")
-        if type(scope) is not dict or (scope.get("kind"), scope.get("scope_id")) not in allowed:
+        if type(scope) is not dict:
             continue
-        current = state.get("current_promotion_id")
-        if type(current) is not str:
+        scope_kind = scope.get("kind")
+        scope_id = scope.get("scope_id")
+        if (scope_kind, scope_id) not in allowed or scope_kind not in _SCOPE_RANK:
             continue
-        record = _read_json(_record_path(current))
-        if record is None or record.get("promotion_id") != current:
-            raise FleetPromotionMutationError("current promoted skill record is unavailable")
-        authorization = record.get("authorization")
+        if type(scope_id) is not str:
+            raise FleetPromotionMutationError(
+                "current promoted skill target scope is invalid"
+            )
+        subject_key = state.get("subject_key")
+        if type(subject_key) is not str:
+            raise FleetPromotionMutationError(
+                "current promoted skill subject is invalid"
+            )
+        record, skill_md, skill_name = _validated_current_skill_record(state)
         prepared = record.get("prepared")
-        detail = record.get("subject_detail")
-        if type(authorization) is not dict or type(prepared) is not dict or type(detail) is not dict:
-            raise FleetPromotionMutationError("current promoted skill record is malformed")
-        if (
-            authorization.get("subject_kind") != "skill"
-            or authorization.get("subject_key") != state.get("subject_key")
-            or authorization.get("source_owner_principal_id") != state.get("source_owner_principal_id")
-            or authorization.get("agent_instance_id") != state.get("agent_instance_id")
-            or authorization.get("source_scope") != state.get("source_scope")
-            or authorization.get("target_scope") != state.get("target_scope")
-        ):
-            raise FleetPromotionMutationError("current promoted skill identity changed")
-        expected_bundle = _skill_version_dir(current)
-        if detail.get("bundle") != str(expected_bundle):
-            raise FleetPromotionMutationError("current promoted skill bundle path changed")
-        _files, observed_hash, changed = _sanitized_skill_manifest(expected_bundle)
-        if changed or observed_hash != prepared.get("approved_content_hash"):
-            raise FleetPromotionMutationError("current promoted skill bundle changed after approval")
-        skill_md = expected_bundle / "SKILL.md"
-        try:
-            info = skill_md.lstat()
-        except OSError as error:
-            raise FleetPromotionMutationError("current promoted skill SKILL.md is unavailable") from error
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-            raise FleetPromotionMutationError("current promoted skill SKILL.md is unsafe")
+        if type(prepared) is not dict:
+            raise FleetPromotionMutationError(
+                "current promoted skill record is malformed"
+            )
+        approved_hash = prepared.get("approved_content_hash")
+        rank = _SCOPE_RANK[scope_kind]
+        previous = best_by_subject.get(subject_key)
+        if previous is not None:
+            if previous[4] != approved_hash:
+                raise FleetPromotionMutationError(
+                    "visible promoted skill versions conflict"
+                )
+            if rank < previous[0] or (rank == previous[0] and scope_id >= previous[1]):
+                continue
+        best_by_subject[subject_key] = (
+            rank,
+            scope_id,
+            skill_md,
+            skill_name,
+            approved_hash,
+        )
+
+    result: list[Path] = []
+    seen_names: dict[str, str] = {}
+    for subject_key, (_rank, _scope_id, skill_md, skill_name, _hash) in sorted(
+        best_by_subject.items()
+    ):
+        other_subject = seen_names.get(skill_name)
+        if other_subject is not None and other_subject != subject_key:
+            raise FleetPromotionMutationError(
+                "visible promoted skill name is ambiguous across authorized scopes"
+            )
+        seen_names[skill_name] = subject_key
         result.append(skill_md)
     return result
 
