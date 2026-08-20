@@ -361,12 +361,34 @@ def _private_directory(path: Path) -> Path:
         ) from error
 
     cursor = home
+    created_home = False
     try:
         home_info = cursor.lstat()
+    except FileNotFoundError:
+        parent = cursor.parent
+        try:
+            parent_info = parent.lstat()
+        except OSError as error:
+            raise FleetPromotionMutationError("Hermes home parent is unavailable") from error
+        if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
+            raise FleetPromotionMutationError("Hermes home parent is unsafe")
+        try:
+            cursor.mkdir()
+            home_info = cursor.lstat()
+            created_home = True
+        except OSError as error:
+            raise FleetPromotionMutationError("Hermes home is unavailable") from error
     except OSError as error:
         raise FleetPromotionMutationError("Hermes home is unavailable") from error
     if stat.S_ISLNK(home_info.st_mode) or not stat.S_ISDIR(home_info.st_mode):
         raise FleetPromotionMutationError("Hermes home is unsafe")
+    if created_home and os.name != "nt":
+        try:
+            cursor.chmod(0o700)
+        except OSError as error:
+            raise FleetPromotionMutationError(
+                "Hermes home permissions are unsafe"
+            ) from error
 
     for part in relative.parts:
         cursor = cursor / part
