@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -240,6 +242,28 @@ def test_memory_promotion_replay_is_idempotent_and_stale_current_conflicts(tmp_p
     )
     with pytest.raises(FleetPromotionMutationError, match="conflict"):
         commit_memory_promotion(target="memory", authorization=stale)
+
+
+def test_promotion_store_creates_fresh_hermes_home(tmp_path: Path) -> None:
+    fresh_home = tmp_path / "fresh-hermes-home"
+    token = set_hermes_home_override(fresh_home)
+    try:
+        assert not fresh_home.exists()
+        history = promotion_history(
+            subject_kind="memory",
+            subject_key="memory:" + ("sha256:" + "e" * 64),
+            source_owner_principal_id=P1,
+            agent_instance_id=AGENT,
+            source_scope={"kind": "principal", "scope_id": P1},
+            target_scope={"kind": "project", "scope_id": "fleet"},
+        )
+        assert history["current_promotion_id"] is None
+        assert history["history"] == []
+        assert fresh_home.is_dir()
+        if os.name != "nt":
+            assert stat.S_IMODE(fresh_home.stat().st_mode) == 0o700
+    finally:
+        reset_hermes_home_override(token)
 
 
 def test_promotion_store_rejects_symlinked_state_root(tmp_path: Path) -> None:
