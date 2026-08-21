@@ -128,7 +128,15 @@ def test_prepare_memory_promotion_sanitizes_private_data_before_approval(tmp_pat
     assert prepared.source_content_hash == source_hash
     assert prepared.approved_content_hash != source_hash
     assert prepared.sanitized is True
-    assert prepared.to_document()["authority"] == "none"
+    document = prepared.to_document()
+    assert document["authority"] == "none"
+    material = document["evaluation_material"]
+    assert material["schema"] == "fleet.promotion-evaluation-material.v1"
+    assert material["kind"] == "memory"
+    assert material["content_hash"] == prepared.approved_content_hash
+    assert material["bytes"] == len(material["text"].encode("utf-8"))
+    assert "dev@example.com" not in material["text"]
+    assert "[email]" in material["text"]
 
 
 def test_prepare_memory_promotion_is_deterministic_for_safe_content(tmp_path: Path) -> None:

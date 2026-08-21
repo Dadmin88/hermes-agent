@@ -135,6 +135,7 @@ async def test_capabilities_advertise_phase18_learning_promotion() -> None:
         body = await response.json()
     assert response.status == 200
     assert body["features"]["fleet_learning_promotion"] is True
+    assert body["features"]["fleet_learning_promotion_gate_material"] is True
 
 
 @pytest.mark.asyncio
@@ -160,6 +161,11 @@ async def test_memory_promotion_prepare_commit_and_history_api() -> None:
         assert prepared["approved_content_hash"] != source_hash
         assert prepared["sanitized"] is True
         assert prepared["authority"] == "none"
+        material = prepared["evaluation_material"]
+        assert material["schema"] == "fleet.promotion-evaluation-material.v1"
+        assert material["kind"] == "memory"
+        assert material["content_hash"] == prepared["approved_content_hash"]
+        assert "dev@example.com" not in material["text"]
 
         authorization = promotion_authorization(
             source_hash=source_hash,
