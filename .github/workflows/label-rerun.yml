@@ -19,7 +19,6 @@ on:
 
 permissions:
   actions: write
-  contents: write
   pull-requests: read
 
 concurrency:
@@ -27,163 +26,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  patch-pr-89849-review:
-    name: Patch PR 89849 review follow-up
-    if: github.event.pull_request.head.ref == 'ci/trigger-pr-89849-review'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
-      - name: Apply guarded fix and restore workflow files
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git fetch origin fix/desktop-session-owner-hint
-          git checkout -B pr-89849-fix origin/fix/desktop-session-owner-hint
-
-          python3 <<'PY'
-          from pathlib import Path
-
-          def replace_once(path: str, old: str, new: str) -> None:
-              p = Path(path)
-              text = p.read_text()
-              if new in text:
-                  return
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(f"Expected exactly one patch anchor in {path}; found {count}")
-              p.write_text(text.replace(old, new, 1))
-
-          utils = 'apps/desktop/src/app/session/hooks/use-session-actions/utils.ts'
-          utils_old = (
-              "    } catch {\n"
-              "      // The caller supplied an authoritative owner. A miss there means this\n"
-              "      // id is missing/stale for that profile; never hunt through unrelated\n"
-              "      // profiles trying to rediscover ownership the caller already supplied.\n"
-              "      return undefined\n"
-              "    }\n"
-          )
-          utils_new = (
-              "    } catch (error) {\n"
-              "      // A genuine missing session ends the authoritative lookup here. A\n"
-              "      // transport/gateway failure is inconclusive: preserve the owner and\n"
-              "      // let the caller arm its bounded retry instead of treating it as 404.\n"
-              "      if (isSessionGoneError(error)) {\n"
-              "        return undefined\n"
-              "      }\n"
-              "\n"
-              "      throw error\n"
-              "    }\n"
-          )
-          replace_once(utils, utils_old, utils_new)
-
-          actions = 'apps/desktop/src/app/session/hooks/use-session-actions/index.ts'
-          replace_once(
-              actions,
-              "import type { SessionCreateResponse, SessionMessage, SessionResumeResponse, UsageStats } from '@/types/hermes'\n",
-              "import type { SessionCreateResponse, SessionInfo, SessionMessage, SessionResumeResponse, UsageStats } from '@/types/hermes'\n",
-          )
-          actions_old = (
-              "      const storedForProfile = await resolveStoredSession(storedSessionId, ownerProfileHint)\n"
-              "      const sessionProfile = storedForProfile?.profile\n"
-              "\n"
-              "      if (resumeRequestRef.current !== requestId) {\n"
-              "        return\n"
-              "      }\n"
-          )
-          actions_new = (
-              "      let storedForProfile: SessionInfo | undefined\n"
-              "\n"
-              "      try {\n"
-              "        storedForProfile = await resolveStoredSession(storedSessionId, ownerProfileHint)\n"
-              "      } catch {\n"
-              "        if (resumeRequestRef.current !== requestId) {\n"
-              "          return\n"
-              "        }\n"
-              "\n"
-              "        // A non-404 owner lookup failure is transient/inconclusive. Keep the\n"
-              "        // authoritative owner scoped to this request and arm the existing\n"
-              "        // bounded route-resume retry instead of probing unrelated profiles.\n"
-              "        setResumeFailedSessionId(storedSessionId)\n"
-              "\n"
-              "        return\n"
-              "      }\n"
-              "\n"
-              "      const sessionProfile = storedForProfile?.profile\n"
-              "\n"
-              "      if (resumeRequestRef.current !== requestId) {\n"
-              "        return\n"
-              "      }\n"
-          )
-          replace_once(actions, actions_old, actions_new)
-
-          tests = 'apps/desktop/src/app/session/hooks/use-session-actions/resolve-stored-session.test.ts'
-          p = Path(tests)
-          text = p.read_text()
-          anchor = "  it('scopes the first by-id lookup so a miss does not skip the active profile', async () => {\n"
-          insert = (
-              "  it('propagates transient explicit-owner failures without scanning other profiles', async () => {\n"
-              "    $profiles.set(profiles('default', 'katana', 'agency-ai-engineer'))\n"
-              "    $activeGatewayProfile.set('katana')\n"
-              "    mockGetSession.mockRejectedValueOnce(new Error('ECONNREFUSED: gateway restarting'))\n"
-              "\n"
-              "    await expect(resolveStoredSession('s1', 'katana')).rejects.toThrow('ECONNREFUSED: gateway restarting')\n"
-              "    expect(mockGetSession).toHaveBeenCalledTimes(1)\n"
-              "    expect(mockGetSession).toHaveBeenCalledWith('s1', 'katana')\n"
-              "  })\n"
-              "\n"
-          )
-          if insert not in text:
-              count = text.count(anchor)
-              if count != 1:
-                  raise SystemExit(f"Expected exactly one test insertion anchor; found {count}")
-              p.write_text(text.replace(anchor, insert + anchor, 1))
-          PY
-
-          # Remove the branch-local one-shot file from the final PR tree.
-          rm -f .github/workflows/address-review-89849.yml
-
-          # Refuse accidental feature-branch scope creep.
-          mapfile -t changed < <(git status --short | awk '{print $2}' | sort -u)
-          allowed=(
-            .github/workflows/address-review-89849.yml
-            apps/desktop/src/app/session/hooks/use-session-actions/index.ts
-            apps/desktop/src/app/session/hooks/use-session-actions/resolve-stored-session.test.ts
-            apps/desktop/src/app/session/hooks/use-session-actions/utils.ts
-          )
-          for path in "${changed[@]}"; do
-            ok=false
-            for expected in "${allowed[@]}"; do
-              if [[ "$path" == "$expected" ]]; then ok=true; break; fi
-            done
-            if [[ "$ok" != true ]]; then
-              echo "Unexpected feature-branch change: $path"
-              exit 1
-            fi
-          done
-
-          git diff --check
-          grep -q "isSessionGoneError(error)" apps/desktop/src/app/session/hooks/use-session-actions/utils.ts
-          grep -q "setResumeFailedSessionId(storedSessionId)" apps/desktop/src/app/session/hooks/use-session-actions/index.ts
-          grep -q "propagates transient explicit-owner failures" apps/desktop/src/app/session/hooks/use-session-actions/resolve-stored-session.test.ts
-
-          git add -A
-          git commit -m "fix(desktop): retry transient owner lookup failures"
-          git push origin HEAD:fix/desktop-session-owner-hint
-
-          # Restore fork main's workflow tree to its pre-transport state.
-          git fetch origin main
-          git checkout -B main-clean origin/main
-          git show ecbd0320748ce4fd3487bc1792f5094436a9bf3c:.github/workflows/label-rerun.yml > .github/workflows/label-rerun.yml
-          rm -f .github/workflows/patch-pr-89849-review.yml
-          git add -A
-          git commit -m "ci: remove temporary PR 89849 review transport"
-          git push origin HEAD:main
-
   rerun-review-labels:
     name: Rerun review-labels job
     if: github.event.label.name == 'ci-reviewed'
@@ -212,15 +54,27 @@ jobs:
             exit 0
           fi
 
+          # Split "RUN_ID STATUS" into two vars. Read STATUS from RUN_INFO,
+          # not from the truncated RUN_ID. Both values came from the same
+          # var before, which made STATUS the run id. Thus the wait branch
+          # always ran.
           RUN_ID="${RUN_INFO%% *}"
           STATUS="${RUN_INFO##* }"
 
           echo "Latest CI run: $RUN_ID (status: $STATUS)"
 
+          # If the run is still in progress, wait for it to finish.
+          # gh run rerun only works on completed runs — if we try while it's
+          # running, GitHub rejects with "cannot be rerun; This workflow is
+          # already running".
           if [ "$STATUS" != "completed" ]; then
             echo "Run is $STATUS — waiting for completion (this may take a while)..."
+            # gh run watch --exit-status exits non-zero if the run fails,
+            # which is expected (the label gate fails). Don't let that kill
+            # the workflow — we WANT to rerun failed jobs.
             timeout 2100 gh run watch "$RUN_ID" --repo "$REPO" --interval 15 || true
 
+            # Verify it's actually completed now.
             STATUS=$(gh run view "$RUN_ID" --repo "$REPO" --json status --jq '.status' 2>/dev/null || echo "unknown")
             if [ "$STATUS" != "completed" ]; then
               echo "Run is still $STATUS after wait — giving up."
