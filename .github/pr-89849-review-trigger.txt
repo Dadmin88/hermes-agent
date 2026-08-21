@@ -1,0 +1,1 @@
+Temporary trigger for the trusted label-event workflow that patches PR #89849 review follow-up. Safe to delete with the trigger branch/PR.
