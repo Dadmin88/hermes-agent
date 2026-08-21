@@ -167,6 +167,15 @@ def test_verified_skill_promotion_is_visible_only_in_authorized_scope(
         source_owner_principal_id=P1,
         agent_instance_id=AGENT,
     )
+    material = prepared.to_document()["evaluation_material"]
+    assert material["schema"] == "fleet.promotion-evaluation-material.v1"
+    assert material["kind"] == "skill"
+    assert material["content_hash"] == prepared.approved_content_hash
+    assert any(item["path"] == "SKILL.md" for item in material["files"])
+    assert all(
+        item["bytes"] == len(item["text"].encode("utf-8"))
+        for item in material["files"]
+    )
     authorization = promotion_authorization(
         candidate_id=candidate_id,
         source_hash=prepared.source_content_hash,

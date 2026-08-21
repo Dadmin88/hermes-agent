@@ -16,7 +16,7 @@ import shutil
 import stat
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
@@ -47,6 +47,8 @@ from tools.memory_tool import MemoryStore
 
 _MAX_SKILL_FILES = 128
 _MAX_SKILL_BYTES = 2 * 1024 * 1024
+_MAX_EVALUATION_MATERIAL_BYTES = 256 * 1024
+PROMOTION_EVALUATION_MATERIAL_SCHEMA = "fleet.promotion-evaluation-material.v1"
 _SCOPE_RANK = {"principal": 0, "project": 1, "network": 2, "owner": 3}
 
 
@@ -78,6 +80,15 @@ def _sanitize_text(value: str) -> tuple[str, bool]:
     return sanitized, sanitized != value
 
 
+def _bounded_evaluation_material(material: dict[str, object]) -> dict[str, object]:
+    payload = _canonical(material)
+    if len(payload) > _MAX_EVALUATION_MATERIAL_BYTES:
+        raise FleetPromotionMutationError(
+            "promotion evaluation material exceeds the supported semantic-review bound"
+        )
+    return material
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedPromotion:
     subject_kind: str
@@ -85,6 +96,7 @@ class PreparedPromotion:
     source_content_hash: str
     approved_content_hash: str
     sanitized: bool
+    evaluation_material: Mapping[str, object] = field(default_factory=dict)
     verification_digest: str | None = None
 
     def to_document(self) -> dict[str, object]:
@@ -94,6 +106,7 @@ class PreparedPromotion:
             "source_content_hash": self.source_content_hash,
             "approved_content_hash": self.approved_content_hash,
             "sanitized": self.sanitized,
+            "evaluation_material": dict(self.evaluation_material),
             "verification_digest": self.verification_digest,
             "authority": "none",
         }
@@ -148,13 +161,24 @@ def prepare_memory_promotion(
         agent_instance_id=agent_instance_id,
     )
     sanitized, changed = _sanitize_text(content)
+    encoded = sanitized.encode("utf-8")
     approved_hash = MemoryStore._entry_hash(sanitized)
+    evaluation_material = _bounded_evaluation_material(
+        {
+            "schema": PROMOTION_EVALUATION_MATERIAL_SCHEMA,
+            "kind": "memory",
+            "content_hash": approved_hash,
+            "bytes": len(encoded),
+            "text": sanitized,
+        }
+    )
     return PreparedPromotion(
         subject_kind="memory",
         subject_key=f"{target}:{source_content_hash}",
         source_content_hash=source_content_hash,
         approved_content_hash=approved_hash,
         sanitized=changed,
+        evaluation_material=evaluation_material,
     )
 
 
@@ -223,8 +247,11 @@ def _learning_binding(metadata: Mapping[str, Any]) -> FleetSkillLearningBinding:
         raise FleetPromotionMutationError("skill candidate binding cannot be reconstructed") from error
 
 
-def _sanitized_skill_manifest(candidate_dir: Path) -> tuple[list[dict[str, object]], str, bool]:
+def _sanitized_skill_documents(
+    candidate_dir: Path,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], str, bool]:
     files: list[dict[str, object]] = []
+    evaluation_files: list[dict[str, object]] = []
     total = 0
     changed = False
     for path in sorted(candidate_dir.rglob("*")):
@@ -256,16 +283,24 @@ def _sanitized_skill_manifest(candidate_dir: Path) -> tuple[list[dict[str, objec
         sanitized_text, item_changed = _sanitize_text(text)
         changed = changed or item_changed
         sanitized_payload = sanitized_text.encode("utf-8")
-        files.append(
-            {
-                "path": path.relative_to(candidate_dir).as_posix(),
-                "sha256": _sha256(sanitized_payload),
-                "bytes": len(sanitized_payload),
-            }
-        )
+        item = {
+            "path": path.relative_to(candidate_dir).as_posix(),
+            "sha256": _sha256(sanitized_payload),
+            "bytes": len(sanitized_payload),
+        }
+        files.append(item)
+        evaluation_files.append({**item, "text": sanitized_text})
     if not any(item["path"] == "SKILL.md" for item in files):
         raise FleetPromotionMutationError("skill candidate bundle is missing SKILL.md")
-    return files, _sha256(_canonical(files)), changed
+    approved_hash = _sha256(_canonical(files))
+    return files, evaluation_files, approved_hash, changed
+
+
+def _sanitized_skill_manifest(candidate_dir: Path) -> tuple[list[dict[str, object]], str, bool]:
+    files, _evaluation_files, approved_hash, changed = _sanitized_skill_documents(
+        candidate_dir
+    )
+    return files, approved_hash, changed
 
 
 def prepare_skill_promotion(
@@ -297,13 +332,24 @@ def prepare_skill_promotion(
     except (FleetSkillCandidateError, FleetSkillVerificationError) as error:
         raise FleetPromotionMutationError("skill candidate cannot be re-verified") from error
 
-    _sanitized_files, approved_hash, changed = _sanitized_skill_manifest(candidate_dir)
+    _sanitized_files, evaluation_files, approved_hash, changed = (
+        _sanitized_skill_documents(candidate_dir)
+    )
+    evaluation_material = _bounded_evaluation_material(
+        {
+            "schema": PROMOTION_EVALUATION_MATERIAL_SCHEMA,
+            "kind": "skill",
+            "content_hash": approved_hash,
+            "files": evaluation_files,
+        }
+    )
     return PreparedPromotion(
         subject_kind="skill",
         subject_key=candidate_id,
         source_content_hash=observed_hash,
         approved_content_hash=approved_hash,
         sanitized=changed,
+        evaluation_material=evaluation_material,
         verification_digest=verification.verification_digest,
     )
 
