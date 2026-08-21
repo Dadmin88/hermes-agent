@@ -1,0 +1,172 @@
+name: Patch PR 89849 review
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Apply review fix to feature branch and self-clean
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin fix/desktop-session-owner-hint
+          git checkout -B pr-89849-fix origin/fix/desktop-session-owner-hint
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              p = Path(path)
+              text = p.read_text()
+              if new in text:
+                  return
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"Expected exactly one patch anchor in {path}; found {count}")
+              p.write_text(text.replace(old, new, 1))
+
+          utils = 'apps/desktop/src/app/session/hooks/use-session-actions/utils.ts'
+          replace_once(
+              utils,
+              """    } catch {
+              // The caller supplied an authoritative owner. A miss there means this
+              // id is missing/stale for that profile; never hunt through unrelated
+              // profiles trying to rediscover ownership the caller already supplied.
+              return undefined
+            }
+          """,
+              """    } catch (error) {
+              // A genuine missing session ends the authoritative lookup here. A
+              // transport/gateway failure is inconclusive: preserve the owner and
+              // let the caller arm its bounded retry instead of treating it as 404.
+              if (isSessionGoneError(error)) {
+                return undefined
+              }
+
+              throw error
+            }
+          """,
+          )
+
+          actions = 'apps/desktop/src/app/session/hooks/use-session-actions/index.ts'
+          replace_once(
+              actions,
+              """import type { SessionCreateResponse, SessionMessage, SessionResumeResponse, UsageStats } from '@/types/hermes'
+          """,
+              """import type { SessionCreateResponse, SessionInfo, SessionMessage, SessionResumeResponse, UsageStats } from '@/types/hermes'
+          """,
+          )
+          replace_once(
+              actions,
+              """      const storedForProfile = await resolveStoredSession(storedSessionId, ownerProfileHint)
+              const sessionProfile = storedForProfile?.profile
+
+              if (resumeRequestRef.current !== requestId) {
+                return
+              }
+          """,
+              """      let storedForProfile: SessionInfo | undefined
+
+              try {
+                storedForProfile = await resolveStoredSession(storedSessionId, ownerProfileHint)
+              } catch {
+                if (resumeRequestRef.current !== requestId) {
+                  return
+                }
+
+                // A non-404 owner lookup failure is transient/inconclusive. Keep the
+                // authoritative owner scoped to this request and arm the existing
+                // bounded route-resume retry instead of probing unrelated profiles.
+                setResumeFailedSessionId(storedSessionId)
+
+                return
+              }
+
+              const sessionProfile = storedForProfile?.profile
+
+              if (resumeRequestRef.current !== requestId) {
+                return
+              }
+          """,
+          )
+
+          tests = 'apps/desktop/src/app/session/hooks/use-session-actions/resolve-stored-session.test.ts'
+          p = Path(tests)
+          text = p.read_text()
+          anchor = """  it('scopes the first by-id lookup so a miss does not skip the active profile', async () => {
+          """
+          insert = """  it('propagates transient explicit-owner failures without scanning other profiles', async () => {
+            $profiles.set(profiles('default', 'katana', 'agency-ai-engineer'))
+            $activeGatewayProfile.set('katana')
+            mockGetSession.mockRejectedValueOnce(new Error('ECONNREFUSED: gateway restarting'))
+
+            await expect(resolveStoredSession('s1', 'katana')).rejects.toThrow('ECONNREFUSED: gateway restarting')
+            expect(mockGetSession).toHaveBeenCalledTimes(1)
+            expect(mockGetSession).toHaveBeenCalledWith('s1', 'katana')
+          })
+
+          """
+          if insert not in text:
+              count = text.count(anchor)
+              if count != 1:
+                  raise SystemExit(f"Expected exactly one test insertion anchor; found {count}")
+              p.write_text(text.replace(anchor, insert + anchor, 1))
+          PY
+
+          # Remove the branch-local transport if it is still present.
+          rm -f .github/workflows/address-review-89849.yml
+
+          mapfile -t changed < <(git status --short | awk '{print $2}' | sort -u)
+          allowed=(
+            .github/workflows/address-review-89849.yml
+            apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+            apps/desktop/src/app/session/hooks/use-session-actions/resolve-stored-session.test.ts
+            apps/desktop/src/app/session/hooks/use-session-actions/utils.ts
+          )
+          for path in "${changed[@]}"; do
+            ok=false
+            for expected in "${allowed[@]}"; do
+              if [[ "$path" == "$expected" ]]; then ok=true; break; fi
+            done
+            if [[ "$ok" != true ]]; then
+              echo "Unexpected feature-branch change: $path"
+              exit 1
+            fi
+          done
+
+          grep -q "isSessionGoneError(error)" apps/desktop/src/app/session/hooks/use-session-actions/utils.ts
+          grep -q "setResumeFailedSessionId(storedSessionId)" apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+          grep -q "propagates transient explicit-owner failures" apps/desktop/src/app/session/hooks/use-session-actions/resolve-stored-session.test.ts
+          git diff --check
+
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "fix(desktop): retry transient owner lookup failures"
+            git push origin HEAD:fix/desktop-session-owner-hint
+          fi
+
+          # Restore fork main to a clean tree by deleting this one-shot runner.
+          git fetch origin main
+          git checkout -B main-clean origin/main
+          rm -f .github/workflows/patch-pr-89849-review.yml
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "ci: remove temporary PR 89849 patch runner"
+            git push origin HEAD:main
+          fi
