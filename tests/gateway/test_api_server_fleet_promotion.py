@@ -57,6 +57,9 @@ def app_for(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post(
         "/v1/fleet/promotions/history", adapter._handle_fleet_promotion_history
     )
+    app.router.add_post(
+        "/v1/fleet/base-overlays/assess", adapter._handle_fleet_base_overlay_assess
+    )
     return app
 
 
@@ -136,6 +139,51 @@ async def test_capabilities_advertise_phase18_learning_promotion() -> None:
     assert response.status == 200
     assert body["features"]["fleet_learning_promotion"] is True
     assert body["features"]["fleet_learning_promotion_gate_material"] is True
+    assert body["features"]["fleet_base_overlay_compatibility"] is True
+
+
+@pytest.mark.asyncio
+async def test_base_overlay_assessment_api_is_exact_and_authority_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.fleet_base_overlay as base_overlay
+
+    expected = {
+        "schema": "fleet.base-overlay-compatibility.v1",
+        "agent_instance_id": AGENT,
+        "base_manifest_digest": "sha256:" + "6" * 64,
+        "base_skills_digest": "sha256:" + "7" * 64,
+        "base_skills": [],
+        "skills": [],
+        "authority": "none",
+        "report_digest": "sha256:" + "8" * 64,
+    }
+
+    def assess(**kwargs):
+        assert kwargs == {
+            "agent_instance_id": AGENT,
+            "base_manifest_digest": "sha256:" + "6" * 64,
+            "base_skills": [],
+        }
+        return expected
+
+    monkeypatch.setattr(base_overlay, "assess_base_overlay_compatibility", assess)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    async with TestClient(TestServer(app_for(adapter))) as client:
+        response = await client.post(
+            "/v1/fleet/base-overlays/assess",
+            json={
+                "agent_instance_id": AGENT,
+                "base_manifest_digest": "sha256:" + "6" * 64,
+                "base_skills": [],
+            },
+        )
+        body = await response.json()
+    assert response.status == 200
+    assert body == {
+        "object": "hermes.api_server.fleet_base_overlay_assessment",
+        "result": expected,
+    }
 
 
 @pytest.mark.asyncio

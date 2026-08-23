@@ -2142,6 +2142,11 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/v1/fleet/promotions/commit", self._handle_fleet_promotion_commit),
             ("POST", "/v1/fleet/promotions/rollback", self._handle_fleet_promotion_rollback),
             ("POST", "/v1/fleet/promotions/history", self._handle_fleet_promotion_history),
+            (
+                "POST",
+                "/v1/fleet/base-overlays/assess",
+                self._handle_fleet_base_overlay_assess,
+            ),
             ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
@@ -3233,6 +3238,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "fleet_scoped_memory_write": True,
                 "fleet_learning_promotion": True,
                 "fleet_learning_promotion_gate_material": True,
+                "fleet_base_overlay_compatibility": True,
                 "run_approval_budget": True,
                 "run_tool_evidence": True,
                 "run_command_evidence": True,
@@ -7151,6 +7157,52 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response(
             {
                 "object": "hermes.api_server.fleet_promotion_history",
+                "result": result,
+            }
+        )
+
+    async def _handle_fleet_base_overlay_assess(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """Assess exact promoted-skill overlays against one exact Agency base."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if type(body) is not dict or set(body) != {
+            "agent_instance_id",
+            "base_manifest_digest",
+            "base_skills",
+        }:
+            return web.json_response(
+                _openai_error(
+                    "Invalid Fleet base-overlay assessment shape",
+                    code="invalid_fleet_base_overlay",
+                ),
+                status=400,
+            )
+        try:
+            from tools.fleet_base_overlay import (
+                FleetBaseOverlayError,
+                assess_base_overlay_compatibility,
+            )
+
+            result = assess_base_overlay_compatibility(
+                agent_instance_id=body["agent_instance_id"],
+                base_manifest_digest=body["base_manifest_digest"],
+                base_skills=body["base_skills"],
+            )
+        except (FleetBaseOverlayError, KeyError) as error:
+            return web.json_response(
+                _openai_error(str(error), code="fleet_base_overlay_assess_failed"),
+                status=409,
+            )
+        return web.json_response(
+            {
+                "object": "hermes.api_server.fleet_base_overlay_assessment",
                 "result": result,
             }
         )

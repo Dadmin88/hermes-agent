@@ -671,11 +671,21 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
 
 
 def _visible_fleet_promoted_skill_files() -> List[Path]:
-    """Return only Phase 18 promoted skills visible to the current Fleet scope."""
+    """Return scope-visible promoted skills after exact Phase 24 quarantine."""
     try:
+        from tools.fleet_base_overlay import quarantined_promoted_skill_names
         from tools.fleet_promotion import visible_promoted_skill_files
 
-        return visible_promoted_skill_files()
+        quarantined = quarantined_promoted_skill_names()
+        visible: List[Path] = []
+        for skill_md in visible_promoted_skill_files():
+            content = skill_md.read_text(encoding="utf-8-sig", errors="replace")[:4000]
+            frontmatter, _body = _parse_frontmatter(content)
+            name = frontmatter.get("name", skill_md.parent.name)[:MAX_NAME_LENGTH]
+            if name in quarantined:
+                continue
+            visible.append(skill_md)
+        return visible
     except Exception as error:
         logger.debug("Fleet promoted-skill discovery failed closed: %s", error)
         return []
