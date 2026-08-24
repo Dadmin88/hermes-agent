@@ -45,6 +45,7 @@ def memory() -> FleetMemoryBinding:
 def app_for(adapter: APIServerAdapter) -> web.Application:
     app = web.Application()
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+    app.router.add_post("/v1/fleet/forget", adapter._handle_fleet_forget)
     app.router.add_post(
         "/v1/fleet/promotions/prepare", adapter._handle_fleet_promotion_prepare
     )
@@ -130,6 +131,38 @@ def seed_private_memory(content: str) -> tuple[FleetMemoryBinding, str]:
     return item, MemoryStore._entry_hash(content)
 
 
+def forget_authorization(source_hash: str) -> dict[str, object]:
+    issued = int(time.time() * 1000)
+    unsigned: dict[str, object] = {
+        "version": "fleet-forget-v1",
+        "policy_version": "phase25-v1",
+        "subject_kind": "memory",
+        "subject_key": "memory:" + source_hash,
+        "source_owner_principal_id": P1,
+        "agent_instance_id": AGENT,
+        "administrator": {
+            "principal_id": P1,
+            "kind": "owner",
+            "generation": 1,
+            "binding_hash": B1,
+        },
+        "issued_at_ms": issued,
+        "expires_at_ms": issued + 60_000,
+        "authority": "none",
+    }
+    payload = json.dumps(
+        unsigned,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return {
+        **unsigned,
+        "forget_id": "sha256:" + hashlib.sha256(payload).hexdigest(),
+    }
+
+
 @pytest.mark.asyncio
 async def test_capabilities_advertise_phase18_learning_promotion() -> None:
     adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
@@ -140,6 +173,42 @@ async def test_capabilities_advertise_phase18_learning_promotion() -> None:
     assert body["features"]["fleet_learning_promotion"] is True
     assert body["features"]["fleet_learning_promotion_gate_material"] is True
     assert body["features"]["fleet_base_overlay_compatibility"] is True
+    assert body["features"]["fleet_right_to_forget"] is True
+    assert body["endpoints"]["fleet_right_to_forget"] == {
+        "method": "POST",
+        "path": "/v1/fleet/forget",
+    }
+
+
+@pytest.mark.asyncio
+async def test_forget_api_erases_exact_memory_and_rejects_path_shaped_requests() -> None:
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    item, source_hash = seed_private_memory("forget this API memory")
+    authorization = forget_authorization(source_hash)
+
+    async with TestClient(TestServer(app_for(adapter))) as client:
+        invalid = await client.post(
+            "/v1/fleet/forget",
+            json={"authorization": authorization, "path": "/tmp/not-allowed"},
+        )
+        invalid_body = await invalid.json()
+        assert invalid.status == 400
+        assert invalid_body["error"]["code"] == "invalid_fleet_forget"
+
+        response = await client.post(
+            "/v1/fleet/forget",
+            json={"authorization": authorization},
+        )
+        body = await response.json()
+
+    assert response.status == 200
+    assert body["object"] == "hermes.api_server.fleet_forget"
+    assert body["result"]["authority"] == "none"
+    assert body["result"]["deleted"]["memory_entries"] == 1
+
+    store = MemoryStore(memory_char_limit=10_000, user_char_limit=10_000)
+    path = store._scope_dir(item.write_scope) / store._target_filename("memory")
+    assert "forget this API memory" not in store._read_file(path)
 
 
 @pytest.mark.asyncio
