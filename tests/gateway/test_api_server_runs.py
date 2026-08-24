@@ -961,10 +961,73 @@ class TestFinalizeRun:
             "last_command_error": None,
             "pending_processes": 0,
             "command_evidence_invalid": False,
+            "fleet_provenance": None,
         }
         assert adapter._run_statuses[run_id]["quiescent"] is True
         assert adapter._run_statuses[run_id]["last_event"] == "run.finalized"
         release.assert_called_once_with("fleet-execution")
+
+    @pytest.mark.asyncio
+    async def test_finalize_snapshots_hash_only_fleet_context_provenance_idempotently(
+        self, adapter
+    ):
+        from agent.fleet_provenance import (
+            clear_fleet_context_provenance,
+            record_memory_exposure,
+            snapshot_fleet_context_provenance,
+        )
+
+        run_id = "run_provenance"
+        source_run = "execution-provenance"
+        content_hash = "sha256:" + "a" * 64
+        clear_fleet_context_provenance(source_run)
+        record_memory_exposure(
+            source_run=source_run,
+            target="memory",
+            scope_kind="principal",
+            scope_id="sha256:" + "1" * 64,
+            content_hash=content_hash,
+            origin_run="source-run",
+            provenance="fleet-run-v1",
+            trust="run-derived",
+            promotion_state="private",
+            sensitivity="private",
+        )
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "completed",
+            "quiescent": False,
+            "fleet_source_run": source_run,
+            "tool_calls": 0,
+            "tool_errors": 0,
+            "last_tool_error": None,
+            "command_calls": 0,
+            "command_errors": 0,
+            "last_command_error": None,
+            "pending_processes": 0,
+            "command_evidence_invalid": False,
+        }
+        adapter._run_profiles[run_id] = "fleet-execution"
+
+        with patch.object(
+            adapter,
+            "_release_profile_runtime",
+            return_value={"session_db_released": True, "log_handlers_released": 1},
+        ):
+            first = await self._finalize(adapter, run_id)
+            second = await self._finalize(adapter, run_id)
+
+        first_payload = json.loads(first.text)
+        second_payload = json.loads(second.text)
+        provenance = first_payload["fleet_provenance"]
+        assert provenance == second_payload["fleet_provenance"]
+        assert provenance["source_run"] == source_run
+        assert provenance["memory"][0]["content_hash"] == content_hash
+        assert provenance["authority"] == "none"
+        assert "raw memory body" not in json.dumps(provenance)
+        assert snapshot_fleet_context_provenance(source_run)["memory"] == []
+        clear_fleet_context_provenance(source_run)
 
     @pytest.mark.asyncio
     async def test_finalize_resolves_unawaited_background_process(self, adapter):

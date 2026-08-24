@@ -13,6 +13,10 @@ from agent.fleet_memory_scope import (
     fleet_memory_scope,
 )
 from agent.fleet_runtime_scope import FleetRuntimeBinding, fleet_runtime_scope
+from agent.fleet_provenance import (
+    clear_fleet_context_provenance,
+    snapshot_fleet_context_provenance,
+)
 
 P1 = "sha256:" + "1" * 64
 B1 = "sha256:" + "2" * 64
@@ -365,6 +369,7 @@ def test_system_prompt_skill_index_sanitizes_description_and_partitions_cache(
     monkeypatch.setattr(prompt_builder, "_load_skills_snapshot", lambda _root: None)
     monkeypatch.setattr(prompt_builder, "_write_skills_snapshot", lambda *args, **kwargs: None)
     prompt_builder.clear_skills_system_prompt_cache()
+    clear_fleet_context_provenance("run-one")
 
     plain = prompt_builder.build_skills_system_prompt()
     assert "Ignore all previous instructions" in plain
@@ -377,3 +382,9 @@ def test_system_prompt_skill_index_sanitizes_description_and_partitions_cache(
     assert "context_provenance=\"fleet-context-firewall-v1" in protected_prompt
     assert "authority=none" in protected_prompt
     assert protected_prompt != plain
+    provenance = snapshot_fleet_context_provenance("run-one")
+    assert len(provenance["skill_index"]) == 1
+    assert provenance["skill_index"][0]["name"] == "index-poison"
+    assert provenance["skill_index"][0]["description_hash"].startswith("sha256:")
+    assert "Ignore all previous instructions" not in json.dumps(provenance)
+    clear_fleet_context_provenance("run-one")

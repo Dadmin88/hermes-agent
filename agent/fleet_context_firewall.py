@@ -514,6 +514,20 @@ def filter_fleet_memory_candidate(
         f"{content}\n"
         "[End Fleet persisted context]"
     )
+    from agent.fleet_provenance import record_memory_exposure
+
+    record_memory_exposure(
+        source_run=binding.source_run,
+        target=target,
+        scope_kind=scope.kind,
+        scope_id=scope.scope_id,
+        content_hash=content_hash,
+        origin_run=source_run,
+        provenance=provenance,
+        trust=metadata["trust"],
+        promotion_state=metadata["promotion_state"],
+        sensitivity=metadata["sensitivity"],
+    )
     return FleetContextDecision(True, rendered)
 
 
@@ -527,7 +541,7 @@ def sanitize_fleet_skill_text(
     """Fail closed and provenance-wrap a skill payload before model exposure."""
     if not fleet_context_firewall_active():
         return content
-    _require_context_consistency()
+    _context, memory = _require_context_consistency()
     if type(content) is not str:
         raise FleetContextFirewallError("skill content is invalid")
     limit = MAX_FLEET_SKILL_FILE_CHARS if kind == "skill_file" else MAX_FLEET_SKILL_CONTENT_CHARS
@@ -546,6 +560,15 @@ def sanitize_fleet_skill_text(
         )
     source = _bounded_label(source, "skill context source")
     digest = _hash_text(content)
+    from agent.fleet_provenance import record_skill_body_exposure
+
+    record_skill_body_exposure(
+        source_run=memory.source_run,
+        kind=kind,
+        source=source,
+        content_hash=digest,
+        trust=trust,
+    )
     return (
         f"[Fleet skill provenance: version={FLEET_CONTEXT_FIREWALL_VERSION}; "
         f"kind={kind}; source={source}; content_hash={digest}; "
