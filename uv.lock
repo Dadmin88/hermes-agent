@@ -1857,7 +1857,7 @@ requires-dist = [
     { name = "hermes-agent", extras = ["web"], marker = "extra == 'all'" },
     { name = "hermes-agent", extras = ["web"], marker = "extra == 'termux-all'" },
     { name = "hermes-agent", extras = ["youtube"], marker = "extra == 'all'" },
-    { name = "hermes-vault", git = "https://github.com/Dadmin88/hermes-vault.git?rev=bb047f19d08585d380bfcf0f2224300939b7ba90" },
+    { name = "hermes-vault", git = "https://github.com/Dadmin88/hermes-vault.git?rev=e0dd12cc5c5c762e9c5d19fa1771983f50d248fb" },
     { name = "hindsight-client", marker = "extra == 'hindsight'", specifier = "==0.6.1" },
     { name = "honcho-ai", marker = "extra == 'honcho'", specifier = "==2.2.0" },
     { name = "httplib2", marker = "extra == 'google'", specifier = "==0.32.0" },
@@ -1938,7 +1938,7 @@ provides-extras = ["anthropic", "exa", "firecrawl", "parallel-web", "fal", "edge
 [[package]]
 name = "hermes-vault"
 version = "0.1.0"
-source = { git = "https://github.com/Dadmin88/hermes-vault.git?rev=bb047f19d08585d380bfcf0f2224300939b7ba90#bb047f19d08585d380bfcf0f2224300939b7ba90" }
+source = { git = "https://github.com/Dadmin88/hermes-vault.git?rev=e0dd12cc5c5c762e9c5d19fa1771983f50d248fb#e0dd12cc5c5c762e9c5d19fa1771983f50d248fb" }
 dependencies = [
     { name = "cryptography" },
 ]

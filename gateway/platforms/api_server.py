@@ -97,6 +97,7 @@ from agent.fleet_context_scope import (
     FleetContextScopeError,
     fleet_context_scope,
 )
+from agent.fleet_forget import FleetForgetAuthorization, FleetForgetError
 from agent.fleet_memory_scope import (
     FleetMemoryBinding,
     FleetMemoryScopeError,
@@ -2138,6 +2139,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
             ("POST", "/v1/fleet/memory", self._handle_fleet_memory_write),
+            ("POST", "/v1/fleet/forget", self._handle_fleet_forget),
             ("POST", "/v1/fleet/promotions/prepare", self._handle_fleet_promotion_prepare),
             ("POST", "/v1/fleet/promotions/commit", self._handle_fleet_promotion_commit),
             ("POST", "/v1/fleet/promotions/rollback", self._handle_fleet_promotion_rollback),
@@ -3236,6 +3238,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_fleet_skill_quarantine": True,
                 "run_fleet_skill_verification": True,
                 "fleet_scoped_memory_write": True,
+                "fleet_right_to_forget": True,
                 "fleet_learning_promotion": True,
                 "fleet_learning_promotion_gate_material": True,
                 "fleet_base_overlay_compatibility": True,
@@ -3269,6 +3272,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
                 "fleet_scoped_memory": {"method": "POST", "path": "/v1/fleet/memory"},
+                "fleet_right_to_forget": {"method": "POST", "path": "/v1/fleet/forget"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
@@ -6928,6 +6932,43 @@ class APIServerAdapter(BasePlatformAdapter):
                 "result": result,
             },
             status=status,
+        )
+
+    async def _handle_fleet_forget(self, request: "web.Request") -> "web.Response":
+        """Irreversibly erase one exact Fleet-authorized Hermes learning identity."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if type(body) is not dict or set(body) != {"authorization"}:
+            return web.json_response(
+                _openai_error(
+                    "Invalid Fleet forget shape",
+                    code="invalid_fleet_forget",
+                ),
+                status=400,
+            )
+        try:
+            from tools.fleet_forget import (
+                FleetForgetMutationError,
+                forget_fleet_learning,
+            )
+
+            authorization = FleetForgetAuthorization.from_request(body["authorization"])
+            result = forget_fleet_learning(authorization)
+        except (FleetForgetError, FleetForgetMutationError, KeyError) as error:
+            return web.json_response(
+                _openai_error(str(error), code="fleet_forget_failed"),
+                status=409,
+            )
+        return web.json_response(
+            {
+                "object": "hermes.api_server.fleet_forget",
+                "result": result.to_document(),
+            }
         )
 
     async def _handle_fleet_promotion_prepare(
