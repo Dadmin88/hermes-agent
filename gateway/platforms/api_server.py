@@ -6718,6 +6718,20 @@ class APIServerAdapter(BasePlatformAdapter):
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
             ts = time.time()
             if event_type == "tool.started":
+                if tool_name == "terminal":
+                    source_run = self._run_statuses.get(run_id, {}).get(
+                        "fleet_source_run"
+                    )
+                    if type(source_run) is str:
+                        try:
+                            from agent.fleet_provenance import record_terminal_command
+
+                            record_terminal_command(
+                                source_run=source_run,
+                                arguments=args,
+                            )
+                        except Exception:
+                            self._mark_command_evidence_invalid(run_id)
                 _push({
                     "event": "tool.started",
                     "run_id": run_id,

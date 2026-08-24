@@ -67,7 +67,7 @@ def _digest(value: object) -> str:
 
 def _record(source_run: str, category: str, item: Mapping[str, object]) -> None:
     source_run = _run_id(source_run)
-    if category not in {"memory", "skill_index", "skill_body"}:
+    if category not in {"memory", "skill_index", "skill_body", "terminal_command"}:
         raise FleetProvenanceError("Fleet provenance category is invalid")
     document = dict(item)
     key = _digest(document)
@@ -76,7 +76,12 @@ def _record(source_run: str, category: str, item: Mapping[str, object]) -> None:
         if run is None:
             if len(_RUNS) >= _MAX_RUNS:
                 raise FleetProvenanceError("Fleet provenance run bound exceeded")
-            run = {"memory": {}, "skill_index": {}, "skill_body": {}}
+            run = {
+                "memory": {},
+                "skill_index": {},
+                "skill_body": {},
+                "terminal_command": {},
+            }
             _RUNS[source_run] = run
         bucket = run[category]
         if key in bucket:
@@ -167,12 +172,36 @@ def record_skill_body_exposure(
     )
 
 
+def record_terminal_command(
+    *, source_run: str, arguments: Mapping[str, object]
+) -> None:
+    if not isinstance(arguments, Mapping):
+        raise FleetProvenanceError("Fleet terminal command arguments are invalid")
+    document = dict(arguments)
+    arguments_digest = _digest(document)
+    _record(
+        source_run,
+        "terminal_command",
+        {
+            "arguments_digest": arguments_digest,
+            "argument_keys": sorted(_label(key, "terminal argument key") for key in document),
+        },
+    )
+
+
 def snapshot_fleet_context_provenance(source_run: str) -> dict[str, object]:
     source_run = _run_id(source_run)
     with _LOCK:
         run = _RUNS.get(source_run)
         categories = (
-            {"memory": {}, "skill_index": {}, "skill_body": {}} if run is None else run
+            {
+                "memory": {},
+                "skill_index": {},
+                "skill_body": {},
+                "terminal_command": {},
+            }
+            if run is None
+            else run
         )
         body: dict[str, object] = {
             "schema": _SCHEMA,
@@ -180,6 +209,9 @@ def snapshot_fleet_context_provenance(source_run: str) -> dict[str, object]:
             "memory": sorted(categories["memory"].values(), key=_canonical),
             "skill_index": sorted(categories["skill_index"].values(), key=_canonical),
             "skill_body": sorted(categories["skill_body"].values(), key=_canonical),
+            "terminal_command": sorted(
+                categories["terminal_command"].values(), key=_canonical
+            ),
             "authority": "none",
         }
     return {**body, "provenance_digest": _digest(body)}
@@ -198,5 +230,6 @@ __all__ = [
     "record_memory_exposure",
     "record_skill_body_exposure",
     "record_skill_index_exposure",
+    "record_terminal_command",
     "snapshot_fleet_context_provenance",
 ]

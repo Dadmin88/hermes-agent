@@ -378,12 +378,20 @@ class TestRunEvents:
 
     @pytest.mark.asyncio
     async def test_foreground_terminal_records_actual_command_exit(self, adapter):
+        from agent.fleet_provenance import (
+            clear_fleet_context_provenance,
+            snapshot_fleet_context_provenance,
+        )
+
         run_id = "run_command_foreground"
+        source_run = "execution-command-foreground"
+        clear_fleet_context_provenance(source_run)
         adapter._run_streams[run_id] = asyncio.Queue()
         adapter._run_statuses[run_id] = {
             "object": "hermes.run",
             "run_id": run_id,
             "status": "running",
+            "fleet_source_run": source_run,
             "tool_calls": 0,
             "tool_errors": 0,
             "last_tool_error": None,
@@ -398,6 +406,12 @@ class TestRunEvents:
             run_id, asyncio.get_running_loop()
         )
 
+        callback(
+            "tool.started",
+            "terminal",
+            None,
+            {"command": "false", "background": False},
+        )
         callback(
             "tool.completed",
             "terminal",
@@ -415,6 +429,14 @@ class TestRunEvents:
         assert status["last_command_error"] is True
         assert status["pending_processes"] == 0
         assert status["command_evidence_invalid"] is False
+        provenance = snapshot_fleet_context_provenance(source_run)
+        assert len(provenance["terminal_command"]) == 1
+        assert provenance["terminal_command"][0]["argument_keys"] == [
+            "background",
+            "command",
+        ]
+        assert "false" not in json.dumps(provenance)
+        clear_fleet_context_provenance(source_run)
 
     @pytest.mark.asyncio
     async def test_background_terminal_requires_process_exit_evidence(self, adapter):

@@ -7,6 +7,7 @@ from agent.fleet_provenance import (
     record_memory_exposure,
     record_skill_body_exposure,
     record_skill_index_exposure,
+    record_terminal_command,
     snapshot_fleet_context_provenance,
 )
 
@@ -56,6 +57,10 @@ def test_hash_only_provenance_is_deduplicated_and_body_free() -> None:
         content_hash=HASH1,
         trust="learned-promoted",
     )
+    record_terminal_command(
+        source_run=RUN,
+        arguments={"command": "printf super-secret-command", "timeout": 30},
+    )
 
     document = snapshot_fleet_context_provenance(RUN)
     assert document["schema"] == "fleet.context-provenance.v1"
@@ -67,8 +72,11 @@ def test_hash_only_provenance_is_deduplicated_and_body_free() -> None:
     assert document["skill_index"][0]["name"] == "safe-helper"
     assert document["skill_index"][0]["description_hash"].startswith("sha256:")
     assert document["skill_body"][0]["content_hash"] == HASH1
+    assert document["terminal_command"][0]["arguments_digest"].startswith("sha256:")
+    assert document["terminal_command"][0]["argument_keys"] == ["command", "timeout"]
     serialized = json.dumps(document)
     assert "Useful helper text" not in serialized
+    assert "super-secret-command" not in serialized
 
 
 def test_clear_removes_transient_exposures_but_keeps_valid_empty_snapshot() -> None:
@@ -85,3 +93,4 @@ def test_clear_removes_transient_exposures_but_keeps_valid_empty_snapshot() -> N
     assert empty["memory"] == []
     assert empty["skill_index"] == []
     assert empty["skill_body"] == []
+    assert empty["terminal_command"] == []
