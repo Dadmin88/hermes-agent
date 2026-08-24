@@ -1961,6 +1961,16 @@ def build_skills_system_prompt(
             seen = set()
             if category in demoted:
                 names = sorted({name for name, _ in skills_by_category[category]})
+                try:
+                    from agent.fleet_provenance import record_current_skill_index_exposure
+
+                    for name in names:
+                        record_current_skill_index_exposure(name, None)
+                except Exception:
+                    from agent.fleet_context_scope import get_fleet_context
+
+                    if get_fleet_context() is not None:
+                        raise
                 index_lines.append(f"  {category} [names only]: {', '.join(names)}")
                 continue
             cat_desc = category_descriptions.get(category, "")
@@ -1985,6 +1995,15 @@ def build_skills_system_prompt(
                     from agent.fleet_context_firewall import sanitize_fleet_skill_description
 
                     desc = sanitize_fleet_skill_description(desc)
+                except Exception:
+                    from agent.fleet_context_scope import get_fleet_context
+
+                    if get_fleet_context() is not None:
+                        raise
+                try:
+                    from agent.fleet_provenance import record_current_skill_index_exposure
+
+                    record_current_skill_index_exposure(name, desc)
                 except Exception:
                     from agent.fleet_context_scope import get_fleet_context
 

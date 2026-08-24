@@ -3232,6 +3232,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_fleet_runtime": True,
                 "run_fleet_memory_scope": True,
                 "run_fleet_context_firewall": True,
+                "fleet_run_provenance": True,
                 "run_sensitive_interception": True,
                 "run_fleet_vault_scope": True,
                 "run_fleet_skill_learning": True,
@@ -6717,6 +6718,20 @@ class APIServerAdapter(BasePlatformAdapter):
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
             ts = time.time()
             if event_type == "tool.started":
+                if tool_name == "terminal":
+                    source_run = self._run_statuses.get(run_id, {}).get(
+                        "fleet_source_run"
+                    )
+                    if type(source_run) is str:
+                        try:
+                            from agent.fleet_provenance import record_terminal_command
+
+                            record_terminal_command(
+                                source_run=source_run,
+                                arguments=args,
+                            )
+                        except Exception:
+                            self._mark_command_evidence_invalid(run_id)
                 _push({
                     "event": "tool.started",
                     "run_id": run_id,
@@ -7552,6 +7567,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id=session_id,
             model=body.get("model", self._model_name),
             quiescent=False,
+            fleet_source_run=(None if fleet_memory is None else fleet_memory.source_run),
             approval_budget=approval_budget,
             approval_count=0 if approval_budget is not None else None,
             tool_calls=0,
@@ -8221,6 +8237,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "command_evidence_invalid": bool(
                         status.get("command_evidence_invalid", False)
                     ),
+                    "fleet_provenance": status.get("fleet_provenance"),
                 })
 
             task = self._active_run_tasks.get(run_id)
@@ -8248,6 +8265,28 @@ class APIServerAdapter(BasePlatformAdapter):
 
             await asyncio.to_thread(self._refresh_pending_process_evidence, run_id)
             status = self._run_statuses.get(run_id) or status
+            fleet_source_run = status.get("fleet_source_run")
+            fleet_provenance = status.get("fleet_provenance")
+            if fleet_provenance is None and type(fleet_source_run) is str:
+                try:
+                    from agent.fleet_provenance import snapshot_fleet_context_provenance
+
+                    fleet_provenance = snapshot_fleet_context_provenance(
+                        fleet_source_run
+                    )
+                except Exception:
+                    logger.exception(
+                        "[api_server] run %s Fleet provenance finalization failed",
+                        run_id,
+                    )
+                    return web.json_response(
+                        _openai_error(
+                            "Run Fleet provenance finalization failed",
+                            err_type="server_error",
+                            code="run_provenance_failed",
+                        ),
+                        status=500,
+                    )
 
             try:
                 released = await asyncio.to_thread(
@@ -8274,7 +8313,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 quiescent=True,
                 finalized_at=finalized_at,
                 last_event="run.finalized",
+                fleet_provenance=fleet_provenance,
             )
+            if type(fleet_source_run) is str:
+                try:
+                    from agent.fleet_provenance import clear_fleet_context_provenance
+
+                    clear_fleet_context_provenance(fleet_source_run)
+                except Exception:
+                    logger.exception(
+                        "[api_server] run %s Fleet provenance cleanup failed",
+                        run_id,
+                    )
             q = self._run_streams.get(run_id)
             if q is not None:
                 try:
@@ -8301,6 +8351,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "command_evidence_invalid": bool(
                     status.get("command_evidence_invalid", False)
                 ),
+                "fleet_provenance": fleet_provenance,
                 **released,
             })
 

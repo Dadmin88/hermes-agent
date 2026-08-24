@@ -174,6 +174,7 @@ async def test_capabilities_advertise_phase18_learning_promotion() -> None:
     assert body["features"]["fleet_learning_promotion_gate_material"] is True
     assert body["features"]["fleet_base_overlay_compatibility"] is True
     assert body["features"]["fleet_right_to_forget"] is True
+    assert body["features"]["fleet_run_provenance"] is True
     assert body["endpoints"]["fleet_right_to_forget"] == {
         "method": "POST",
         "path": "/v1/fleet/forget",
