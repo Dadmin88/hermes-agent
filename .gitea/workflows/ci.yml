@@ -2,7 +2,7 @@ name: CI (Gitea)
 
 on:
   push:
-    branches: [main]
+    branches: [main, ci/nonroot-python-proof]
   pull_request:
   workflow_dispatch:
 
@@ -70,13 +70,22 @@ jobs:
           --extra fal --extra modal --extra daytona --extra hindsight
           --extra parallel-web
 
+      - name: Prepare GitHub-like non-root test identity
+        run: |
+          set -euo pipefail
+          install -d -o ubuntu -g ubuntu /home/ubuntu
+          chown -R ubuntu:ubuntu "$GITHUB_WORKSPACE"
+
       - name: Run canonical Hermes test suite
-        env:
-          HERMES_TEST_WORKERS: "2"
-          OPENROUTER_API_KEY: ""
-          OPENAI_API_KEY: ""
-          NOUS_API_KEY: ""
-        run: scripts/run_tests.sh
+        run: |
+          set -euo pipefail
+          sudo -u ubuntu -H env \
+            PATH="$PATH" \
+            HERMES_TEST_WORKERS="2" \
+            OPENROUTER_API_KEY="" \
+            OPENAI_API_KEY="" \
+            NOUS_API_KEY="" \
+            scripts/run_tests.sh
 
   quality:
     name: Python static quality
