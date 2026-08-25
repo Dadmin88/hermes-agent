@@ -1,0 +1,22 @@
+name: Docker Build (Gitea Manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  amd64-smoke:
+    name: Build amd64 image smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Verify nested Docker engine
+        run: docker version
+
+      - name: Build local amd64 image
+        run: docker build --pull --tag hermes-agent:gitea-ci .
