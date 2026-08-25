@@ -84,7 +84,15 @@ jobs:
         run: |
           set -euo pipefail
           sudo -u ubuntu -H env \
-            PATH="$PATH" \
+            PATH="/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            CI="${CI:-true}" \
+            GITHUB_ACTIONS="${GITHUB_ACTIONS:-true}" \
+            GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
+            RUNNER_TEMP="$RUNNER_TEMP" \
+            RUNNER_OS="${RUNNER_OS:-Linux}" \
+            RUNNER_ARCH="${RUNNER_ARCH:-X64}" \
+            LANG="C.UTF-8" \
+            TZ="UTC" \
             HERMES_TEST_WORKERS="2" \
             OPENROUTER_API_KEY="" \
             OPENAI_API_KEY="" \
