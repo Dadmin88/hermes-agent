@@ -1,0 +1,13 @@
+name: Deploy Site (Gitea manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  notice:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Release-driven site deployment is manual on the Psalmbox Gitea CI pool."
