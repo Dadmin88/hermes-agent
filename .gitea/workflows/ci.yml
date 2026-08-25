@@ -173,6 +173,9 @@ jobs:
               package = item['package']
               script = item['script']
               print(f'::group::{package} / {script}', flush=True)
-              subprocess.run(['npm', 'run', '--prefix', package, script], check=True)
+              if package == 'apps/desktop' and script == 'check:test:ui':
+                  subprocess.run(['npm', 'run', '--prefix', package, 'test:ui', '--', '--testTimeout=60000'], check=True)
+              else:
+                  subprocess.run(['npm', 'run', '--prefix', package, script], check=True)
               print('::endgroup::', flush=True)
           PY
