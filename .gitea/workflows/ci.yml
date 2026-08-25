@@ -60,21 +60,25 @@ jobs:
             pyproject.toml
             uv.lock
 
-      - name: Install Python
-        run: uv python install "${PYTHON_VERSION}"
-
-      - name: Install locked test dependencies
-        run: >-
-          uv sync --locked --python "${PYTHON_VERSION}"
-          --extra all --extra dev --extra anthropic --extra mistral
-          --extra fal --extra modal --extra daytona --extra hindsight
-          --extra parallel-web
-
       - name: Prepare GitHub-like non-root test identity
         run: |
           set -euo pipefail
           install -d -o ubuntu -g ubuntu /home/ubuntu
           chown -R ubuntu:ubuntu "$GITHUB_WORKSPACE"
+
+      - name: Install Python as non-root
+        run: |
+          set -euo pipefail
+          sudo -u ubuntu -H env PATH="$PATH" uv python install "${PYTHON_VERSION}"
+
+      - name: Install locked test dependencies as non-root
+        run: |
+          set -euo pipefail
+          sudo -u ubuntu -H env PATH="$PATH" \
+            uv sync --locked --python "${PYTHON_VERSION}" \
+            --extra all --extra dev --extra anthropic --extra mistral \
+            --extra fal --extra modal --extra daytona --extra hindsight \
+            --extra parallel-web
 
       - name: Run canonical Hermes test suite
         run: |
