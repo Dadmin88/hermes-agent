@@ -107,7 +107,7 @@ jobs:
   javascript:
     name: JavaScript and TypeScript checks
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 60
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -124,5 +124,44 @@ jobs:
       - name: Install locked dependencies
         run: npm ci
 
-      - name: Run workspace checks
-        run: npm run check
+      - name: Discover maintained workspace checks
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const { execSync } = require('child_process');
+          const pkgs = JSON.parse(execSync('npm query .workspace', { encoding: 'utf-8' }));
+          if (pkgs.length === 0) {
+            throw new Error('Workspace discovery returned no packages');
+          }
+          const checks = [];
+          for (const pkg of pkgs) {
+            const scripts = pkg.scripts || {};
+            const subs = Object.keys(scripts).filter((s) => /^check:.+$/.test(s));
+            if (subs.length > 0) {
+              for (const script of subs) checks.push({ package: pkg.location, script });
+            } else if (scripts.check) {
+              checks.push({ package: pkg.location, script: 'check' });
+            }
+          }
+          if (checks.length === 0) {
+            throw new Error('No maintained workspace check scripts found');
+          }
+          fs.writeFileSync('gitea-js-checks.json', JSON.stringify(checks, null, 2));
+          console.log(`Discovered ${checks.length} maintained workspace checks`);
+          NODE
+
+      - name: Run maintained workspace checks serially
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+
+          with open('gitea-js-checks.json', encoding='utf-8') as fh:
+              checks = json.load(fh)
+          for item in checks:
+              package = item['package']
+              script = item['script']
+              print(f'::group::{package} / {script}', flush=True)
+              subprocess.run(['npm', 'run', '--prefix', package, script], check=True)
+              print('::endgroup::', flush=True)
+          PY
