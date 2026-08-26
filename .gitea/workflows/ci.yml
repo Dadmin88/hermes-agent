@@ -83,8 +83,9 @@ jobs:
       - name: Run canonical Hermes test suite
         run: |
           set -euo pipefail
+          SAFE_PATH="$(python3 -c 'import os; print(":".join(p for p in os.environ["PATH"].split(":") if p and not p.startswith("/root/")))')"
           sudo -u ubuntu -H env \
-            PATH="/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            PATH="$GITHUB_WORKSPACE/.venv/bin:/home/ubuntu/.local/bin:$SAFE_PATH" \
             CI="${CI:-true}" \
             GITHUB_ACTIONS="${GITHUB_ACTIONS:-true}" \
             GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
