@@ -520,7 +520,12 @@ describe('useVirtualHistory offset cache reuse', () => {
     const streams = makeStreams()
     const initialHeights = new Map(items.map(item => [item.key, item.height]))
 
-    const instance = renderSync(React.createElement(Harness, { expose, initialHeights, items }), {
+    // Keep every row mounted until the stale-cache rerender so the first row's
+    // ref(null) is guaranteed to occur in the same commit that introduces the
+    // stale height. ScrollBox subscriptions are synchronous, so with the normal
+    // 16-row cap item-0 can unmount during scrollTo(5) before the test installs
+    // the stale cache, making the intended measure-at-unmount seam racy.
+    const instance = renderSync(React.createElement(Harness, { expose, initialHeights, items, maxMounted: 20 }), {
       patchConsole: false,
       stderr: streams.stderr as NodeJS.WriteStream,
       stdin: streams.stdin as NodeJS.ReadStream,

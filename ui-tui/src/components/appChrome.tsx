@@ -1,6 +1,6 @@
 import { Box, type ScrollBoxHandle, stringWidth, Text } from '@hermes/ink'
 import { useStore } from '@nanostores/react'
-import { type ReactNode, type RefObject, useEffect, useMemo, useRef, useState } from 'react'
+import { type ReactNode, type RefObject, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import unicodeSpinners from 'unicode-animations'
 
 import { $delegationState } from '../app/delegationStore.js'
@@ -377,10 +377,10 @@ function SessionDuration({ startedAt }: { startedAt: number }) {
   const [now, setNow] = useState(() => Date.now())
   const isOccluded = useStore($isStatusRuleOccluded)
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     // Paused only while an overlay actually covers the status rule — see
-    // FaceTicker.  The `setNow` below already re-seeds from the wall clock
-    // on every re-arm, so it doubles as the reveal catch-up.
+    // FaceTicker.  Re-seed from the wall clock in a layout effect so reveal
+    // catch-up lands before the newly visible status rule is painted.
     if (isOccluded) {
       return
     }
@@ -400,10 +400,10 @@ function IdleSince({ endedAt }: { endedAt: number }) {
   const [now, setNow] = useState(() => Date.now())
   const isOccluded = useStore($isStatusRuleOccluded)
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     // Paused only while an overlay actually covers the status rule — see
-    // FaceTicker.  The `setNow` below re-seeds from the wall clock on reveal
-    // so the idle read-out is not frozen when the overlay closes.
+    // FaceTicker.  Re-seed before paint on reveal so the idle read-out never
+    // exposes the stale pre-overlay timestamp.
     if (isOccluded) {
       return
     }
