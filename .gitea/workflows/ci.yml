@@ -11,7 +11,7 @@ permissions:
 
 concurrency:
   group: gitea-ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 env:
   UV_VERSION: "0.9.28"
