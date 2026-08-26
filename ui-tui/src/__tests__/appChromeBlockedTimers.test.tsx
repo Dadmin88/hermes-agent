@@ -302,7 +302,9 @@ describe('status-chrome timers under an occluding overlay', () => {
     // Caught up to real elapsed time, not stuck on the pre-overlay values.
     expect(resumed).toContain('6m 0s')
     expect(resumed).toContain('✓ 5m 5s')
-    expect(resumed).not.toContain('1m 0s')
+    // renderSync's output stream retains earlier frames; prove the newest
+    // elapsed frame is the caught-up one rather than asserting old bytes vanish.
+    expect(resumed.lastIndexOf('6m 0s')).toBeGreaterThan(resumed.lastIndexOf('1m 0s'))
 
     // …and the clocks are running again.
     expect(oneSecondTimers(intervalSpy)).toBe(2)
