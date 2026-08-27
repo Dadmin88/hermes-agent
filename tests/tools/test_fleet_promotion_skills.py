@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import tools.fleet_promotion as promotion_module
 import tools.fleet_skill_verification as verification_module
 import tools.skill_manager_tool as sm
 import tools.skills_tool as skills_tool
@@ -486,3 +487,68 @@ def test_skill_promotion_rejects_native_name_collision(
     )
     with pytest.raises(FleetPromotionMutationError, match="conflict"):
         commit_skill_promotion(authorization=authorization)
+
+
+def test_skill_promotion_record_write_interruption_retries_same_promotion(
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _candidate, metadata = verified_candidate(isolated_home, monkeypatch)
+    candidate_id = metadata["candidate_id"]
+    prepared = prepare_skill_promotion(
+        candidate_id=candidate_id,
+        source_owner_principal_id=P1,
+        agent_instance_id=AGENT,
+    )
+    authorization = promotion_authorization(
+        candidate_id=candidate_id,
+        source_hash=prepared.source_content_hash,
+        approved_hash=prepared.approved_content_hash,
+        verification_digest=prepared.verification_digest or "",
+    )
+    original_write = promotion_module._write_json
+    writes = 0
+
+    def fail_first_write(path, document):
+        nonlocal writes
+        writes += 1
+        if writes == 1:
+            raise OSError(28, "phase30 injected promotion record write failure")
+        return original_write(path, document)
+
+    monkeypatch.setattr(promotion_module, "_write_json", fail_first_write)
+    with pytest.raises(OSError, match="promotion record write failure"):
+        commit_skill_promotion(authorization=authorization)
+
+    materialized = promotion_module._skill_version_dir(authorization.promotion_id)
+    assert materialized.is_dir()
+    history = promotion_history(
+        subject_kind="skill",
+        subject_key=candidate_id,
+        source_owner_principal_id=P1,
+        agent_instance_id=AGENT,
+        source_scope=authorization.source_scope.to_request(),
+        target_scope=authorization.target_scope.to_request(),
+    )
+    assert history["current_promotion_id"] is None
+    assert history["history"] == []
+
+    monkeypatch.setattr(promotion_module, "_write_json", original_write)
+    committed = commit_skill_promotion(authorization=authorization)
+    assert committed.promotion_id == authorization.promotion_id
+    assert committed.idempotent is False
+
+    replay = commit_skill_promotion(authorization=authorization)
+    assert replay.promotion_id == authorization.promotion_id
+    assert replay.idempotent is True
+
+    recovered_history = promotion_history(
+        subject_kind="skill",
+        subject_key=candidate_id,
+        source_owner_principal_id=P1,
+        agent_instance_id=AGENT,
+        source_scope=authorization.source_scope.to_request(),
+        target_scope=authorization.target_scope.to_request(),
+    )
+    assert recovered_history["current_promotion_id"] == authorization.promotion_id
+    assert recovered_history["history"] == [authorization.promotion_id]

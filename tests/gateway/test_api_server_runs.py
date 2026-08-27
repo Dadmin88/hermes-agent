@@ -1100,6 +1100,42 @@ class TestFinalizeRun:
         poll.assert_called_once_with("proc-auto")
 
     @pytest.mark.asyncio
+    async def test_finalize_persistence_barrier_failure_stays_nonquiescent_and_retries(
+        self, adapter
+    ):
+        run_id = "run_phase30_persistence_barrier"
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "completed",
+            "quiescent": False,
+        }
+        adapter._run_profiles[run_id] = "fleet-execution"
+
+        with patch.object(
+            adapter,
+            "_release_profile_runtime",
+            side_effect=OSError(28, "phase30 injected persistence barrier failure"),
+        ):
+            failed = await self._finalize(adapter, run_id)
+
+        assert failed.status == 500
+        assert json.loads(failed.text)["error"]["code"] == "run_finalization_failed"
+        assert adapter._run_statuses[run_id]["quiescent"] is False
+
+        with patch.object(
+            adapter,
+            "_release_profile_runtime",
+            return_value={"session_db_released": True, "log_handlers_released": 1},
+        ) as release:
+            recovered = await self._finalize(adapter, run_id)
+
+        assert recovered.status == 200
+        assert json.loads(recovered.text)["quiescent"] is True
+        assert adapter._run_statuses[run_id]["quiescent"] is True
+        release.assert_called_once_with("fleet-execution")
+
+    @pytest.mark.asyncio
     async def test_finalize_is_idempotent(self, adapter):
         run_id = "run_final_idempotent"
         adapter._run_statuses[run_id] = {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -417,3 +418,28 @@ def test_allowed_tools_overflow_fails_closed(skills_root: Path) -> None:
 
     assert result.state == "rejected"
     assert "tool_declaration_overflow" in reason_codes(candidate)
+
+
+def test_candidate_disk_full_cleans_incomplete_directory_and_never_activates(
+    skills_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def disk_full(*_args, **_kwargs):
+        raise OSError(errno.ENOSPC, "phase30 injected candidate disk full")
+
+    monkeypatch.setattr(quarantine_module, "atomic_write_text", disk_full, raising=False)
+    import tools.fleet_skill_candidates as candidates
+
+    monkeypatch.setattr(candidates, "atomic_write_text", disk_full)
+    result = background_skill_manage(
+        binding(),
+        action="create",
+        name="phase30-disk-full-helper",
+        content=SAFE_SKILL.replace("safe-helper", "phase30-disk-full-helper"),
+    )
+
+    assert result["success"] is False
+    assert sm._find_skill("phase30-disk-full-helper") is None
+    candidate_root = skills_root / ".fleet" / "candidates"
+    if candidate_root.exists():
+        assert list(candidate_root.iterdir()) == []

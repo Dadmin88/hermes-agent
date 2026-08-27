@@ -648,7 +648,7 @@ def route_fleet_skill_candidate_write(
                 "description": "private quarantined skill candidate",
             },
         }
-    except FleetSkillCandidateError as error:
+    except (FleetSkillCandidateError, OSError) as error:
         if candidate_dir is not None and not (candidate_dir / _METADATA_FILE).exists():
             # A newly seeded candidate that failed before metadata was committed is
             # not a valid candidate. Remove only the deterministic hidden directory.
@@ -656,7 +656,12 @@ def route_fleet_skill_candidate_write(
                 shutil.rmtree(candidate_dir)
             except OSError:
                 pass
-        return {"success": False, "error": str(error), "candidate": True}
+        message = (
+            str(error)
+            if isinstance(error, FleetSkillCandidateError)
+            else "candidate persistence failed"
+        )
+        return {"success": False, "error": message, "candidate": True}
 
 
 __all__ = ["FleetSkillCandidateError", "route_fleet_skill_candidate_write"]
